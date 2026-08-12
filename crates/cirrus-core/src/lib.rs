@@ -48,8 +48,16 @@ impl HasError for (){
 pub trait ContextWithValue<Val>: HasError {
     type Wrapped;
 }
+pub trait ContextWithCreate<Val>: ContextWithValue<Val>{
+    fn create(&mut self, val: Val) -> Result<Self::Wrapped,Self::Error>;
+}
 impl<Val> ContextWithValue<Val> for () {
     type Wrapped = Val;
+}
+impl<Val> ContextWithCreate<Val> for (){
+    fn create(&mut self, val: Val) -> Result<Self::Wrapped,Self::Error> {
+        Ok(val)
+    }
 }
 #[macro_export]
 macro_rules! context_with_binop {
