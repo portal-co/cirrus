@@ -356,11 +356,26 @@ pub fn ert_emit<W: Clone, E: Error>(
             }
 
             // memory
-            Inst::Lb { offset, dest, base } => {
+            Inst::Lb { offset, dest, base } => 'a: {
                 let offset = match base {
                     x if x == Reg::SP => offset,
                     x if offs[x.0 as usize].is_some() => {
                         Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    x if reg_consts[x.0 as usize].is_some() => {
+                        offs[dest.0 as usize] = None;
+                        let v = i8::from_le_bytes(array::from_fn(|i| {
+                            mem[i + reg_consts[x.0 as usize].unwrap() as usize]
+                        })) as i32 as u32;
+                        reg_consts[dest.0 as usize] = Some(v);
+                        for i in 0..32 {
+                            regs[dest.0 as usize][i] = if v >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                        break 'a pc + 4;
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
@@ -372,11 +387,26 @@ pub fn ert_emit<W: Clone, E: Error>(
                 }
                 pc + 4
             }
-            Inst::Lh { offset, dest, base } => {
+            Inst::Lh { offset, dest, base } => 'a: {
                 let offset = match base {
                     x if x == Reg::SP => offset,
                     x if offs[x.0 as usize].is_some() => {
                         Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    x if reg_consts[x.0 as usize].is_some() => {
+                        offs[dest.0 as usize] = None;
+                        let v = i16::from_le_bytes(array::from_fn(|i| {
+                            mem[i + reg_consts[x.0 as usize].unwrap() as usize]
+                        })) as i32 as u32;
+                        reg_consts[dest.0 as usize] = Some(v);
+                        for i in 0..32 {
+                            regs[dest.0 as usize][i] = if v >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                        break 'a pc + 4;
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
@@ -388,11 +418,26 @@ pub fn ert_emit<W: Clone, E: Error>(
                 }
                 pc + 4
             }
-            Inst::Lbu { offset, dest, base } => {
+            Inst::Lbu { offset, dest, base } => 'a: {
                 let offset = match base {
                     x if x == Reg::SP => offset,
                     x if offs[x.0 as usize].is_some() => {
                         Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    x if reg_consts[x.0 as usize].is_some() => {
+                        offs[dest.0 as usize] = None;
+                        let v = u8::from_le_bytes(array::from_fn(|i| {
+                            mem[i + reg_consts[x.0 as usize].unwrap() as usize]
+                        })) as u32;
+                        reg_consts[dest.0 as usize] = Some(v);
+                        for i in 0..32 {
+                            regs[dest.0 as usize][i] = if v >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                        break 'a pc + 4;
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
@@ -408,11 +453,26 @@ pub fn ert_emit<W: Clone, E: Error>(
                 }
                 pc + 4
             }
-            Inst::Lhu { offset, dest, base } => {
+            Inst::Lhu { offset, dest, base } => 'a: {
                 let offset = match base {
                     x if x == Reg::SP => offset,
                     x if offs[x.0 as usize].is_some() => {
                         Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    x if reg_consts[x.0 as usize].is_some() => {
+                        offs[dest.0 as usize] = None;
+                        let v = u16::from_le_bytes(array::from_fn(|i| {
+                            mem[i + reg_consts[x.0 as usize].unwrap() as usize]
+                        })) as u32;
+                        reg_consts[dest.0 as usize] = Some(v);
+                        for i in 0..32 {
+                            regs[dest.0 as usize][i] = if v >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                        break 'a pc + 4;
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
@@ -428,11 +488,26 @@ pub fn ert_emit<W: Clone, E: Error>(
                 }
                 pc + 4
             }
-            Inst::Lw { offset, dest, base } => {
+            Inst::Lw { offset, dest, base } => 'a: {
                 let offset = match base {
                     x if x == Reg::SP => offset,
                     x if offs[x.0 as usize].is_some() => {
                         Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    x if reg_consts[x.0 as usize].is_some() => {
+                        offs[dest.0 as usize] = None;
+                        let v = u32::from_le_bytes(array::from_fn(|i| {
+                            mem[i + reg_consts[x.0 as usize].unwrap() as usize]
+                        }));
+                        reg_consts[dest.0 as usize] = Some(v);
+                        for i in 0..32 {
+                            regs[dest.0 as usize][i] = if v >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                        break 'a pc + 4;
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
