@@ -1,0 +1,7 @@
+[workspace]
+members = []
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+description = "New circuit compiler, for everywhere"

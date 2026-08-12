@@ -1,0 +1,9 @@
+{
+  "description": "New circuit compiler, for everywhere",
+  "devDependencies": {
+    "zshy": "^0.7.0"
+  },
+  "name": "@portal-solutions/cirrus",
+  "type": "module",
+  "workspaces": []
+}

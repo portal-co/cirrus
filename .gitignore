@@ -1,0 +1,36 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+
+# Node.js
+node_modules/
+npm-debug.log*
+package-lock.json
+
+
+# Build outputs
+dist/
+build/
+out/
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+
+# Logs
+*.log
+logs/
+
+
+# Environment
+.env
+.env.local
