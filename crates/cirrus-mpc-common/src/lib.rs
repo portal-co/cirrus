@@ -1,0 +1,62 @@
+#![no_std]
+
+use core::ops::{Add, Mul};
+
+use cirrus_core::{ContextWithAdd, ContextWithSub, ContextWithValue};
+pub trait CreateBeaverTriple<Val> {
+    fn beaver(&mut self) -> [Val; 3];
+}
+pub trait Open<Val> {
+    type Opening;
+    fn open(&mut self, val: Val) -> Self::Opening;
+    fn close(&mut self, opening: Self::Opening) -> Val;
+}
+pub trait BeaverOpening<B: BeaverMul<Val> + ?Sized, Val>:
+    Sized
+    + Add<Self, Output = Self>
+    + Mul<B::Wrapped, Output = B::Wrapped>
+    + Mul<Self, Output = Self>
+    + Clone
+{
+}
+impl<
+    B: BeaverMul<Val> + ?Sized,
+    Val,
+    T: Add<Self, Output = Self>
+        + Mul<B::Wrapped, Output = B::Wrapped>
+        + Mul<Self, Output = Self>
+        + Clone,
+> BeaverOpening<B, Val> for T
+{
+}
+pub trait BeaverMul<Val>:
+    ContextWithValue<Val, Wrapped: Clone>
+    + ContextWithSub<Val>
+    + ContextWithAdd<Val>
+    + CreateBeaverTriple<Self::Wrapped>
+{
+    fn beaver_mul<O: Open<Self::Wrapped, Opening: BeaverOpening<Self, Val>>>(
+        &mut self,
+        opening: &mut O,
+        am: Self::Wrapped,
+        bm: Self::Wrapped,
+    ) -> Self::Wrapped {
+        let [a, b, c] = self.beaver();
+        let d = opening.open(self.sub(am, a.clone()));
+        let e = opening.open(self.sub(bm, b.clone()));
+        let mut v = opening.close(d.clone() * e.clone());
+        self.add_assign(&mut v, d * b);
+        self.add_assign(&mut v, e * a);
+        self.add_assign(&mut v, c);
+        return v;
+    }
+}
+impl<
+    Val,
+    T: ContextWithValue<Val, Wrapped: Clone>
+        + ContextWithSub<Val>
+        + ContextWithAdd<Val>
+        + CreateBeaverTriple<Self::Wrapped>,
+> BeaverMul<Val> for T
+{
+}
