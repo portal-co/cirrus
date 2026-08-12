@@ -5,6 +5,7 @@ use core::{convert::Infallible, error::Error};
 use cirrus_core::{ContextWithValue, HasError};
 use portal_pc_asm_common::types::{mem::MemorySize, reg::Reg};
 use portal_solutions_asm_aarch64::AArch64Arch;
+use portal_solutions_asm_x86_64::X64Arch;
 pub trait AsmValue {}
 pub struct Asm<'a, Context, T: ?Sized> {
     pub arch: &'a mut T,
@@ -17,6 +18,11 @@ pub trait InternalContext: HasError {
 }
 impl<'a, 'b, Context, E: Error> HasError
     for Asm<'a, Context, dyn portal_solutions_asm_aarch64::out::WriterCore<Context, Error = E> + 'b>
+{
+    type Error = E;
+}
+impl<'a, 'b, Context, E: Error> HasError
+    for Asm<'a, Context, dyn portal_solutions_asm_x86_64::out::WriterCore<Context, Error = E> + 'b>
 {
     type Error = E;
 }
@@ -42,6 +48,18 @@ impl<'a, 'b, Context, E: Error> InternalContext
                 mode: portal_solutions_asm_aarch64::out::arg::AddressingMode::PreIndex,
             },
         )
+    }
+}
+impl<'a, 'b, Context, E: Error> InternalContext
+    for Asm<'a, Context, dyn portal_solutions_asm_x86_64::out::WriterCore<Context, Error = E> + 'b>
+{
+    fn save_regs(&mut self, reg1: Reg, reg2: Reg) -> Result<(), Self::Error> {
+        self.offset += 16;
+        for (Reg(i),u) in [(reg1,self.offset - 8),(reg2,self.offset)]{
+            self.used_regs[i as usize] = u;
+            self.arch.push(self.context, X64Arch::default(), &Reg(i))?;
+        }
+        Ok(())
     }
 }
 impl<'a, Context, T: AsmValue, W: ?Sized> ContextWithValue<T> for Asm<'a, Context, W>
