@@ -1,5 +1,7 @@
 #![no_std]
 
+use core::array;
+
 use digest::{Digest, array::Array};
 use ml_kem::{
     Decapsulate, DecapsulationKey1024, Encapsulate, EncapsulationKey1024, Generate, SharedKey,
@@ -25,41 +27,25 @@ pub fn miniot_start_recv(
         decaps,
     )
 }
-pub fn miniot_sender<D: Digest>(
+pub fn miniot_sender(
     rng: &mut (dyn CryptoRng + '_),
-    v: SharedKey,
+    v: [SharedKey; 2],
     from_recv: [EncapsulationKey1024; 2],
-) -> ([(Ciphertext, SharedKey); 2], Array<u8, D::OutputSize>) {
-    let mut h = D::new();
-    return (
-        from_recv.map(|a| {
-            let (c, k) = a.encapsulate_with_rng(rng);
-            h.update(&c);
-            (c, SharedKey::from_fn(|i| k[i] ^ v[i]))
-        }),
-        {
-            h.update(&v);
-            h.finalize()
-        },
-    );
+) -> ([(Ciphertext, SharedKey); 2]) {
+    return array::from_fn(|i| {
+        let a = &from_recv[i];
+        let v = &v[i];
+        let (c, k) = a.encapsulate_with_rng(rng);
+        (c, SharedKey::from_fn(|i| k[i] ^ v[i]))
+    });
 }
 pub fn miniot_finish_recv<D: Digest + Clone>(
     from_sender: [(Ciphertext, SharedKey); 2],
-    hash_from_sender: Array<u8, D::OutputSize>,
+    v: bool,
     state: DecapsulationKey1024,
 ) -> SharedKey {
-    let mut h = D::new();
-    for (a, _) in &from_sender {
-        h.update(a);
-    }
-    for (a, b) in from_sender {
-        let a = state.decapsulate(&a);
-        let a = SharedKey::from_fn(|i| a[i] ^ b[i]);
-        let mut h = h.clone();
-        h.update(&a);
-        if h.finalize() == hash_from_sender {
-            return a;
-        }
-    }
-    unreachable!()
+    let (a, b) = from_sender[if v{1}else{0}];
+    let a = state.decapsulate(&a);
+    let a = SharedKey::from_fn(|i| a[i] ^ b[i]);
+    return a;
 }
