@@ -364,6 +364,8 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = None;
                 for i in 0..32 {
                     let j = i.min(7);
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + j].clone();
@@ -378,6 +380,8 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = None;
                 for i in 0..32 {
                     let j = i.min(15);
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + j].clone();
@@ -392,6 +396,8 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = None;
                 for i in 0..32 {
                     let j = i.min(7);
                     if j != i {
@@ -410,6 +416,8 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = None;
                 for i in 0..32 {
                     let j = i.min(15);
                     if j != i {
@@ -428,6 +436,8 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     _ => return Err(ErtError::Unexpected),
                 };
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = None;
                 for i in 0..32 {
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + i].clone();
                 }
