@@ -3,6 +3,12 @@
 use core::ops::{Add, Mul};
 
 use cirrus_core::{ContextWithAdd, ContextWithSub, ContextWithValue};
+use digest::Digest;
+pub trait HashVal<Val> {
+    fn hash<D: Digest>(&mut self, digest: &mut D, val: Val) -> D::OutputSize;
+}
+pub trait HashWrapped<Val>: ContextWithValue<Val> + HashVal<Self::Wrapped> {}
+impl<Val, T: ContextWithValue<Val> + HashVal<Self::Wrapped>> HashWrapped<Val> for T {}
 pub trait CreateBeaverTriple<Val> {
     fn beaver(&mut self) -> [Val; 3];
 }

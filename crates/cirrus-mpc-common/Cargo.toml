@@ -6,3 +6,4 @@ description.workspace = true
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+digest = "0.11.3"
