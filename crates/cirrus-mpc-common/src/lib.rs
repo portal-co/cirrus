@@ -36,18 +36,16 @@ impl<
 {
 }
 pub trait BeaverMul<Val>:
-    ContextWithValue<Val, Wrapped: Clone>
-    + ContextWithSub<Val>
-    + ContextWithAdd<Val>
-    + CreateBeaverTriple<Self::Wrapped>
+    ContextWithValue<Val, Wrapped: Clone> + ContextWithSub<Val> + ContextWithAdd<Val>
 {
     fn beaver_mul<O: Open<Self::Wrapped, Opening: BeaverOpening<Self, Val>>>(
         &mut self,
         opening: &mut O,
         am: Self::Wrapped,
         bm: Self::Wrapped,
+        beaver: [Self::Wrapped; 3],
     ) -> Self::Wrapped {
-        let [a, b, c] = self.beaver();
+        let [a, b, c] = beaver;
         let d = opening.open(self.sub(am, a.clone()));
         let e = opening.open(self.sub(bm, b.clone()));
         let mut v = opening.close(d.clone() * e.clone());
@@ -59,11 +57,7 @@ pub trait BeaverMul<Val>:
 }
 impl<
     Val,
-    T: ?Sized
-        + ContextWithValue<Val, Wrapped: Clone>
-        + ContextWithSub<Val>
-        + ContextWithAdd<Val>
-        + CreateBeaverTriple<Self::Wrapped>,
+    T: ?Sized + ContextWithValue<Val, Wrapped: Clone> + ContextWithSub<Val> + ContextWithAdd<Val>,
 > BeaverMul<Val> for T
 {
 }
