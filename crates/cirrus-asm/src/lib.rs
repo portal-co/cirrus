@@ -14,7 +14,7 @@ pub struct Asm<'a, Context, T: ?Sized> {
     pub offset: u32,
 }
 pub trait InternalContext: HasError {
-    fn save_regs(&mut self, reg1: Reg, reg2: Reg) -> Result<(), Self::Error>;
+    fn save_regs(&mut self, reg1: Reg, reg2: Reg, silent: bool) -> Result<[u32; 2], Self::Error>;
 }
 impl<'a, 'b, Context, E: Error> HasError
     for Asm<'a, Context, dyn portal_solutions_asm_aarch64::out::WriterCore<Context, Error = E> + 'b>
@@ -29,10 +29,12 @@ impl<'a, 'b, Context, E: Error> HasError
 impl<'a, 'b, Context, E: Error> InternalContext
     for Asm<'a, Context, dyn portal_solutions_asm_aarch64::out::WriterCore<Context, Error = E> + 'b>
 {
-    fn save_regs(&mut self, reg1: Reg, reg2: Reg) -> Result<(), Self::Error> {
+    fn save_regs(&mut self, reg1: Reg, reg2: Reg, silent: bool) -> Result<[u32; 2], Self::Error> {
         self.offset += 16;
-        for (Reg(i),u) in [(reg1,self.offset - 8),(reg2,self.offset)]{
-            self.used_regs[i as usize] = u;
+        if !silent {
+            for (Reg(i), u) in [(reg1, self.offset - 8), (reg2, self.offset)] {
+                self.used_regs[i as usize] = u;
+            }
         }
         self.arch.stp(
             self.context,
@@ -47,19 +49,22 @@ impl<'a, 'b, Context, E: Error> InternalContext
                 reg_class: portal_solutions_asm_aarch64::RegisterClass::Gpr,
                 mode: portal_solutions_asm_aarch64::out::arg::AddressingMode::PreIndex,
             },
-        )
+        )?;
+        Ok([self.offset - 8, self.offset])
     }
 }
 impl<'a, 'b, Context, E: Error> InternalContext
     for Asm<'a, Context, dyn portal_solutions_asm_x86_64::out::WriterCore<Context, Error = E> + 'b>
 {
-    fn save_regs(&mut self, reg1: Reg, reg2: Reg) -> Result<(), Self::Error> {
+    fn save_regs(&mut self, reg1: Reg, reg2: Reg, silent: bool) -> Result<[u32; 2], Self::Error> {
         self.offset += 16;
-        for (Reg(i),u) in [(reg1,self.offset - 8),(reg2,self.offset)]{
-            self.used_regs[i as usize] = u;
+        for (Reg(i), u) in [(reg1, self.offset - 8), (reg2, self.offset)] {
+            if !silent {
+                self.used_regs[i as usize] = u;
+            }
             self.arch.push(self.context, X64Arch::default(), &Reg(i))?;
         }
-        Ok(())
+        Ok([self.offset - 8, self.offset])
     }
 }
 impl<'a, Context, T: AsmValue, W: ?Sized> ContextWithValue<T> for Asm<'a, Context, W>
