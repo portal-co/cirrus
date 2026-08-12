@@ -18,6 +18,9 @@ context_with_binop!(ContextWithAdd, add);
 context_with_binop!(ContextWithSub, sub);
 context_with_binop!(ContextWithMul, mul);
 context_with_binop!(ContextWithDiv, div);
+context_with_binop!(ContextWithAnd, and);
+context_with_binop!(ContextWithOr, or);
+context_with_binop!(ContextWithXor, xor);
 pub trait ContextWithMux<Val>: ContextWithValue<bool> + ContextWithValue<Val> {
     fn mux(
         &mut self,
