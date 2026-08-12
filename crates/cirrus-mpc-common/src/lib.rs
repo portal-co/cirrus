@@ -44,15 +44,15 @@ pub trait BeaverMul<Val>:
         am: Self::Wrapped,
         bm: Self::Wrapped,
         beaver: [Self::Wrapped; 3],
-    ) -> Self::Wrapped {
+    ) -> Result<Self::Wrapped,Self::Error> {
         let [a, b, c] = beaver;
-        let d = opening.open(self.sub(am, a.clone()));
-        let e = opening.open(self.sub(bm, b.clone()));
+        let d = opening.open(self.sub(am, a.clone())?);
+        let e = opening.open(self.sub(bm, b.clone())?);
         let mut v = opening.close(d.clone() * e.clone());
-        self.add_assign(&mut v, d * b);
-        self.add_assign(&mut v, e * a);
-        self.add_assign(&mut v, c);
-        return v;
+        self.add_assign(&mut v, d * b)?;
+        self.add_assign(&mut v, e * a)?;
+        self.add_assign(&mut v, c)?;
+        return Ok(v);
     }
 }
 impl<
