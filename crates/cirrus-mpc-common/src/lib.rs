@@ -59,7 +59,8 @@ pub trait BeaverMul<Val>:
 }
 impl<
     Val,
-    T: ContextWithValue<Val, Wrapped: Clone>
+    T: ?Sized
+        + ContextWithValue<Val, Wrapped: Clone>
         + ContextWithSub<Val>
         + ContextWithAdd<Val>
         + CreateBeaverTriple<Self::Wrapped>,
