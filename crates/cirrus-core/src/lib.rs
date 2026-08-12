@@ -1,7 +1,44 @@
 #![no_std]
-use core::{convert::Infallible, error::Error};
+use core::{convert::Infallible, error::Error, ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign}};
 
 pub use paste::paste;
+pub struct Bit(pub bool);
+impl Add for Bit{
+    type Output = Bit;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Bit(self.0 ^ rhs.0)
+    }
+}
+impl AddAssign for Bit{
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 ^= rhs.0;
+    }
+}
+impl Sub for Bit{
+    type Output = Bit;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Bit(self.0 ^ rhs.0)
+    }
+}
+impl SubAssign for Bit{
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 ^= rhs.0;
+    }
+}
+impl Mul for Bit{
+    type Output = Bit;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Bit(self.0 & rhs.0)
+    }
+}
+impl MulAssign for Bit{
+    fn mul_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
 pub trait HasError{
     type Error: Error;
 }
