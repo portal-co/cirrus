@@ -49,10 +49,11 @@ pub fn ert_emit<W: Clone, E: Error>(
     rstack: &mut [u32],
     vstack: &mut [W],
     mut pc: u32,
-    mut regs: [[W; 32]; 32],
+    mut regs: [([W; 32]); 32],
+    mut reg_consts: &mut [Option<u32>; 32],
     zero: W,
     one: W,
-) -> Result<[[W; 32]; 32], ErtError<E>> {
+) -> Result<(), ErtError<E>> {
     let mut sp: u32 = 0;
     let mut rsp: u32 = 0;
     let mut offs: [Option<i32>; 32] = [const { None }; 32];
@@ -68,8 +69,10 @@ pub fn ert_emit<W: Clone, E: Error>(
         for r in regs[0].iter_mut() {
             *r = zero.clone();
         }
+        reg_consts[0] = Some(0);
         offs[0] = None;
-        offs[Reg::SP.0 as usize] = None;
+        reg_consts[Reg::SP.0 as usize] = None;
+        offs[Reg::SP.0 as usize] = Some(0);
         for (i, r) in regs[Reg::SP.0 as usize].iter_mut().enumerate() {
             *r = if sp >> i == 0 {
                 zero.clone()
@@ -85,6 +88,9 @@ pub fn ert_emit<W: Clone, E: Error>(
                     for o in offs.iter_mut().flatten() {
                         *o = o.wrapping_add(imm.as_i32());
                     }
+                }
+                if src1 != dest {
+                    offs[dest.0 as usize] = None;
                 }
                 if src1 == Reg::SP {
                     offs[dest.0 as usize] = Some(imm.as_i32())
@@ -107,10 +113,32 @@ pub fn ert_emit<W: Clone, E: Error>(
                     one.clone(),
                 )
                 .map_err(|e| ErtError::Emitted(e))?;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a.wrapping_add_signed(imm.as_i32())),
+                    _ => None,
+                };
 
                 pc + 4
             }
             Inst::Add { dest, src1, src2 } => {
+                if src1 != dest && src2 != dest {
+                    offs[dest.0 as usize] = None;
+                }
+                if let Some(k) = reg_consts[src2.0 as usize] {
+                    if src1 == Reg::SP {
+                        offs[dest.0 as usize] = Some(k as i32)
+                    } else if let Some(a) = offs[src1.0 as usize] {
+                        offs[dest.0 as usize] = Some(a.wrapping_add_unsigned(k))
+                    }
+                }
+                if let Some(k) = reg_consts[src1.0 as usize] {
+                    if src2 == Reg::SP {
+                        offs[dest.0 as usize] = Some(k as i32)
+                    } else if let Some(a) = offs[src2.0 as usize] {
+                        offs[dest.0 as usize] = Some(a.wrapping_add_unsigned(k))
+                    }
+                }
+
                 regs[dest.0 as usize] = simple_add(
                     t,
                     &regs[src1.0 as usize],
@@ -120,10 +148,32 @@ pub fn ert_emit<W: Clone, E: Error>(
                     one.clone(),
                 )
                 .map_err(|e| ErtError::Emitted(e))?;
+                reg_consts[dest.0 as usize] =
+                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                        (Some(a), Some(b)) => Some(a.wrapping_add(b)),
+                        _ => None,
+                    };
 
                 pc + 4
             }
             Inst::Sub { dest, src1, src2 } => {
+                if src1 != dest && src2 != dest {
+                    offs[dest.0 as usize] = None;
+                }
+                if let Some(k) = reg_consts[src2.0 as usize] {
+                    if src1 == Reg::SP {
+                        offs[dest.0 as usize] = Some(-(k as i32))
+                    } else if let Some(a) = offs[src1.0 as usize] {
+                        offs[dest.0 as usize] = Some(a.wrapping_sub_unsigned(k))
+                    }
+                }
+                if let Some(k) = reg_consts[src1.0 as usize] {
+                    if src2 == Reg::SP {
+                        offs[dest.0 as usize] = Some(-(k as i32))
+                    } else if let Some(a) = offs[src2.0 as usize] {
+                        offs[dest.0 as usize] = Some(a.wrapping_sub_unsigned(k))
+                    }
+                }
                 let mut a = regs[src1.0 as usize].clone();
                 for a in &mut a[..] {
                     *a = t
@@ -139,10 +189,22 @@ pub fn ert_emit<W: Clone, E: Error>(
                     one.clone(),
                 )
                 .map_err(|e| ErtError::Emitted(e))?;
+                reg_consts[dest.0 as usize] =
+                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                        (Some(a), Some(b)) => Some(a.wrapping_sub(b)),
+                        _ => None,
+                    };
 
                 pc + 4
             }
             Inst::And { dest, src1, src2 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] =
+                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                        (Some(a), Some(b)) => Some(a & b),
+                        _ => None,
+                    };
+
                 for i in 0..32 {
                     regs[dest.0 as usize][i] = t
                         .bitand(
@@ -154,6 +216,12 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Or { dest, src1, src2 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] =
+                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                        (Some(a), Some(b)) => Some(a | b),
+                        _ => None,
+                    };
                 for i in 0..32 {
                     regs[dest.0 as usize][i] = t
                         .bitor(
@@ -165,6 +233,12 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Xor { dest, src1, src2 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] =
+                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                        (Some(a), Some(b)) => Some(a ^ b),
+                        _ => None,
+                    };
                 for i in 0..32 {
                     regs[dest.0 as usize][i] = t
                         .bitxor(
@@ -176,6 +250,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Andi { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a & (imm.as_i32() as u32)),
+                    _ => None,
+                };
                 for i in 0..32 {
                     if imm.as_i32() as u32 & (1 << i) == 0 {
                         regs[dest.0 as usize][i] = zero.clone()
@@ -186,6 +265,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Ori { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a | (imm.as_i32() as u32)),
+                    _ => None,
+                };
                 for i in 0..32 {
                     if imm.as_i32() as u32 & (1 << i) != 0 {
                         regs[dest.0 as usize][i] = one.clone()
@@ -196,6 +280,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Xori { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a ^ (imm.as_i32() as u32)),
+                    _ => None,
+                };
                 for i in 0..32 {
                     if imm.as_i32() as u32 & (1 << i) != 0 {
                         regs[dest.0 as usize][i] = t
@@ -208,6 +297,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Slli { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a << (imm.as_i32() as u32 & 31)),
+                    _ => None,
+                };
                 for a in regs[dest.0 as usize].iter_mut() {
                     *a = zero.clone()
                 }
@@ -222,6 +316,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Srli { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some(a >> (imm.as_i32() as u32 & 31)),
+                    _ => None,
+                };
                 for a in regs[dest.0 as usize].iter_mut() {
                     *a = zero.clone()
                 }
@@ -236,6 +335,11 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Srai { imm, dest, src1 } => {
+                offs[dest.0 as usize] = None;
+                reg_consts[dest.0 as usize] = match (reg_consts[src1.0 as usize]) {
+                    (Some(a)) => Some((a as i32 >> (imm.as_i32() as u32 & 31)) as u32),
+                    _ => None,
+                };
                 let sign = regs[dest.0 as usize][31].clone();
                 for a in regs[dest.0 as usize].iter_mut() {
                     *a = sign.clone();
@@ -381,6 +485,84 @@ pub fn ert_emit<W: Clone, E: Error>(
                 //assume return
                 rsp -= 1;
                 rstack[rsp as usize]
+            }
+            Inst::Beq { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if a == b {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
+            }
+            Inst::Bne { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if a != b {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
+            }
+            Inst::Bgeu { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if a >= b {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
+            }
+            Inst::Bltu { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if a < b {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
+            }
+            Inst::Bge { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if (a as i32) >= (b as i32) {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
+            }
+            Inst::Blt { offset, src1, src2 } => {
+                let Some(a) = reg_consts[src1.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                let Some(b) = reg_consts[src2.0 as usize] else {
+                    return Err(ErtError::Unexpected);
+                };
+                if (a as i32) < (b as i32) {
+                    pc.wrapping_add_signed(offset.as_i32())
+                } else {
+                    pc + 4
+                }
             }
             _ => return Err(ErtError::Unexpected),
         }
