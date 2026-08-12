@@ -46,6 +46,7 @@ pub fn simple_add<W: Clone, E: Error>(
 pub fn ert_emit<W: Clone, E: Error>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
     mem: &mut [u8],
+    rstack: &mut [u32],
     vstack: &mut [W],
     mut pc: u32,
     mut regs: [[W; 32]; 32],
@@ -53,6 +54,7 @@ pub fn ert_emit<W: Clone, E: Error>(
     one: W,
 ) -> Result<[[W; 32]; 32], ErtError<E>> {
     let mut sp: u32 = 0;
+    let mut rsp: u32 = 0;
     let mut offs: [Option<i32>; 32] = [const { None }; 32];
     loop {
         pc &= !3;
@@ -365,6 +367,20 @@ pub fn ert_emit<W: Clone, E: Error>(
                     vstack[offset.as_u32() as usize * 8 + i] = regs[src.0 as usize][i].clone();
                 }
                 pc + 4
+            }
+            //control flow
+            Inst::Jal { offset, dest } => {
+                if dest.0 != 0 {
+                    //assume call
+                    rstack[rsp as usize] = pc + 4;
+                    rsp += 1;
+                }
+                pc.wrapping_add_signed(offset.as_i32())
+            }
+            Inst::Jalr { offset, base, dest } => {
+                //assume return
+                rsp -= 1;
+                rstack[rsp as usize]
             }
             _ => return Err(ErtError::Unexpected),
         }
