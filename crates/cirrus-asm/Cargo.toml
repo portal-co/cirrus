@@ -1,0 +1,12 @@
+[package]
+name = "cirrus-asm"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+portal-pc-asm-common.workspace = true
+portal-solutions-asm-aarch64.workspace = true
+portal-solutions-asm-regalloc.workspace = true
+portal-solutions-asm-x86-64.workspace = true
