@@ -6,7 +6,7 @@ use cirrus_core::{
     ContextWithAdd, ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithDiv,
     ContextWithMul, ContextWithSub,
 };
-use rv_asm::{DecodeError, Inst, Reg};
+use rv_asm::{DecodeError, Imm, Inst, Reg};
 pub trait ContextWithRvOps<Val>:
     ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<Val>
 {
@@ -53,6 +53,7 @@ pub fn ert_emit<W: Clone, E: Error>(
     one: W,
 ) -> Result<[[W; 32]; 32], ErtError<E>> {
     let mut sp: u32 = 0;
+    let mut offs: [Option<i32>; 32] = [const { None }; 32];
     loop {
         pc &= !3;
         let bc = match rv_asm::Inst::decode(
@@ -65,6 +66,8 @@ pub fn ert_emit<W: Clone, E: Error>(
         for r in regs[0].iter_mut() {
             *r = zero.clone();
         }
+        offs[0] = None;
+        offs[Reg::SP.0 as usize] = None;
         for (i, r) in regs[Reg::SP.0 as usize].iter_mut().enumerate() {
             *r = if sp >> i == 0 {
                 zero.clone()
@@ -77,6 +80,14 @@ pub fn ert_emit<W: Clone, E: Error>(
             Inst::Addi { imm, dest, src1 } => {
                 if dest == Reg::SP {
                     sp = sp.wrapping_add_signed(imm.as_i32());
+                    for o in offs.iter_mut().flatten() {
+                        *o = o.wrapping_add(imm.as_i32());
+                    }
+                }
+                if src1 == Reg::SP {
+                    offs[dest.0 as usize] = Some(imm.as_i32())
+                } else if let Some(a) = offs[src1.0 as usize] {
+                    offs[dest.0 as usize] = Some(a.wrapping_add(imm.as_i32()))
                 }
                 let w = array::from_fn(|i| {
                     if (imm.as_i32() as u32 >> i) & 1 == 1 {
@@ -240,9 +251,13 @@ pub fn ert_emit<W: Clone, E: Error>(
 
             // memory
             Inst::Lb { offset, dest, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     let j = i.min(7);
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + j].clone();
@@ -250,9 +265,13 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Lh { offset, dest, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     let j = i.min(15);
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + j].clone();
@@ -260,9 +279,13 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Lbu { offset, dest, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     let j = i.min(7);
                     if j != i {
@@ -274,9 +297,13 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Lhu { offset, dest, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     let j = i.min(15);
                     if j != i {
@@ -288,36 +315,52 @@ pub fn ert_emit<W: Clone, E: Error>(
                 pc + 4
             }
             Inst::Lw { offset, dest, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     regs[dest.0 as usize][i] = vstack[offset.as_u32() as usize * 8 + i].clone();
                 }
                 pc + 4
             }
             Inst::Sb { offset, src, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..8 {
                     vstack[offset.as_u32() as usize * 8 + i] = regs[src.0 as usize][i].clone();
                 }
                 pc + 4
             }
             Inst::Sh { offset, src, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..16 {
                     vstack[offset.as_u32() as usize * 8 + i] = regs[src.0 as usize][i].clone();
                 }
                 pc + 4
             }
             Inst::Sw { offset, src, base } => {
-                if base != Reg::SP {
-                    return Err(ErtError::Unexpected);
-                }
+                let offset = match base {
+                    x if x == Reg::SP => offset,
+                    x if offs[x.0 as usize].is_some() => {
+                        Imm::new_i32(offs[base.0 as usize].unwrap().wrapping_add(offset.as_i32()))
+                    }
+                    _ => return Err(ErtError::Unexpected),
+                };
                 for i in 0..32 {
                     vstack[offset.as_u32() as usize * 8 + i] = regs[src.0 as usize][i].clone();
                 }
