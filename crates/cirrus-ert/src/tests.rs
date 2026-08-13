@@ -2,6 +2,9 @@ extern crate std;
 
 use core::{array, convert::Infallible};
 
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError,
+};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
@@ -53,6 +56,85 @@ fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
 
 fn assert_success(result: Result<(), ErtError<Infallible>>) {
     assert!(result.is_ok());
+}
+
+#[derive(Default)]
+struct CountingContext {
+    bitand: usize,
+    bitor: usize,
+    bitxor: usize,
+}
+
+impl HasError for CountingContext {
+    type Error = Infallible;
+}
+
+impl ContextWithValue<bool> for CountingContext {
+    type Wrapped = bool;
+}
+
+impl ContextWithBitAnd<bool> for CountingContext {
+    fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitand += 1;
+        Ok(left & right)
+    }
+
+    fn bitand_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitand += 1;
+        *left &= right;
+        Ok(())
+    }
+}
+
+impl ContextWithBitOr<bool> for CountingContext {
+    fn bitor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitor += 1;
+        Ok(left | right)
+    }
+
+    fn bitor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitor += 1;
+        *left |= right;
+        Ok(())
+    }
+}
+
+impl ContextWithBitXor<bool> for CountingContext {
+    fn bitxor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitxor += 1;
+        Ok(left ^ right)
+    }
+
+    fn bitxor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitxor += 1;
+        *left ^= right;
+        Ok(())
+    }
+}
+
+fn run_counting(
+    instructions: impl IntoIterator<Item = Inst>,
+    regs: &mut [[bool; 32]; 32],
+    constants: &mut [Option<u32>; 32],
+) -> CountingContext {
+    let mut context = CountingContext::default();
+    let mut hash = no_hash;
+    let mut mem = program(instructions);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    assert_success(ert_emit(
+        &mut context,
+        &mut hash,
+        &mut mem,
+        &mut rstack,
+        &mut vstack,
+        0,
+        regs,
+        constants,
+        false,
+        true,
+    ));
+    context
 }
 
 fn exit_register(regs: &mut [[bool; 32]; 32], constants: &mut [Option<u32>; 32]) {
@@ -163,6 +245,365 @@ fn arithmetic_immediates_and_shifts_preserve_concrete_tracking() {
     assert_eq!(constants[Reg::T2.0 as usize], Some(10));
     assert_eq!(constants[Reg::T1.0 as usize], Some(0x4000_0001));
     assert_eq!(constants[Reg::T6.0 as usize], Some(u32::MAX));
+    assert_eq!(value(&regs[Reg::T2.0 as usize]), 10);
+    assert_eq!(value(&regs[Reg::T1.0 as usize]), 0x4000_0001);
+    assert_eq!(value(&regs[Reg::T6.0 as usize]), u32::MAX);
+}
+
+#[test]
+fn runtime_shifts_use_low_five_bits_and_snapshot_aliased_sources() {
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T1.0 as usize] = word(0x4000_0001);
+    regs[Reg::T2.0 as usize] = word(33);
+    regs[Reg::T3.0 as usize] = word(0x8000_0003);
+    regs[Reg::T4.0 as usize] = word(0x8000_0003);
+    regs[Reg::T5.0 as usize] = word(1);
+    exit_register(&mut regs, &mut constants);
+    let mut mem = program([
+        Inst::Sll {
+            dest: Reg::T1,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Srl {
+            dest: Reg::T2,
+            src1: Reg::T3,
+            src2: Reg::T2,
+        },
+        Inst::Sra {
+            dest: Reg::T4,
+            src1: Reg::T4,
+            src2: Reg::T5,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert_success(run(
+        &mut mem,
+        &mut regs,
+        &mut constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+
+    assert_eq!(value(&regs[Reg::T1.0 as usize]), 0x8000_0002);
+    assert_eq!(value(&regs[Reg::T2.0 as usize]), 0x4000_0001);
+    assert_eq!(value(&regs[Reg::T4.0 as usize]), 0xc000_0001);
+    assert!(constants[Reg::T1.0 as usize].is_none());
+    assert!(constants[Reg::T2.0 as usize].is_none());
+    assert!(constants[Reg::T4.0 as usize].is_none());
+}
+
+#[test]
+fn concrete_shift_amounts_avoid_barrel_selector_gates() {
+    let instructions = [
+        Inst::Sll {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ];
+    let mut symbolic_regs = [[false; 32]; 32];
+    let mut symbolic_constants = [None; 32];
+    symbolic_regs[Reg::T1.0 as usize] = word(0x0123_4567);
+    symbolic_regs[Reg::T2.0 as usize] = word(1);
+    exit_register(&mut symbolic_regs, &mut symbolic_constants);
+    let symbolic = run_counting(instructions, &mut symbolic_regs, &mut symbolic_constants);
+
+    let mut constant_regs = [[false; 32]; 32];
+    let mut constant_metadata = [None; 32];
+    constant_regs[Reg::T1.0 as usize] = word(0x0123_4567);
+    constant_regs[Reg::T2.0 as usize] = word(33);
+    constant_metadata[Reg::T1.0 as usize] = Some(0x0123_4567);
+    constant_metadata[Reg::T2.0 as usize] = Some(33);
+    exit_register(&mut constant_regs, &mut constant_metadata);
+    let constant = run_counting(instructions, &mut constant_regs, &mut constant_metadata);
+
+    assert_eq!(symbolic.bitand, 160);
+    assert_eq!(symbolic.bitxor, 320);
+    assert_eq!(symbolic.bitor, 0);
+    assert_eq!(constant.bitand, 0);
+    assert_eq!(constant.bitxor, 0);
+    assert_eq!(constant.bitor, 0);
+    assert_eq!(value(&constant_regs[Reg::T0.0 as usize]), 0x0246_8ace);
+    assert_eq!(constant_metadata[Reg::T0.0 as usize], Some(0x0246_8ace));
+}
+
+fn signed_high(left: u32, right: u32) -> u32 {
+    (((left as i32 as i64) * (right as i32 as i64)) >> 32) as u32
+}
+
+fn signed_unsigned_high(left: u32, right: u32) -> u32 {
+    (((left as i32 as i64) * (right as u64 as i64)) >> 32) as u32
+}
+
+fn unsigned_high(left: u32, right: u32) -> u32 {
+    ((left as u64 * right as u64) >> 32) as u32
+}
+
+#[test]
+fn symbolic_multiplication_supports_low_and_high_product_variants() {
+    let left = 0x8000_0000;
+    let right = 0xffff_fffd;
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T1.0 as usize] = word(left);
+    regs[Reg::T2.0 as usize] = word(right);
+    exit_register(&mut regs, &mut constants);
+    let mut mem = program([
+        Inst::Mul {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulh {
+            dest: Reg::T3,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulhsu {
+            dest: Reg::T4,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulhu {
+            dest: Reg::T5,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert_success(run(
+        &mut mem,
+        &mut regs,
+        &mut constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+
+    assert_eq!(value(&regs[Reg::T0.0 as usize]), left.wrapping_mul(right));
+    assert_eq!(value(&regs[Reg::T3.0 as usize]), signed_high(left, right));
+    assert_eq!(
+        value(&regs[Reg::T4.0 as usize]),
+        signed_unsigned_high(left, right)
+    );
+    assert_eq!(value(&regs[Reg::T5.0 as usize]), unsigned_high(left, right));
+    for register in [Reg::T0, Reg::T3, Reg::T4, Reg::T5] {
+        assert!(constants[register.0 as usize].is_none());
+    }
+}
+
+#[test]
+fn high_products_apply_each_required_signed_correction() {
+    for (left, right) in [
+        (0x7fff_fffe, 0x8000_0003),
+        (0x8000_0002, 5),
+        (0x1234_5678, 0x1020_3040),
+    ] {
+        let mut regs = [[false; 32]; 32];
+        let mut constants = [None; 32];
+        regs[Reg::T1.0 as usize] = word(left);
+        regs[Reg::T2.0 as usize] = word(right);
+        exit_register(&mut regs, &mut constants);
+        let mut mem = program([
+            Inst::Mulh {
+                dest: Reg::T3,
+                src1: Reg::T1,
+                src2: Reg::T2,
+            },
+            Inst::Mulhsu {
+                dest: Reg::T4,
+                src1: Reg::T1,
+                src2: Reg::T2,
+            },
+            Inst::Mulhu {
+                dest: Reg::T5,
+                src1: Reg::T1,
+                src2: Reg::T2,
+            },
+            Inst::Ecall,
+        ]);
+        let mut rstack = [0; 8];
+        let mut vstack = [false; 64];
+
+        assert_success(run(
+            &mut mem,
+            &mut regs,
+            &mut constants,
+            &mut rstack,
+            &mut vstack,
+        ));
+
+        assert_eq!(value(&regs[Reg::T3.0 as usize]), signed_high(left, right));
+        assert_eq!(
+            value(&regs[Reg::T4.0 as usize]),
+            signed_unsigned_high(left, right)
+        );
+        assert_eq!(value(&regs[Reg::T5.0 as usize]), unsigned_high(left, right));
+    }
+}
+
+#[test]
+fn multiplication_snapshots_aliased_operands() {
+    let left = 0x1234_5678;
+    let right = 0x0001_0003;
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T1.0 as usize] = word(left);
+    regs[Reg::T2.0 as usize] = word(right);
+    regs[Reg::T3.0 as usize] = word(left);
+    exit_register(&mut regs, &mut constants);
+    let mut mem = program([
+        Inst::Mul {
+            dest: Reg::T1,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulh {
+            dest: Reg::T2,
+            src1: Reg::T3,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert_success(run(
+        &mut mem,
+        &mut regs,
+        &mut constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+
+    assert_eq!(value(&regs[Reg::T1.0 as usize]), left.wrapping_mul(right));
+    assert_eq!(value(&regs[Reg::T2.0 as usize]), signed_high(left, right));
+}
+
+#[test]
+fn concrete_multiplicands_use_specialized_product_paths() {
+    let multiplicand = 0x1020_3040;
+    let multiplier = 3;
+    let instructions = [
+        Inst::Mul {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ];
+    let mut symbolic_regs = [[false; 32]; 32];
+    let mut symbolic_constants = [None; 32];
+    symbolic_regs[Reg::T1.0 as usize] = word(multiplicand);
+    symbolic_regs[Reg::T2.0 as usize] = word(multiplier);
+    exit_register(&mut symbolic_regs, &mut symbolic_constants);
+    let symbolic = run_counting(instructions, &mut symbolic_regs, &mut symbolic_constants);
+
+    let mut right_constant_regs = [[false; 32]; 32];
+    let mut right_constant_metadata = [None; 32];
+    right_constant_regs[Reg::T1.0 as usize] = word(multiplicand);
+    right_constant_regs[Reg::T2.0 as usize] = word(multiplier);
+    right_constant_metadata[Reg::T2.0 as usize] = Some(multiplier);
+    exit_register(&mut right_constant_regs, &mut right_constant_metadata);
+    let right_constant = run_counting(
+        instructions,
+        &mut right_constant_regs,
+        &mut right_constant_metadata,
+    );
+
+    let mut left_constant_regs = [[false; 32]; 32];
+    let mut left_constant_metadata = [None; 32];
+    left_constant_regs[Reg::T1.0 as usize] = word(multiplier);
+    left_constant_regs[Reg::T2.0 as usize] = word(multiplicand);
+    left_constant_metadata[Reg::T1.0 as usize] = Some(multiplier);
+    exit_register(&mut left_constant_regs, &mut left_constant_metadata);
+    let left_constant = run_counting(
+        instructions,
+        &mut left_constant_regs,
+        &mut left_constant_metadata,
+    );
+
+    for regs in [&right_constant_regs, &left_constant_regs] {
+        assert_eq!(
+            value(&regs[Reg::T0.0 as usize]),
+            multiplicand.wrapping_mul(multiplier)
+        );
+    }
+    assert!(right_constant_metadata[Reg::T0.0 as usize].is_none());
+    assert!(left_constant_metadata[Reg::T0.0 as usize].is_none());
+    assert!(right_constant.bitand < symbolic.bitand);
+    assert!(left_constant.bitand < symbolic.bitand);
+    assert!(right_constant.bitxor < symbolic.bitxor);
+    assert!(left_constant.bitxor < symbolic.bitxor);
+
+    let mut concrete_regs = [[false; 32]; 32];
+    let mut concrete_metadata = [None; 32];
+    concrete_regs[Reg::T1.0 as usize] = word(0x8000_0000);
+    concrete_regs[Reg::T2.0 as usize] = word(0xffff_fffd);
+    concrete_metadata[Reg::T1.0 as usize] = Some(0x8000_0000);
+    concrete_metadata[Reg::T2.0 as usize] = Some(0xffff_fffd);
+    exit_register(&mut concrete_regs, &mut concrete_metadata);
+    let mut concrete_mem = program([
+        Inst::Mul {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulh {
+            dest: Reg::T3,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulhsu {
+            dest: Reg::T4,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Mulhu {
+            dest: Reg::T5,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    assert_success(run(
+        &mut concrete_mem,
+        &mut concrete_regs,
+        &mut concrete_metadata,
+        &mut rstack,
+        &mut vstack,
+    ));
+    assert_eq!(concrete_metadata[Reg::T0.0 as usize], Some(0x8000_0000));
+    assert_eq!(concrete_metadata[Reg::T3.0 as usize], Some(1));
+    assert_eq!(
+        concrete_metadata[Reg::T4.0 as usize],
+        Some(signed_unsigned_high(0x8000_0000, 0xffff_fffd))
+    );
+    assert_eq!(
+        concrete_metadata[Reg::T5.0 as usize],
+        Some(unsigned_high(0x8000_0000, 0xffff_fffd))
+    );
+
+    let mut zero_regs = [[false; 32]; 32];
+    let mut zero_metadata = [None; 32];
+    zero_regs[Reg::T1.0 as usize] = word(multiplicand);
+    zero_regs[Reg::T2.0 as usize] = word(0);
+    zero_metadata[Reg::T2.0 as usize] = Some(0);
+    exit_register(&mut zero_regs, &mut zero_metadata);
+    let zero = run_counting(instructions, &mut zero_regs, &mut zero_metadata);
+    assert_eq!(zero_metadata[Reg::T0.0 as usize], Some(0));
+    assert_eq!(zero.bitand, 0);
+    assert_eq!(zero.bitxor, 0);
 }
 
 #[test]

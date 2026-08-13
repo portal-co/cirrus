@@ -21,11 +21,17 @@
 //! calls return [`ErtError::Unexpected`].
 //!
 //! The supported instructions are `LUI`, `AUIPC`; `ADDI`, `ADD`, `SUB`, `AND`,
-//! `OR`, `XOR`, their supported immediate forms, and immediate shifts; `LB`,
-//! `LBU`, `LH`, `LHU`, `LW`, `SB`, `SH`, `SW`; `JAL`, the interpreter's return
-//! form of `JALR`, and the six integer branches; plus the hash and exit `ECALL`s.
+//! `OR`, `XOR`, their supported immediate forms; immediate and register shifts;
+//! and `MUL`, `MULH`, `MULHSU`, and `MULHU`; `LB`, `LBU`, `LH`, `LHU`, `LW`,
+//! `SB`, `SH`, `SW`; `JAL`, the interpreter's return form of `JALR`, and the
+//! six integer branches; plus the hash and exit `ECALL`s.
+//!
+//! Symbolic register shifts use a five-stage barrel shifter over `rs2[4:0]`.
+//! Symbolic multiplication uses fixed long-multiplication rounds. A concrete
+//! shift amount or multiplicand selects a smaller fixed-shift or constant-product
+//! path, so callers should retain concrete metadata whenever it is known.
 
-use core::{error::Error, mem::MaybeUninit};
+use core::error::Error;
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
 use rv_asm::DecodeError;
@@ -36,7 +42,7 @@ mod machine;
 #[cfg(test)]
 mod tests;
 
-use machine::{Machine, read_abi_results, write_abi_args};
+use machine::{Machine, add_bits, read_abi_results, write_abi_args};
 
 /// The Boolean operations required to execute the supported RISC-V subset.
 pub trait ContextWithRvOps<Val>:
@@ -67,24 +73,11 @@ pub fn simple_add<W: Clone, E: Error>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
     v: &[W; 32],
     w: &[W; 32],
-    mut carry: W,
+    carry: W,
     _zero: W,
     _one: W,
 ) -> Result<[W; 32], E> {
-    let mut x: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
-    for i in 0..32 {
-        let s = t.bitxor(v[i].clone(), w[i].clone())?;
-        x[i] = MaybeUninit::new(t.bitxor(s, carry.clone())?);
-        let v = [v[i].clone(), w[i].clone(), carry.clone()];
-        let mut w: [MaybeUninit<W>; 3] = [const { MaybeUninit::uninit() }; 3];
-        for i in 0..3 {
-            w[i] = MaybeUninit::new(t.bitand(v[(i + 2) % 3].clone(), v[(i + 1) % 3].clone())?);
-        }
-        let [a, b, c] = w.map(|a| unsafe { a.assume_init() });
-        let b = t.bitor(c, b)?;
-        carry = t.bitor(a, b)?;
-    }
-    Ok(x.map(|a| unsafe { a.assume_init() }))
+    add_bits(t, v, w, carry)
 }
 
 /// Invoke a symbolic RV32 function using the RISC-V argument and result ABI.

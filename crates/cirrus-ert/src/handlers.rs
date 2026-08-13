@@ -2,8 +2,8 @@ use core::array;
 
 use rv_asm::{Imm, Inst, Reg};
 
-use crate::machine::Machine;
-use crate::{ErtError, machine::LoadAddress, simple_add};
+use crate::machine::{Machine, add_bits};
+use crate::{ErtError, machine::LoadAddress};
 
 pub(crate) enum Flow {
     Next(u32),
@@ -22,6 +22,14 @@ enum Shift {
     Left,
     LogicalRight,
     ArithmeticRight,
+}
+
+#[derive(Clone, Copy)]
+enum Product {
+    Low,
+    HighSigned,
+    HighSignedUnsigned,
+    HighUnsigned,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +76,21 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
         Inst::Slli { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::Left),
         Inst::Srli { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::LogicalRight),
         Inst::Srai { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::ArithmeticRight),
+        Inst::Sll { dest, src1, src2 } => runtime_shift(machine, dest, src1, src2, Shift::Left),
+        Inst::Srl { dest, src1, src2 } => {
+            runtime_shift(machine, dest, src1, src2, Shift::LogicalRight)
+        }
+        Inst::Sra { dest, src1, src2 } => {
+            runtime_shift(machine, dest, src1, src2, Shift::ArithmeticRight)
+        }
+        Inst::Mul { dest, src1, src2 } => multiply(machine, dest, src1, src2, Product::Low),
+        Inst::Mulh { dest, src1, src2 } => multiply(machine, dest, src1, src2, Product::HighSigned),
+        Inst::Mulhsu { dest, src1, src2 } => {
+            multiply(machine, dest, src1, src2, Product::HighSignedUnsigned)
+        }
+        Inst::Mulhu { dest, src1, src2 } => {
+            multiply(machine, dest, src1, src2, Product::HighUnsigned)
+        }
 
         Inst::Lb { offset, dest, base } => load(machine, offset, dest, base, LoadKind::ByteSigned),
         Inst::Lh { offset, dest, base } => load(machine, offset, dest, base, LoadKind::HalfSigned),
@@ -146,13 +169,11 @@ fn add_immediate<W: Clone, E: core::error::Error>(
             machine.zero.clone()
         }
     });
-    machine.regs[dest.0 as usize] = simple_add(
+    machine.regs[dest.0 as usize] = add_bits(
         machine.t,
         &machine.regs[src1.0 as usize],
         &word,
         machine.zero.clone(),
-        machine.zero.clone(),
-        machine.one.clone(),
     )
     .map_err(ErtError::Emitted)?;
     machine.reg_consts[dest.0 as usize] = match machine.reg_consts[src1.0 as usize] {
@@ -186,13 +207,11 @@ fn add<W: Clone, E: core::error::Error>(
         }
     }
 
-    machine.regs[dest.0 as usize] = simple_add(
+    machine.regs[dest.0 as usize] = add_bits(
         machine.t,
         &machine.regs[src1.0 as usize],
         &machine.regs[src2.0 as usize],
         machine.zero.clone(),
-        machine.zero.clone(),
-        machine.one.clone(),
     )
     .map_err(ErtError::Emitted)?;
     machine.reg_consts[dest.0 as usize] = match (
@@ -236,12 +255,10 @@ fn subtract<W: Clone, E: core::error::Error>(
             .bitxor(bit.clone(), machine.one.clone())
             .map_err(ErtError::Emitted)?;
     }
-    machine.regs[dest.0 as usize] = simple_add(
+    machine.regs[dest.0 as usize] = add_bits(
         machine.t,
         &left,
         &machine.regs[src2.0 as usize],
-        machine.one.clone(),
-        machine.zero.clone(),
         machine.one.clone(),
     )
     .map_err(ErtError::Emitted)?;
@@ -343,6 +360,7 @@ fn shift<W: Clone, E: core::error::Error>(
     direction: Shift,
 ) -> Result<Flow, ErtError<E>> {
     let amount = imm.as_u32() & 31;
+    let source = machine.regs[src1.0 as usize].clone();
     machine.offs[dest.0 as usize] = None;
     machine.reg_consts[dest.0 as usize] =
         machine.reg_consts[src1.0 as usize].map(|value| match direction {
@@ -350,40 +368,261 @@ fn shift<W: Clone, E: core::error::Error>(
             Shift::LogicalRight => value >> amount,
             Shift::ArithmeticRight => (value as i32 >> amount) as u32,
         });
-
-    match direction {
-        Shift::Left | Shift::LogicalRight => {
-            for bit in machine.regs[dest.0 as usize].iter_mut() {
-                *bit = machine.zero.clone();
-            }
-        }
-        Shift::ArithmeticRight => {
-            let sign = machine.regs[dest.0 as usize][31].clone();
-            for bit in machine.regs[dest.0 as usize].iter_mut() {
-                *bit = sign.clone();
-            }
-        }
-    }
-
-    for bit in 0..32 {
-        let target = match direction {
-            Shift::Left => {
-                if amount + bit >= 32 {
-                    continue;
-                }
-                amount + bit
-            }
-            Shift::LogicalRight | Shift::ArithmeticRight => {
-                if amount > bit {
-                    continue;
-                }
-                bit - amount
-            }
-        };
-        machine.regs[dest.0 as usize][target as usize] =
-            machine.regs[src1.0 as usize][bit as usize].clone();
-    }
+    machine.regs[dest.0 as usize] = shifted_word(machine, &source, amount, direction);
     next(machine)
+}
+
+fn runtime_shift<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    dest: Reg,
+    src1: Reg,
+    src2: Reg,
+    direction: Shift,
+) -> Result<Flow, ErtError<E>> {
+    let source = machine.regs[src1.0 as usize].clone();
+    let amount_word = machine.regs[src2.0 as usize].clone();
+    machine.offs[dest.0 as usize] = None;
+
+    if let Some(amount) = machine.reg_consts[src2.0 as usize] {
+        machine.reg_consts[dest.0 as usize] =
+            machine.reg_consts[src1.0 as usize].map(|value| match direction {
+                Shift::Left => value << (amount & 31),
+                Shift::LogicalRight => value >> (amount & 31),
+                Shift::ArithmeticRight => (value as i32 >> (amount & 31)) as u32,
+            });
+        machine.regs[dest.0 as usize] = shifted_word(machine, &source, amount & 31, direction);
+        return next(machine);
+    }
+
+    let mut shifted = source;
+    for stage in 0..5 {
+        let candidate = shifted_word(machine, &shifted, 1 << stage, direction);
+        shifted = select_word(machine, amount_word[stage].clone(), &candidate, &shifted)?;
+    }
+    machine.reg_consts[dest.0 as usize] = None;
+    machine.regs[dest.0 as usize] = shifted;
+    next(machine)
+}
+
+fn shifted_word<W: Clone, E: core::error::Error>(
+    machine: &Machine<'_, W, E>,
+    source: &[W; 32],
+    amount: u32,
+    direction: Shift,
+) -> [W; 32] {
+    let fill = match direction {
+        Shift::ArithmeticRight => source[31].clone(),
+        Shift::Left | Shift::LogicalRight => machine.zero.clone(),
+    };
+    array::from_fn(|destination_bit| match direction {
+        Shift::Left if destination_bit >= amount as usize => {
+            source[destination_bit - amount as usize].clone()
+        }
+        Shift::LogicalRight | Shift::ArithmeticRight
+            if destination_bit + (amount as usize) < 32 =>
+        {
+            source[destination_bit + (amount as usize)].clone()
+        }
+        _ => fill.clone(),
+    })
+}
+
+fn select_word<W: Clone, E: core::error::Error, const N: usize>(
+    machine: &mut Machine<'_, W, E>,
+    condition: W,
+    then: &[W; N],
+    r#else: &[W; N],
+) -> Result<[W; N], ErtError<E>> {
+    let mut selected = r#else.clone();
+    for bit in 0..N {
+        let difference = machine
+            .t
+            .bitxor(then[bit].clone(), r#else[bit].clone())
+            .map_err(ErtError::Emitted)?;
+        let difference = machine
+            .t
+            .bitand(condition.clone(), difference)
+            .map_err(ErtError::Emitted)?;
+        selected[bit] = machine
+            .t
+            .bitxor(r#else[bit].clone(), difference)
+            .map_err(ErtError::Emitted)?;
+    }
+    Ok(selected)
+}
+
+fn multiply<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    dest: Reg,
+    src1: Reg,
+    src2: Reg,
+    product: Product,
+) -> Result<Flow, ErtError<E>> {
+    let left = machine.regs[src1.0 as usize].clone();
+    let right = machine.regs[src2.0 as usize].clone();
+    let left_constant = machine.reg_consts[src1.0 as usize];
+    let right_constant = machine.reg_consts[src2.0 as usize];
+    machine.offs[dest.0 as usize] = None;
+
+    if let (Some(left), Some(right)) = (left_constant, right_constant) {
+        machine.write_constant(dest, concrete_product(product, left, right));
+        return next(machine);
+    }
+    if left_constant == Some(0) || right_constant == Some(0) {
+        machine.write_constant(dest, 0);
+        return next(machine);
+    }
+
+    let result = match product {
+        Product::Low => {
+            if let Some(constant) = left_constant {
+                multiply_by_constant(machine, &right, constant)?
+            } else if let Some(constant) = right_constant {
+                multiply_by_constant(machine, &left, constant)?
+            } else {
+                multiply_selected(machine, &left, &right)?
+            }
+        }
+        Product::HighSigned | Product::HighSignedUnsigned | Product::HighUnsigned => {
+            let full_product = if let Some(constant) = left_constant {
+                let multiplicand = zero_extend(&right, &machine.zero);
+                multiply_by_constant(machine, &multiplicand, constant)?
+            } else if let Some(constant) = right_constant {
+                let multiplicand = zero_extend(&left, &machine.zero);
+                multiply_by_constant(machine, &multiplicand, constant)?
+            } else {
+                let multiplicand = zero_extend(&left, &machine.zero);
+                multiply_selected(machine, &multiplicand, &right)?
+            };
+            let high = array::from_fn(|bit| full_product[32 + bit].clone());
+            correct_high_product(
+                machine,
+                high,
+                &left,
+                &right,
+                left_constant,
+                right_constant,
+                product,
+            )?
+        }
+    };
+    machine.reg_consts[dest.0 as usize] = None;
+    machine.regs[dest.0 as usize] = result;
+    next(machine)
+}
+
+fn concrete_product(product: Product, left: u32, right: u32) -> u32 {
+    match product {
+        Product::Low => left.wrapping_mul(right),
+        Product::HighSigned => (((left as i32 as i64) * (right as i32 as i64)) >> 32) as u32,
+        Product::HighSignedUnsigned => {
+            (((left as i32 as i64) * (right as u64 as i64)) >> 32) as u32
+        }
+        Product::HighUnsigned => ((left as u64 * right as u64) >> 32) as u32,
+    }
+}
+
+fn multiply_selected<W: Clone, E: core::error::Error, const N: usize>(
+    machine: &mut Machine<'_, W, E>,
+    multiplicand: &[W; N],
+    multiplier: &[W; 32],
+) -> Result<[W; N], ErtError<E>> {
+    let mut accumulator = array::from_fn(|_| machine.zero.clone());
+    let mut addend = multiplicand.clone();
+    for multiplier_bit in multiplier {
+        let sum = add_bits(machine.t, &accumulator, &addend, machine.zero.clone())
+            .map_err(ErtError::Emitted)?;
+        accumulator = select_word(machine, multiplier_bit.clone(), &sum, &accumulator)?;
+        addend = shift_left_one(&addend, &machine.zero);
+    }
+    Ok(accumulator)
+}
+
+fn multiply_by_constant<W: Clone, E: core::error::Error, const N: usize>(
+    machine: &mut Machine<'_, W, E>,
+    multiplicand: &[W; N],
+    multiplier: u32,
+) -> Result<[W; N], ErtError<E>> {
+    let mut accumulator = array::from_fn(|_| machine.zero.clone());
+    let mut addend = multiplicand.clone();
+    for bit in 0..32 {
+        if multiplier & (1 << bit) != 0 {
+            accumulator = add_bits(machine.t, &accumulator, &addend, machine.zero.clone())
+                .map_err(ErtError::Emitted)?;
+        }
+        addend = shift_left_one(&addend, &machine.zero);
+    }
+    Ok(accumulator)
+}
+
+fn zero_extend<W: Clone>(word: &[W; 32], zero: &W) -> [W; 64] {
+    array::from_fn(|bit| {
+        if bit < 32 {
+            word[bit].clone()
+        } else {
+            zero.clone()
+        }
+    })
+}
+
+fn shift_left_one<W: Clone, const N: usize>(word: &[W; N], zero: &W) -> [W; N] {
+    array::from_fn(|bit| {
+        if bit == 0 {
+            zero.clone()
+        } else {
+            word[bit - 1].clone()
+        }
+    })
+}
+
+fn correct_high_product<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    mut high: [W; 32],
+    left: &[W; 32],
+    right: &[W; 32],
+    left_constant: Option<u32>,
+    right_constant: Option<u32>,
+    product: Product,
+) -> Result<[W; 32], ErtError<E>> {
+    if matches!(product, Product::HighSigned | Product::HighSignedUnsigned) {
+        high = subtract_if_negative(machine, high, left, right, left_constant)?;
+    }
+    if matches!(product, Product::HighSigned) {
+        high = subtract_if_negative(machine, high, right, left, right_constant)?;
+    }
+    Ok(high)
+}
+
+fn subtract_if_negative<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    value: [W; 32],
+    signed_operand: &[W; 32],
+    subtrahend: &[W; 32],
+    signed_constant: Option<u32>,
+) -> Result<[W; 32], ErtError<E>> {
+    match signed_constant {
+        Some(constant) if constant >> 31 == 0 => Ok(value),
+        Some(_) => subtract_word(machine, &value, subtrahend),
+        None => {
+            let difference = subtract_word(machine, &value, subtrahend)?;
+            select_word(machine, signed_operand[31].clone(), &difference, &value)
+        }
+    }
+}
+
+fn subtract_word<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    minuend: &[W; 32],
+    subtrahend: &[W; 32],
+) -> Result<[W; 32], ErtError<E>> {
+    let mut inverted = subtrahend.clone();
+    for bit in &mut inverted {
+        *bit = machine
+            .t
+            .bitxor(bit.clone(), machine.one.clone())
+            .map_err(ErtError::Emitted)?;
+    }
+    add_bits(machine.t, minuend, &inverted, machine.one.clone()).map_err(ErtError::Emitted)
 }
 
 fn load<W: Clone, E: core::error::Error>(
