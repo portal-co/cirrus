@@ -81,6 +81,33 @@ pub fn ert_emit<W: Clone, E: Error>(
             }
         }
         pc = match bc {
+            //consts
+            Inst::Lui { uimm, dest } => {
+                offs[dest.0 as usize] = None;
+                let v = uimm.as_u32();
+                reg_consts[dest.0 as usize] = Some(v);
+                for i in 0..32 {
+                    regs[dest.0 as usize][i] = if v >> i == 0 {
+                        zero.clone()
+                    } else {
+                        one.clone()
+                    };
+                }
+                pc + 4
+            }
+            Inst::Auipc { uimm, dest } => {
+                offs[dest.0 as usize] = None;
+                let v = uimm.as_u32().wrapping_add(pc);
+                reg_consts[dest.0 as usize] = Some(v);
+                for i in 0..32 {
+                    regs[dest.0 as usize][i] = if v >> i == 0 {
+                        zero.clone()
+                    } else {
+                        one.clone()
+                    };
+                }
+                pc + 4
+            }
             //arith
             Inst::Addi { imm, dest, src1 } => {
                 if dest == Reg::SP {
