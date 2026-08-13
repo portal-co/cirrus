@@ -5,18 +5,18 @@ use core::{array, convert::Infallible};
 use cirrus_core::{Bit, ContextWithAdd, ContextWithMul, ContextWithSub, ContextWithValue, HasError, Pusher};
 use digest::{Digest, array::Array};
 
-pub struct GC<'a,'b,D: Digest>{
-    pub queue: &'a mut (dyn Pusher<[Array<u8, D::OutputSize>; 4]> + 'b),
+pub struct GC<'a,'b,D: Digest,const N: usize>{
+    pub queue: &'a mut (dyn Pusher<[[u8;N]; 4]> + 'b),
     pub seed: Array<u8,D::OutputSize>,
     pub delta: Array<u8,D::OutputSize>,
 }
-impl<D: Digest> HasError for GC<'_, '_, D> {
+impl<D: Digest, const N: usize> HasError for GC<'_, '_, D,N> {
     type Error = Infallible;
 }
-impl<D: Digest> ContextWithValue<Bit> for GC<'_, '_, D> {
-    type Wrapped = Array<u8, D::OutputSize>;
+impl<D: Digest, const N: usize> ContextWithValue<Bit> for GC<'_, '_, D,N> {
+    type Wrapped = [u8; N];
 }
-impl<D: Digest> ContextWithAdd<Bit> for GC<'_, '_, D> {
+impl<D: Digest, const N: usize> ContextWithAdd<Bit> for GC<'_, '_, D,N> {
     fn add(
         &mut self,
         a: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
@@ -25,7 +25,7 @@ impl<D: Digest> ContextWithAdd<Bit> for GC<'_, '_, D> {
         <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         <Self as cirrus_core::HasError>::Error,
     > {
-        Ok(Array::from_fn(|i| a[i] ^ b[i]))
+        Ok(array::from_fn(|i| a[i] ^ b[i]))
     }
 
     fn add_assign(
@@ -39,7 +39,7 @@ impl<D: Digest> ContextWithAdd<Bit> for GC<'_, '_, D> {
         Ok(())
     }
 }
-impl<D: Digest> ContextWithSub<Bit> for GC<'_, '_, D> {
+impl<D: Digest, const N: usize> ContextWithSub<Bit> for GC<'_, '_, D,N> {
     fn sub(
         &mut self,
         a: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
@@ -48,7 +48,7 @@ impl<D: Digest> ContextWithSub<Bit> for GC<'_, '_, D> {
         <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         <Self as cirrus_core::HasError>::Error,
     > {
-        Ok(Array::from_fn(|i| a[i] ^ b[i]))
+        Ok(array::from_fn(|i| a[i] ^ b[i]))
     }
 
     fn sub_assign(
@@ -62,14 +62,14 @@ impl<D: Digest> ContextWithSub<Bit> for GC<'_, '_, D> {
         Ok(())
     }
 }
-impl<D: Digest> ContextWithMul<Bit> for GC<'_, '_, D>{
+impl<D: Digest, const N: usize> ContextWithMul<Bit> for GC<'_, '_, D,N>{
     fn mul(&mut self,a: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,b: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped) -> Result<<Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,<Self as cirrus_core::HasError>::Error> {
         self.seed = D::digest(&self.seed);
-        let mut new = self.seed.clone();
-        new[0] |= 0x01;
+        let new = self.seed.clone();
+        let new: [u8; N] = array::from_fn(|i|new[i]);
         self.queue.push(array::from_fn(|i|{
-            let a = ((i & 1) == 1) ^ (self.delta[0] & 0x01 == 1);
-            let b = ((i & 2) == 2) ^ (self.delta[0] & 0x01 == 1);
+            let a = ((i & 1) == 1) ^ (a[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
+            let b = ((i & 2) == 2) ^ (b[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
             let r = a & b;
             let mut x = new.clone();
             if r{
