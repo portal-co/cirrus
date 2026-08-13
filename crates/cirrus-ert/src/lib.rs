@@ -299,11 +299,13 @@ pub fn ert_emit<W: Clone, E: Error>(
                     one.clone(),
                 )
                 .map_err(|e| ErtError::Emitted(e))?;
-                reg_consts[dest.0 as usize] =
-                    match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
+                reg_consts[dest.0 as usize] = match (offs[src1.0 as usize], offs[src2.0 as usize]) {
+                    ((Some(a), Some(b))) => Some(a.wrapping_sub(b) as u32),
+                    _ => match (reg_consts[src1.0 as usize], reg_consts[src2.0 as usize]) {
                         (Some(a), Some(b)) => Some(a.wrapping_sub(b)),
                         _ => None,
-                    };
+                    },
+                };
 
                 pc + 4
             }
