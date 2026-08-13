@@ -55,7 +55,7 @@ pub fn ert_emit<W: Clone, E: Error>(
     zero: W,
     one: W,
 ) -> Result<(), ErtError<E>> {
-    let mut sp: u32 = 0;
+    let mut sp: u32 = vstack.len() as u32 - 1;
     let mut rsp: u32 = 0;
     let mut offs: [Option<i32>; 32] = [const { None }; 32];
     loop {
@@ -700,6 +700,9 @@ pub fn ert_emit<W: Clone, E: Error>(
                     pc + 4
                 }
                 Some(0xffff_ffff) => {
+                    if sp + 1 != vstack.len() as u32{
+                        return Err(ErtError::Unexpected);
+                    }
                     return Ok(());
                 }
                 _ => return Err(ErtError::Unexpected),

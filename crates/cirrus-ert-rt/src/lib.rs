@@ -6,6 +6,7 @@ use core::{array, iter};
 use rand_core::{TryCryptoRng, TryRng};
 use sha2::Digest;
 /// Exit the program
+#[inline(always)]
 pub fn exit<T>() -> T {
     crate::exit_with!()
 }
