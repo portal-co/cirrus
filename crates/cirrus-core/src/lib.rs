@@ -2,6 +2,9 @@
 use core::{convert::Infallible, error::Error, ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign}};
 
 pub use paste::paste;
+pub trait Pusher<T>{
+    fn push(&mut self, x: T);
+}
 pub struct Bit(pub bool);
 impl Add for Bit{
     type Output = Bit;

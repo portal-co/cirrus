@@ -2,11 +2,9 @@
 
 use core::{array, convert::Infallible};
 
-use cirrus_core::{Bit, ContextWithAdd, ContextWithMul, ContextWithSub, ContextWithValue, HasError};
+use cirrus_core::{Bit, ContextWithAdd, ContextWithMul, ContextWithSub, ContextWithValue, HasError, Pusher};
 use digest::{Digest, array::Array};
-pub trait Pusher<T>{
-    fn push(&mut self, x: T);
-}
+
 pub struct GC<'a,'b,D: Digest>{
     pub queue: &'a mut (dyn Pusher<[Array<u8, D::OutputSize>; 4]> + 'b),
     pub seed: Array<u8,D::OutputSize>,
