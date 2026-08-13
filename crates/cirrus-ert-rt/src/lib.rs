@@ -1,7 +1,9 @@
 #![no_std]
 use core::arch::asm;
+use core::convert::Infallible;
 use core::{array, iter};
 
+use rand_core::{TryCryptoRng, TryRng};
 use sha2::Digest;
 /// Hash a value, with host-provided salts
 pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
@@ -25,7 +27,7 @@ pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
     unreachable!()
 }
 /// Sponge construction/XOF of [`hash`]
-pub fn hash_many(x: &[u8]) -> impl Iterator<Item = u8> {
+pub fn hash_many(x: &[u8]) -> Xof {
     let mut state = [0xff; 32];
     for c in x.chunks(16) {
         state = hash(state);
@@ -33,10 +35,53 @@ pub fn hash_many(x: &[u8]) -> impl Iterator<Item = u8> {
         state[0..(c.len())].copy_from_slice(c);
     }
     state = hash(state);
-    return iter::from_fn(move || {
-        let ext: [u8; 16] = array::from_fn(|i| state[i]);
-        state = hash(state);
-        Some(ext)
-    })
-    .flatten();
+    return Xof {
+        state: hash(state),
+        s: array::from_fn(|i| state[i]),
+        i: 0,
+    };
 }
+#[derive(Clone)]
+pub struct Xof {
+    state: [u8; 32],
+    s: [u8; 16],
+    i: u8,
+}
+impl Xof {
+    pub fn next_byte(&mut self) -> u8 {
+        let r = self.s[self.i as usize];
+        self.i += 1;
+        if self.i == 16 {
+            self.s = array::from_fn(|i| self.state[i]);
+            self.state = hash(self.state);
+            self.i = 0;
+        };
+        r
+    }
+}
+impl Iterator for Xof {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.next_byte())
+    }
+}
+impl TryRng for Xof {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for d in dst.iter_mut() {
+            *d = self.next_byte();
+        }
+        Ok(())
+    }
+}
+impl TryCryptoRng for Xof {}

@@ -5,4 +5,5 @@ version.workspace = true
 description.workspace = true
 
 [dependencies]
+rand_core = "0.10.1"
 sha2 = { version = "0.11.0", default-features = false }
