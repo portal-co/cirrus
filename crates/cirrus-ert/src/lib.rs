@@ -54,68 +54,76 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     mut reg_consts: &mut [Option<u32>; 32],
     zero: W,
     one: W,
-) -> impl FnMut([([W; 32], Option<u32>); N]) -> Result<[([W; 32], Option<u32>); M], ErtError<E>> {
-    return move |a| {
-        for (i, (a, b)) in a.into_iter().enumerate() {
-            match [
-                Reg::A0,
-                Reg::A1,
-                Reg::A2,
-                Reg::A3,
-                Reg::A4,
-                Reg::A5,
-                Reg::A6,
-                Reg::A7,
-            ]
-            .get(i)
-            .cloned()
-            {
-                Some(r) => {
-                    regs[r.0 as usize] = a;
-                    reg_consts[r.0 as usize] = b;
-                }
-                None => {
-                    let i = (vstack.len() - 32 * (i - 8));
-                    let c = &mut vstack[..i];
-                    for (j, x) in a.into_iter().enumerate() {
-                        c[c.len() - 32 + j] = x;
-                    }
+    args: [([W; 32], Option<u32>); N],
+) -> Result<[([W; 32], Option<u32>); M], ErtError<E>> {
+    for (i, (a, b)) in args.into_iter().enumerate() {
+        match [
+            Reg::A0,
+            Reg::A1,
+            Reg::A2,
+            Reg::A3,
+            Reg::A4,
+            Reg::A5,
+            Reg::A6,
+            Reg::A7,
+        ]
+        .get(i)
+        .cloned()
+        {
+            Some(r) => {
+                regs[r.0 as usize] = a;
+                reg_consts[r.0 as usize] = b;
+            }
+            None => {
+                let i = (vstack.len() - 32 * (i - 8));
+                let c = &mut vstack[..i];
+                for (j, x) in a.into_iter().enumerate() {
+                    c[c.len() - 32 + j] = x;
                 }
             }
         }
-        ert_emit(
-            t, hash, mem, rstack, vstack, pc, regs, reg_consts, zero.clone(), one.clone(),
-        )?;
-        let mut x: [MaybeUninit<([W; 32], Option<u32>)>; M] = [const { MaybeUninit::uninit() }; M];
-        for (i, v) in x.iter_mut().enumerate() {
-            match [
-                Reg::A0,
-                Reg::A1,
-                Reg::A2,
-                Reg::A3,
-                Reg::A4,
-                Reg::A5,
-                Reg::A6,
-                Reg::A7,
-            ]
-            .get(i)
-            .cloned()
-            {
-                Some(r) => {
-                    *v = MaybeUninit::new((
-                        regs[r.0 as usize].clone(),
-                        reg_consts[r.0 as usize].clone(),
-                    ));
-                }
-                None => {
-                    let i = (vstack.len() - 32 * (i - 8));
-                    let c = &mut vstack[..i];
-                    *v = MaybeUninit::new((array::from_fn(|i| c[c.len() - 32 + i].clone()), None))
-                }
+    }
+    ert_emit(
+        t,
+        hash,
+        mem,
+        rstack,
+        vstack,
+        pc,
+        regs,
+        reg_consts,
+        zero.clone(),
+        one.clone(),
+    )?;
+    let mut x: [MaybeUninit<([W; 32], Option<u32>)>; M] = [const { MaybeUninit::uninit() }; M];
+    for (i, v) in x.iter_mut().enumerate() {
+        match [
+            Reg::A0,
+            Reg::A1,
+            Reg::A2,
+            Reg::A3,
+            Reg::A4,
+            Reg::A5,
+            Reg::A6,
+            Reg::A7,
+        ]
+        .get(i)
+        .cloned()
+        {
+            Some(r) => {
+                *v = MaybeUninit::new((
+                    regs[r.0 as usize].clone(),
+                    reg_consts[r.0 as usize].clone(),
+                ));
+            }
+            None => {
+                let i = (vstack.len() - 32 * (i - 8));
+                let c = &mut vstack[..i];
+                *v = MaybeUninit::new((array::from_fn(|i| c[c.len() - 32 + i].clone()), None))
             }
         }
-        Ok(x.map(|a| unsafe { a.assume_init() }))
-    };
+    }
+    Ok(x.map(|a| unsafe { a.assume_init() }))
 }
 pub fn ert_emit<W: Clone, E: Error>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
