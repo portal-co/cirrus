@@ -45,6 +45,7 @@ pub fn simple_add<W: Clone, E: Error>(
 }
 pub fn ert_emit<W: Clone, E: Error>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
+    hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
     mem: &mut [u8],
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -678,6 +679,26 @@ pub fn ert_emit<W: Clone, E: Error>(
             }
             //ecall
             Inst::Ecall => match reg_consts[Reg::A0.0 as usize] {
+                Some(0) => {
+                    let h = hash(&regs[Reg::A1.0 as usize..][..(256 / 32)])
+                        .map_err(|e| ErtError::Emitted(e))?;
+                    for ((r, a), h) in regs[Reg::A1.0 as usize..][..(256 / 32)]
+                        .iter_mut()
+                        .zip(reg_consts[Reg::A1.0 as usize..][..(256 / 32)].iter_mut())
+                        .zip(h.chunks_exact(256 / 32))
+                    {
+                        let h = u32::from_le_bytes(array::from_fn(|i| h[i]));
+                        *a = Some(h);
+                        for i in 0..32 {
+                            r[i] = if h >> i == 0 {
+                                zero.clone()
+                            } else {
+                                one.clone()
+                            };
+                        }
+                    }
+                    pc + 4
+                }
                 _ => return Err(ErtError::Unexpected),
             },
             _ => return Err(ErtError::Unexpected),
