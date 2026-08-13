@@ -699,6 +699,9 @@ pub fn ert_emit<W: Clone, E: Error>(
                     }
                     pc + 4
                 }
+                Some(0xffff_ffff) => {
+                    return Ok(());
+                }
                 _ => return Err(ErtError::Unexpected),
             },
             _ => return Err(ErtError::Unexpected),
