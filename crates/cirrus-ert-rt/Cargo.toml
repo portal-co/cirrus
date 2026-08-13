@@ -1,0 +1,7 @@
+[package]
+name = "cirrus-ert-rt"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
