@@ -1,10 +1,32 @@
 #![no_std]
-use core::arch::asm;
+pub use core::arch::asm;
 use core::convert::Infallible;
 use core::{array, iter};
 
 use rand_core::{TryCryptoRng, TryRng};
 use sha2::Digest;
+/// Exit the program
+pub fn exit<T>() -> T {
+    crate::exit_with!()
+}
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[macro_export]
+macro_rules! exit_with {
+    ($($a:tt)*) => {
+        loop{
+            unsafe{
+                $crate::asm!("ecall", in("a0") 0xffff_ffff, $($a)*)
+            }
+        }
+    };
+}
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+#[macro_export]
+macro_rules! exit_with {
+    ($($a:tt)*) => {
+        loop {}
+    };
+}
 /// Hash a value, with host-provided salts
 pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
     v = sha2::Sha256::digest(&v).0;
