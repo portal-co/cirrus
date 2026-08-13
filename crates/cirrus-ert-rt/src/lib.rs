@@ -11,6 +11,7 @@ pub fn exit<T>() -> T {
 }
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 #[macro_export]
+/// Exit the program, with extra register arguments
 macro_rules! exit_with {
     ($($a:tt)*) => {
         loop{
@@ -22,6 +23,7 @@ macro_rules! exit_with {
 }
 #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 #[macro_export]
+/// Exit the program, with extra register arguments
 macro_rules! exit_with {
     ($($a:tt)*) => {
         loop {}
