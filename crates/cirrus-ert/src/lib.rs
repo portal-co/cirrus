@@ -676,6 +676,10 @@ pub fn ert_emit<W: Clone, E: Error>(
                     pc + 4
                 }
             }
+            //ecall
+            Inst::Ecall => match reg_consts[Reg::A0.0 as usize] {
+                _ => return Err(ErtError::Unexpected),
+            },
             _ => return Err(ErtError::Unexpected),
         }
     }
