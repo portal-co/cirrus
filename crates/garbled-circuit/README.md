@@ -10,5 +10,7 @@ a replacement garbling scheme.
 
 All implementations use the Boolean-context seam consumed by the ERT facades.
 Their tests must exercise the same primitive truth tables and locked RV32/Thumb
-SHA-256 workloads, while treating transport and coroutine scheduling as an
-integrator responsibility.
+SHA-256 workloads. Each garbler also needs a paired host evaluator that pulls
+its ordered table/hint records through an `Iterator`; this is a completeness
+check, not a transport or authentication protocol. Transport and coroutine
+scheduling remain an integrator responsibility.
