@@ -607,7 +607,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|path| path.parent())
-            .expect("the garbled-circuit crate lives under the workspace crates directory")
+            .and_then(|path| path.parent())
+            .expect("the garbled-circuit crate lives under the workspace family directory")
             .to_path_buf()
     }
 

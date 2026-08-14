@@ -32,7 +32,7 @@ keeping the interpreted code and constants at the high RAM address.
 
 ## Streaming garbled circuits
 
-[`cirrus-garbled-circuit`](crates/cirrus-garbled-circuit/src/lib.rs) is the
+[`cirrus-garbled-circuit`](crates/garbled-circuit/cirrus-garbled-circuit/src/lib.rs) is the
 stable four-row-table baseline backend. It emits every non-free table to a
 caller-supplied `Pusher` in circuit order; it deliberately does not own a
 circuit buffer, network driver, allocator, or async runtime. An embedded

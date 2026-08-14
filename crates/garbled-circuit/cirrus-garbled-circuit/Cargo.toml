@@ -5,11 +5,11 @@ version.workspace = true
 description.workspace = true
 
 [dependencies]
-cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 digest = "0.11.3"
 
 [dev-dependencies]
-cirrus-armv8m-ert = { path = "../ert/cirrus-armv8m-ert" }
-cirrus-ert = { path = "../ert/cirrus-ert" }
+cirrus-armv8m-ert = { path = "../../ert/cirrus-armv8m-ert" }
+cirrus-ert = { path = "../../ert/cirrus-ert" }
 rv-asm.workspace = true
 sha2 = { version = "0.11.0", default-features = false }
