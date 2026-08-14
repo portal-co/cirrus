@@ -19,6 +19,7 @@ use std::fmt;
 
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
+    ContextWithValue, HasError,
 };
 use cirrus_ert_core::{add_bits_with, BitOp as WordBitOp};
 use cirrus_recompile_core::{Idx, Program, Recorder};
@@ -34,6 +35,43 @@ use inkwell::values::{
 };
 use inkwell::IntPredicate;
 
+/// Boolean operation context used by the in-memory LLVM runner.
+///
+/// `Recorder` is the lowering adapter, while `()` and user-provided wrappers
+/// can execute the same LLVM IR directly.  The runner keeps concrete shadows
+/// itself; this backend only sees Boolean values or wires.
+pub trait ExecutionBackend:
+    HasError
+    + ContextWithValue<bool, Wrapped = Self::Wire>
+    + ContextWithCreate<bool>
+    + ContextWithBitAnd<bool>
+    + ContextWithBitOr<bool>
+    + ContextWithBitXor<bool>
+    + ContextWithMux<bool>
+{
+    /// The backend's Boolean wire or direct Boolean value.
+    type Wire: Clone;
+    /// Convert a backend failure into a contextual diagnostic string.
+    fn describe_error(error: Self::Error) -> String;
+}
+
+impl<T> ExecutionBackend for T
+where
+    T: ContextWithCreate<bool>
+        + ContextWithBitAnd<bool>
+        + ContextWithBitOr<bool>
+        + ContextWithBitXor<bool>
+        + ContextWithMux<bool>,
+    T::Wrapped: Clone,
+    T::Error: fmt::Display,
+{
+    type Wire = T::Wrapped;
+
+    fn describe_error(error: Self::Error) -> String {
+        error.to_string()
+    }
+}
+
 /// The LLVM container supplied to [`lower`].
 #[derive(Clone, Copy, Debug)]
 pub enum ModuleInput<'a> {
@@ -44,7 +82,10 @@ pub enum ModuleInput<'a> {
 }
 
 /// Explicit data classification and output selection for one lowering run.
-pub struct LowerRequest<'a> {
+pub struct LowerRequest<'a, Backend = Recorder>
+where
+    Backend: ExecutionBackend,
+{
     /// Name of the function to execute.
     pub entry: &'a str,
     /// One binding for every entry-function parameter, in ABI order.
@@ -56,7 +97,7 @@ pub struct LowerRequest<'a> {
     /// Bounded-execution limits.
     pub limits: LoweringLimits,
     /// Declared-call adapters, keyed by their LLVM declaration name.
-    pub host_calls: &'a HostCallRegistry,
+    pub host_calls: &'a HostCallRegistry<Backend>,
 }
 
 /// Bind one entry-function parameter.
@@ -155,20 +196,20 @@ impl Default for LoweringLimits {
 /// A symbolic value contains only circuit slot identities; it never exposes a
 /// secret plaintext bit.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HostValue {
+pub enum HostValue<W = Idx> {
     /// An LLVM integer value.
-    Integer(HostInteger),
+    Integer(HostInteger<W>),
     /// A concrete-address pointer into a request, global, or stack region.
     Pointer { region: usize, offset: usize },
 }
 
 /// A concrete or symbolic fixed-width integer passed to a [`HostCall`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HostInteger {
+pub enum HostInteger<W = Idx> {
     /// A public fixed-width value.
     Concrete { width: u32, value: u64 },
     /// A secret fixed-width value, low bit first.
-    Symbolic { width: u32, bits: Vec<Idx> },
+    Symbolic { width: u32, bits: Vec<W> },
 }
 
 /// One LLVM type permitted in a [`HostCallSignature`].
@@ -200,27 +241,37 @@ impl HostCallSignature {
 }
 
 /// A user-defined lowering for an LLVM declaration.
-pub trait HostCall: Send + Sync {
+pub trait HostCall<Backend = Recorder>: Send + Sync
+where
+    Backend: ExecutionBackend,
+{
     /// Lower a validated, direct call without observing symbolic plaintext.
     ///
     /// Return `None` for a `void` call and `Some` for an integer or pointer
     /// result which matches the LLVM declaration's result type.
     fn lower(
         &self,
-        context: &mut HostCallContext<'_>,
-        arguments: &[HostValue],
-    ) -> Result<Option<HostValue>, FrontendError>;
+        backend: &mut Backend,
+        context: &HostCallContext<Backend::Wire>,
+        arguments: &[HostValue<Backend::Wire>],
+    ) -> Result<Option<HostValue<Backend::Wire>>, FrontendError>;
 }
 
-/// Circuit construction surface made available to a [`HostCall`].
-pub struct HostCallContext<'a> {
-    engine: &'a mut Engine,
+/// Concrete constants and Boolean-word helpers available to a [`HostCall`].
+///
+/// The [`HostCall::lower`] backend parameter is deliberately separate from
+/// this context, just like ERT's `ecall`/`svc` handler receives its concrete
+/// generic context directly.  This lets an adapter call backend-specific
+/// operations or inspect wrapper state without exposing symbolic plaintext.
+pub struct HostCallContext<W> {
+    zero: W,
+    one: W,
 }
 
-impl HostCallContext<'_> {
+impl<W: Clone> HostCallContext<W> {
     /// Construct a public integer.
-    pub fn concrete(&mut self, width: u32, value: u64) -> Result<HostInteger, FrontendError> {
-        self.engine.check_width(width)?;
+    pub fn concrete(&self, width: u32, value: u64) -> Result<HostInteger<W>, FrontendError> {
+        check_width(width)?;
         Ok(HostInteger::Concrete {
             width,
             value: value & mask(width),
@@ -228,71 +279,105 @@ impl HostCallContext<'_> {
     }
 
     /// Form a bitwise XOR with constant-side simplification.
-    pub fn xor(
-        &mut self,
-        left: HostInteger,
-        right: HostInteger,
-    ) -> Result<HostInteger, FrontendError> {
-        let value = self
-            .engine
-            .bitwise(int_from_host(left)?, int_from_host(right)?, BitOp::Xor)?;
-        Ok(self.engine.host_int(value))
+    pub fn xor<Backend: ExecutionBackend<Wire = W>>(
+        &self,
+        backend: &mut Backend,
+        left: HostInteger<W>,
+        right: HostInteger<W>,
+    ) -> Result<HostInteger<W>, FrontendError> {
+        self.with_engine(backend, |engine| {
+            engine.bitwise(int_from_host(left)?, int_from_host(right)?, BitOp::Xor)
+        })
     }
 
     /// Form a bitwise AND with constant-side simplification.
-    pub fn and(
-        &mut self,
-        left: HostInteger,
-        right: HostInteger,
-    ) -> Result<HostInteger, FrontendError> {
-        let value = self
-            .engine
-            .bitwise(int_from_host(left)?, int_from_host(right)?, BitOp::And)?;
-        Ok(self.engine.host_int(value))
+    pub fn and<Backend: ExecutionBackend<Wire = W>>(
+        &self,
+        backend: &mut Backend,
+        left: HostInteger<W>,
+        right: HostInteger<W>,
+    ) -> Result<HostInteger<W>, FrontendError> {
+        self.with_engine(backend, |engine| {
+            engine.bitwise(int_from_host(left)?, int_from_host(right)?, BitOp::And)
+        })
     }
 
     /// Form a fixed-width modular sum with constant-side simplification.
-    pub fn add(
-        &mut self,
-        left: HostInteger,
-        right: HostInteger,
-    ) -> Result<HostInteger, FrontendError> {
-        let value = self.engine.add(int_from_host(left)?, int_from_host(right)?);
-        Ok(self.engine.host_int(value))
+    pub fn add<Backend: ExecutionBackend<Wire = W>>(
+        &self,
+        backend: &mut Backend,
+        left: HostInteger<W>,
+        right: HostInteger<W>,
+    ) -> Result<HostInteger<W>, FrontendError> {
+        self.with_engine(backend, |engine| {
+            Ok(engine.add(int_from_host(left)?, int_from_host(right)?))
+        })
     }
 
     /// Select `then_value` when `condition` is set, otherwise `else_value`.
-    pub fn select(
-        &mut self,
-        condition: HostInteger,
-        then_value: HostInteger,
-        else_value: HostInteger,
-    ) -> Result<HostInteger, FrontendError> {
+    pub fn select<Backend: ExecutionBackend<Wire = W>>(
+        &self,
+        backend: &mut Backend,
+        condition: HostInteger<W>,
+        then_value: HostInteger<W>,
+        else_value: HostInteger<W>,
+    ) -> Result<HostInteger<W>, FrontendError> {
         let condition = int_from_host(condition)?;
         if condition.width != 1 {
             return Err(FrontendError::request("host select condition must be i1"));
         }
-        let value = self.engine.select(
-            condition,
-            int_from_host(then_value)?,
-            int_from_host(else_value)?,
-        )?;
-        Ok(self.engine.host_int(value))
+        self.with_engine(backend, |engine| {
+            engine.select(
+                condition,
+                int_from_host(then_value)?,
+                int_from_host(else_value)?,
+            )
+        })
+    }
+
+    fn with_engine<Backend: ExecutionBackend<Wire = W>>(
+        &self,
+        backend: &mut Backend,
+        run: impl FnOnce(&mut Engine<'_, Backend>) -> Result<SymInt<W>, FrontendError>,
+    ) -> Result<HostInteger<W>, FrontendError> {
+        let mut engine = Engine::from_constants(backend, self.zero.clone(), self.one.clone());
+        let value = run(&mut engine)?;
+        engine.check_error()?;
+        Ok(engine.host_int(value))
     }
 }
 
-/// The declaration-name registry used by [`LowerRequest`].
-#[derive(Default)]
-pub struct HostCallRegistry {
-    calls: BTreeMap<String, RegisteredHostCall>,
+/// The declaration registry used by [`LowerRequest`].
+///
+/// Registrations made with [`HostCallRegistry::register_ir`] take precedence
+/// over the name fallback. This lets a caller bind host behavior to a specific
+/// in-memory declaration without depending on its textual name.
+pub struct HostCallRegistry<Backend = Recorder>
+where
+    Backend: ExecutionBackend,
+{
+    calls: BTreeMap<String, RegisteredHostCall<Backend>>,
+    ir_calls: HashMap<usize, RegisteredHostCall<Backend>>,
 }
 
-struct RegisteredHostCall {
+struct RegisteredHostCall<Backend>
+where
+    Backend: ExecutionBackend,
+{
     signature: HostCallSignature,
-    call: Box<dyn HostCall>,
+    call: Box<dyn HostCall<Backend>>,
 }
 
-impl HostCallRegistry {
+impl<Backend: ExecutionBackend> Default for HostCallRegistry<Backend> {
+    fn default() -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            ir_calls: HashMap::new(),
+        }
+    }
+}
+
+impl<Backend: ExecutionBackend> HostCallRegistry<Backend> {
     /// Construct an empty registry.
     pub fn new() -> Self {
         Self::default()
@@ -304,7 +389,7 @@ impl HostCallRegistry {
         &mut self,
         name: impl Into<String>,
         signature: HostCallSignature,
-        call: impl HostCall + 'static,
+        call: impl HostCall<Backend> + 'static,
     ) {
         self.calls.insert(
             name.into(),
@@ -315,8 +400,28 @@ impl HostCallRegistry {
         );
     }
 
-    fn get(&self, name: &str) -> Option<&RegisteredHostCall> {
-        self.calls.get(name)
+    /// Register an adapter for this in-memory LLVM declaration.  It is keyed
+    /// by IR identity, so distinct declarations with the same textual name in
+    /// separate modules can safely use different adapters.
+    pub fn register_ir<'ctx>(
+        &mut self,
+        function: FunctionValue<'ctx>,
+        signature: HostCallSignature,
+        call: impl HostCall<Backend> + 'static,
+    ) {
+        self.ir_calls.insert(
+            function.as_value_ref() as usize,
+            RegisteredHostCall {
+                signature,
+                call: Box::new(call),
+            },
+        );
+    }
+
+    fn get<'ctx>(&self, function: FunctionValue<'ctx>) -> Option<&RegisteredHostCall<Backend>> {
+        self.ir_calls
+            .get(&(function.as_value_ref() as usize))
+            .or_else(|| self.calls.get(&cstr(function.get_name())))
     }
 }
 
@@ -350,6 +455,12 @@ impl FrontendError {
             message: format!("LLVM concrete-control execution failed: {}", message.into()),
         }
     }
+
+    fn backend(error: impl fmt::Display) -> Self {
+        Self {
+            message: format!("LLVM backend operation failed: {error}"),
+        }
+    }
 }
 
 impl fmt::Display for FrontendError {
@@ -364,7 +475,7 @@ impl std::error::Error for FrontendError {}
 pub fn lower(
     context: &Context,
     input: ModuleInput<'_>,
-    request: &LowerRequest<'_>,
+    request: &LowerRequest<'_, Recorder>,
 ) -> Result<Program, FrontendError> {
     let module = match input {
         ModuleInput::Assembly(source) => context
@@ -385,8 +496,22 @@ pub fn lower(
 /// Lower an already parsed LLVM module.
 pub fn lower_module<'module, 'ctx>(
     module: &'module Module<'ctx>,
-    request: &LowerRequest<'_>,
+    request: &LowerRequest<'_, Recorder>,
 ) -> Result<Program, FrontendError> {
+    let mut recorder = Recorder::new();
+    let execution = execute_module(module, request, &mut recorder)?;
+    Ok(recorder.finish(execution.inputs, execution.outputs))
+}
+
+/// Execute an already parsed, in-memory LLVM module through any Boolean
+/// backend.  This is the frontend's primary seam; [`lower_module`] is merely
+/// the [`Recorder`] adapter which turns the resulting wires into a raw
+/// [`Program`].
+pub fn execute_module<'module, 'ctx, Backend: ExecutionBackend>(
+    module: &'module Module<'ctx>,
+    request: &LowerRequest<'_, Backend>,
+    backend: &mut Backend,
+) -> Result<ExecutionResult<Backend::Wire>, FrontendError> {
     let entry = module.get_function(request.entry).ok_or_else(|| {
         FrontendError::request(format!("entry function `{}` does not exist", request.entry))
     })?;
@@ -395,7 +520,7 @@ pub fn lower_module<'module, 'ctx>(
     }
     let data_layout =
         TargetData::create(module.get_data_layout().as_str().to_string_lossy().as_ref());
-    let mut lowerer = Lowerer::new(module, data_layout, request)?;
+    let mut lowerer = Lowerer::new(module, data_layout, request, backend)?;
     let arguments = lowerer.bind_entry(entry)?;
     // Bind entry inputs before global regions so the raw Program's input order
     // is stable and follows the public request order: arguments, then globals.
@@ -404,9 +529,17 @@ pub fn lower_module<'module, 'ctx>(
     lowerer.finish()
 }
 
+/// Wires supplied and produced by [`execute_module`] in request order.
+pub struct ExecutionResult<W> {
+    /// Symbolic scalar and region input wires in deterministic request order.
+    pub inputs: Vec<W>,
+    /// Explicitly requested return and memory wires in export order.
+    pub outputs: Vec<W>,
+}
+
 #[derive(Clone, Debug)]
-enum Value {
-    Integer(SymInt),
+enum Value<W = Idx> {
+    Integer(SymInt<W>),
     Pointer(Pointer),
 }
 
@@ -417,50 +550,53 @@ struct Pointer {
 }
 
 #[derive(Clone, Debug)]
-struct Region {
-    bytes: Vec<SymInt>,
+struct Region<W = Idx> {
+    bytes: Vec<SymInt<W>>,
     writable: bool,
     label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SymInt {
+struct SymInt<W = Idx> {
     width: u32,
-    value: SymRepr,
+    value: SymRepr<W>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SymRepr {
+enum SymRepr<W = Idx> {
     Concrete(u64),
-    Wires(Vec<Idx>),
+    Wires(Vec<W>),
 }
 
-struct Lowerer<'module, 'ctx, 'request> {
+struct Lowerer<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend> {
     module: &'module Module<'ctx>,
     target_data: TargetData,
-    request: &'request LowerRequest<'request>,
-    engine: Engine,
-    regions: Vec<Region>,
+    request: &'request LowerRequest<'request, Backend>,
+    engine: Engine<'backend, Backend>,
+    regions: Vec<Region<Backend::Wire>>,
     globals: HashMap<String, usize>,
     argument_regions: Vec<Option<usize>>,
     visits: usize,
     calls: usize,
     alloca_bytes: usize,
     call_stack: Vec<String>,
-    returned: Option<Value>,
+    returned: Option<Value<Backend::Wire>>,
 }
 
-impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
+impl<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend>
+    Lowerer<'module, 'ctx, 'request, 'backend, Backend>
+{
     fn new(
         module: &'module Module<'ctx>,
         target_data: TargetData,
-        request: &'request LowerRequest<'request>,
+        request: &'request LowerRequest<'request, Backend>,
+        backend: &'backend mut Backend,
     ) -> Result<Self, FrontendError> {
         Ok(Self {
             module,
             target_data,
             request,
-            engine: Engine::new(),
+            engine: Engine::new(backend)?,
             regions: Vec::new(),
             globals: HashMap::new(),
             argument_regions: Vec::new(),
@@ -498,7 +634,10 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(())
     }
 
-    fn bind_entry(&mut self, function: FunctionValue<'ctx>) -> Result<Vec<Value>, FrontendError> {
+    fn bind_entry(
+        &mut self,
+        function: FunctionValue<'ctx>,
+    ) -> Result<Vec<Value<Backend::Wire>>, FrontendError> {
         let parameters = function.get_params();
         if parameters.len() != self.request.arguments.len() {
             return Err(FrontendError::request(format!(
@@ -553,21 +692,23 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         &mut self,
         binding: &RegionBinding,
         label: String,
-    ) -> Result<Vec<SymInt>, FrontendError> {
+    ) -> Result<Vec<SymInt<Backend::Wire>>, FrontendError> {
         binding
             .bytes
             .iter()
             .map(|byte| match byte {
-                RegionByte::Concrete(value) => {
-                    Ok::<SymInt, FrontendError>(SymInt::concrete(8, u64::from(*value)))
+                RegionByte::Concrete(value) => Ok::<SymInt<Backend::Wire>, FrontendError>(
+                    SymInt::concrete(8, u64::from(*value)),
+                ),
+                RegionByte::Symbolic => {
+                    Ok::<SymInt<Backend::Wire>, FrontendError>(self.engine.symbolic(8))
                 }
-                RegionByte::Symbolic => Ok::<SymInt, FrontendError>(self.engine.symbolic(8)),
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| FrontendError::request(format!("{label}: {error}")))
     }
 
-    fn add_region(&mut self, bytes: Vec<SymInt>, writable: bool, label: String) {
+    fn add_region(&mut self, bytes: Vec<SymInt<Backend::Wire>>, writable: bool, label: String) {
         self.regions.push(Region {
             bytes,
             writable,
@@ -578,8 +719,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn execute_function(
         &mut self,
         function: FunctionValue<'ctx>,
-        arguments: Vec<Value>,
-    ) -> Result<Option<Value>, FrontendError> {
+        arguments: Vec<Value<Backend::Wire>>,
+    ) -> Result<Option<Value<Backend::Wire>>, FrontendError> {
         let name = cstr(function.get_name());
         if self.call_stack.iter().any(|active| active == &name) {
             return Err(FrontendError::unsupported(format!(
@@ -646,7 +787,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         &mut self,
         block: BasicBlock<'ctx>,
         predecessor: Option<BasicBlock<'ctx>>,
-        values: &mut HashMap<BasicValueEnum<'ctx>, Value>,
+        values: &mut HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
     ) -> Result<(), FrontendError> {
         let mut updates = Vec::new();
         for instruction in block.get_instructions() {
@@ -687,10 +828,10 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn execute_instruction(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        values: &mut HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<Flow<'ctx>, FrontendError> {
+        values: &mut HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<Flow<'ctx, Backend::Wire>, FrontendError> {
         let opcode = instruction.get_opcode();
-        let operands = |this: &mut Self| -> Result<Vec<Value>, FrontendError> {
+        let operands = |this: &mut Self| -> Result<Vec<Value<Backend::Wire>>, FrontendError> {
             (0..instruction.get_num_operands())
                 .map(|index| match instruction.get_operand(index) {
                     Some(Operand::Value(value)) => this.value(value, values),
@@ -1006,8 +1147,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn branch(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        values: &HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<Flow<'ctx>, FrontendError> {
+        values: &HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<Flow<'ctx, Backend::Wire>, FrontendError> {
         match instruction.get_num_operands() {
             1 => Ok(Flow::Branch(
                 instruction
@@ -1043,8 +1184,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn switch(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        values: &HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<Flow<'ctx>, FrontendError> {
+        values: &HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<Flow<'ctx, Backend::Wire>, FrontendError> {
         let condition = instruction
             .get_operand(0)
             .and_then(Operand::value)
@@ -1084,8 +1225,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn call(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        values: &mut HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<Flow<'ctx>, FrontendError> {
+        values: &mut HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<Flow<'ctx, Backend::Wire>, FrontendError> {
         self.calls = self
             .calls
             .checked_add(1)
@@ -1134,8 +1275,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn execute_declaration(
         &mut self,
         function: FunctionValue<'ctx>,
-        arguments: Vec<Value>,
-    ) -> Result<Option<Value>, FrontendError> {
+        arguments: Vec<Value<Backend::Wire>>,
+    ) -> Result<Option<Value<Backend::Wire>>, FrontendError> {
         let name = cstr(function.get_name());
         if name.starts_with("llvm.lifetime.") || name.starts_with("llvm.dbg.") {
             return Ok(None);
@@ -1178,7 +1319,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
             self.write_bytes(*destination, vec![byte; len])?;
             return Ok(None);
         }
-        let adapter = self.request.host_calls.get(&name).ok_or_else(|| {
+        let adapter = self.request.host_calls.get(function).ok_or_else(|| {
             FrontendError::unsupported(format!("declaration `{name}` has no HostCall adapter"))
         })?;
         self.validate_host_signature(function, &adapter.signature)?;
@@ -1187,10 +1328,13 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
             .cloned()
             .map(|value| self.to_host(value))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut context = HostCallContext {
-            engine: &mut self.engine,
+        let context = HostCallContext {
+            zero: self.engine.zero.clone(),
+            one: self.engine.one.clone(),
         };
-        let result = adapter.call.lower(&mut context, &host_arguments)?;
+        let result = adapter
+            .call
+            .lower(self.engine.backend, &context, &host_arguments)?;
         self.from_host_result(function, result)
     }
 
@@ -1232,7 +1376,10 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(())
     }
 
-    fn to_host(&self, value: Value) -> Result<HostValue, FrontendError> {
+    fn to_host(
+        &self,
+        value: Value<Backend::Wire>,
+    ) -> Result<HostValue<Backend::Wire>, FrontendError> {
         Ok(match value {
             Value::Integer(value) => HostValue::Integer(match value.value {
                 SymRepr::Concrete(bits) => HostInteger::Concrete {
@@ -1254,8 +1401,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn from_host_result(
         &mut self,
         function: FunctionValue<'ctx>,
-        result: Option<HostValue>,
-    ) -> Result<Option<Value>, FrontendError> {
+        result: Option<HostValue<Backend::Wire>>,
+    ) -> Result<Option<Value<Backend::Wire>>, FrontendError> {
         match (function.get_type().get_return_type(), result) {
             (None, None) => Ok(None),
             (Some(BasicTypeEnum::IntType(int)), Some(HostValue::Integer(value))) => {
@@ -1286,8 +1433,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn value(
         &mut self,
         value: BasicValueEnum<'ctx>,
-        values: &HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<Value, FrontendError> {
+        values: &HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<Value<Backend::Wire>, FrontendError> {
         if let Some(value) = values.get(&value) {
             return Ok(value.clone());
         }
@@ -1326,8 +1473,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn integer(
         &mut self,
         value: BasicValueEnum<'ctx>,
-        values: &HashMap<BasicValueEnum<'ctx>, Value>,
-    ) -> Result<SymInt, FrontendError> {
+        values: &HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         match self.value(value, values)? {
             Value::Integer(value) => Ok(value),
             Value::Pointer(_) => Err(FrontendError::unsupported("pointer used as integer")),
@@ -1337,7 +1484,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn pointer(
         &mut self,
         value: BasicValueEnum<'ctx>,
-        values: &HashMap<BasicValueEnum<'ctx>, Value>,
+        values: &HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
     ) -> Result<Pointer, FrontendError> {
         match self.value(value, values)? {
             Value::Pointer(value) => Ok(value),
@@ -1348,8 +1495,8 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn assign_integer(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        value: SymInt,
-        values: &mut HashMap<BasicValueEnum<'ctx>, Value>,
+        value: SymInt<Backend::Wire>,
+        values: &mut HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
     ) -> Result<(), FrontendError> {
         let width = integer_width(instruction)?;
         if value.width != width {
@@ -1365,7 +1512,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         &mut self,
         instruction: InstructionValue<'ctx>,
         value: Pointer,
-        values: &mut HashMap<BasicValueEnum<'ctx>, Value>,
+        values: &mut HashMap<BasicValueEnum<'ctx>, Value<Backend::Wire>>,
     ) -> Result<(), FrontendError> {
         values.insert(basic_instruction(instruction)?, Value::Pointer(value));
         Ok(())
@@ -1431,12 +1578,20 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(())
     }
 
-    fn read_bytes(&self, pointer: Pointer, len: usize) -> Result<Vec<SymInt>, FrontendError> {
+    fn read_bytes(
+        &self,
+        pointer: Pointer,
+        len: usize,
+    ) -> Result<Vec<SymInt<Backend::Wire>>, FrontendError> {
         self.check_address(pointer, len)?;
         Ok(self.regions[pointer.region].bytes[pointer.offset..pointer.offset + len].to_vec())
     }
 
-    fn write_bytes(&mut self, pointer: Pointer, bytes: Vec<SymInt>) -> Result<(), FrontendError> {
+    fn write_bytes(
+        &mut self,
+        pointer: Pointer,
+        bytes: Vec<SymInt<Backend::Wire>>,
+    ) -> Result<(), FrontendError> {
         self.check_address(pointer, bytes.len())?;
         let region = &mut self.regions[pointer.region];
         if !region.writable {
@@ -1449,7 +1604,11 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(())
     }
 
-    fn load_integer(&mut self, pointer: Pointer, width: u32) -> Result<SymInt, FrontendError> {
+    fn load_integer(
+        &mut self,
+        pointer: Pointer,
+        width: u32,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.engine.check_width(width)?;
         let bytes = self.read_bytes(pointer, (width / 8).max(1) as usize)?;
         let mut output = SymInt::concrete(width, 0);
@@ -1466,7 +1625,11 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(output)
     }
 
-    fn store_integer(&mut self, pointer: Pointer, value: SymInt) -> Result<(), FrontendError> {
+    fn store_integer(
+        &mut self,
+        pointer: Pointer,
+        value: SymInt<Backend::Wire>,
+    ) -> Result<(), FrontendError> {
         self.engine.check_width(value.width)?;
         let len = (value.width / 8).max(1) as usize;
         let mut bytes = Vec::with_capacity(len);
@@ -1488,7 +1651,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
     fn constant_bytes(
         &mut self,
         value: BasicValueEnum<'ctx>,
-    ) -> Result<Vec<SymInt>, FrontendError> {
+    ) -> Result<Vec<SymInt<Backend::Wire>>, FrontendError> {
         let type_ = value.get_type();
         let len = usize::try_from(self.target_data.get_abi_size(&type_))
             .map_err(|_| FrontendError::unsupported("global initializer too large"))?;
@@ -1501,7 +1664,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         &mut self,
         value: BasicValueEnum<'ctx>,
         offset: usize,
-        bytes: &mut [SymInt],
+        bytes: &mut [SymInt<Backend::Wire>],
     ) -> Result<(), FrontendError> {
         match value {
             BasicValueEnum::IntValue(value) => {
@@ -1587,7 +1750,7 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Program, FrontendError> {
+    fn finish(mut self) -> Result<ExecutionResult<Backend::Wire>, FrontendError> {
         let return_value = self.returned.take();
         let mut outputs = Vec::new();
         for export in self.request.exports {
@@ -1641,21 +1804,22 @@ impl<'module, 'ctx, 'request> Lowerer<'module, 'ctx, 'request> {
                 }
             }
         }
-        Ok(self.engine.finish(outputs))
+        self.engine.finish(outputs)
     }
 }
 
-enum Flow<'ctx> {
+enum Flow<'ctx, W = Idx> {
     Continue,
     Branch(BasicBlock<'ctx>),
-    Return(Option<Value>),
+    Return(Option<Value<W>>),
 }
 
-struct Engine {
-    recorder: Recorder,
-    inputs: Vec<Idx>,
-    zero: Idx,
-    one: Idx,
+struct Engine<'backend, Backend: ExecutionBackend> {
+    backend: &'backend mut Backend,
+    inputs: Vec<Backend::Wire>,
+    zero: Backend::Wire,
+    one: Backend::Wire,
+    error: Option<FrontendError>,
 }
 
 #[derive(Clone, Copy)]
@@ -1672,39 +1836,72 @@ enum ShiftOp {
     ArithmeticRight,
 }
 
-impl Engine {
-    fn new() -> Self {
-        let mut recorder = Recorder::new();
-        let zero = recorder.create(false).expect("Recorder is infallible");
-        let one = recorder.create(true).expect("Recorder is infallible");
+impl<'backend, Backend: ExecutionBackend> Engine<'backend, Backend> {
+    fn new(backend: &'backend mut Backend) -> Result<Self, FrontendError> {
+        let zero = backend
+            .create(false)
+            .map_err(|error| FrontendError::backend(Backend::describe_error(error)))?;
+        let one = backend
+            .create(true)
+            .map_err(|error| FrontendError::backend(Backend::describe_error(error)))?;
+        Ok(Self::from_constants(backend, zero, one))
+    }
+
+    fn from_constants(
+        backend: &'backend mut Backend,
+        zero: Backend::Wire,
+        one: Backend::Wire,
+    ) -> Self {
         Self {
-            recorder,
+            backend,
             inputs: Vec::new(),
             zero,
             one,
+            error: None,
         }
     }
 
-    fn finish(self, outputs: Vec<Idx>) -> Program {
-        self.recorder.finish(self.inputs, outputs)
+    fn finish(
+        mut self,
+        outputs: Vec<Backend::Wire>,
+    ) -> Result<ExecutionResult<Backend::Wire>, FrontendError> {
+        self.check_error()?;
+        Ok(ExecutionResult {
+            inputs: self.inputs,
+            outputs,
+        })
+    }
+
+    fn check_error(&mut self) -> Result<(), FrontendError> {
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn record_backend_error(&mut self, error: Backend::Error) {
+        if self.error.is_none() {
+            self.error = Some(FrontendError::backend(Backend::describe_error(error)));
+        }
     }
 
     fn check_width(&self, width: u32) -> Result<(), FrontendError> {
-        if matches!(width, 1 | 8 | 16 | 32 | 64) {
-            Ok(())
-        } else {
-            Err(FrontendError::unsupported(format!(
-                "integer width i{width}"
-            )))
-        }
+        check_width(width)
     }
 
-    fn symbolic(&mut self, width: u32) -> SymInt {
+    fn symbolic(&mut self, width: u32) -> SymInt<Backend::Wire> {
         let mut wires = Vec::with_capacity(width as usize);
         for _ in 0..width {
-            let input = self.recorder.create(false).expect("Recorder is infallible");
-            self.inputs.push(input);
-            wires.push(input);
+            match self.backend.create(false) {
+                Ok(input) => {
+                    self.inputs.push(input.clone());
+                    wires.push(input);
+                }
+                Err(error) => {
+                    self.record_backend_error(error);
+                    wires.push(self.zero.clone());
+                }
+            }
         }
         SymInt {
             width,
@@ -1712,7 +1909,7 @@ impl Engine {
         }
     }
 
-    fn host_int(&self, value: SymInt) -> HostInteger {
+    fn host_int(&self, value: SymInt<Backend::Wire>) -> HostInteger<Backend::Wire> {
         match value.value {
             SymRepr::Concrete(bits) => HostInteger::Concrete {
                 width: value.width,
@@ -1725,15 +1922,18 @@ impl Engine {
         }
     }
 
-    fn materialize(&mut self, value: SymInt) -> Result<Vec<Idx>, FrontendError> {
+    fn materialize(
+        &mut self,
+        value: SymInt<Backend::Wire>,
+    ) -> Result<Vec<Backend::Wire>, FrontendError> {
         self.check_width(value.width)?;
         Ok(match value.value {
             SymRepr::Concrete(bits) => (0..value.width)
                 .map(|bit| {
                     if (bits >> bit) & 1 == 0 {
-                        self.zero
+                        self.zero.clone()
                     } else {
-                        self.one
+                        self.one.clone()
                     }
                 })
                 .collect(),
@@ -1741,14 +1941,14 @@ impl Engine {
         })
     }
 
-    fn bit(&self, value: &SymInt, index: usize) -> IdxOrConst {
+    fn bit(&self, value: &SymInt<Backend::Wire>, index: usize) -> IdxOrConst<Backend::Wire> {
         match &value.value {
             SymRepr::Concrete(value) => IdxOrConst::Constant((value >> index) & 1 == 1),
-            SymRepr::Wires(bits) => IdxOrConst::Wire(bits[index]),
+            SymRepr::Wires(bits) => IdxOrConst::Wire(bits[index].clone()),
         }
     }
 
-    fn from_bits(&self, width: u32, bits: Vec<IdxOrConst>) -> SymInt {
+    fn from_bits(&self, width: u32, bits: Vec<IdxOrConst<Backend::Wire>>) -> SymInt<Backend::Wire> {
         if bits
             .iter()
             .all(|bit| matches!(bit, IdxOrConst::Constant(_)))
@@ -1764,8 +1964,8 @@ impl Engine {
                     bits.into_iter()
                         .map(|bit| match bit {
                             IdxOrConst::Wire(wire) => wire,
-                            IdxOrConst::Constant(false) => self.zero,
-                            IdxOrConst::Constant(true) => self.one,
+                            IdxOrConst::Constant(false) => self.zero.clone(),
+                            IdxOrConst::Constant(true) => self.one.clone(),
                         })
                         .collect(),
                 ),
@@ -1773,7 +1973,12 @@ impl Engine {
         }
     }
 
-    fn gate(&mut self, op: BitOp, left: IdxOrConst, right: IdxOrConst) -> IdxOrConst {
+    fn gate(
+        &mut self,
+        op: BitOp,
+        left: IdxOrConst<Backend::Wire>,
+        right: IdxOrConst<Backend::Wire>,
+    ) -> IdxOrConst<Backend::Wire> {
         use IdxOrConst::{Constant as C, Wire as W};
         match (op, left, right) {
             (_, C(left), C(right)) => C(match op {
@@ -1786,63 +1991,76 @@ impl Engine {
             (BitOp::Or, C(true), _) | (BitOp::Or, _, C(true)) => C(true),
             (BitOp::Or, C(false), right) | (BitOp::Or, right, C(false)) => right,
             (BitOp::Xor, C(false), right) | (BitOp::Xor, right, C(false)) => right,
-            (BitOp::Xor, C(true), W(right)) | (BitOp::Xor, W(right), C(true)) => W(self
-                .recorder
-                .bitxor(right, self.one)
-                .expect("Recorder is infallible")),
-            (BitOp::And, W(left), W(right)) => W(self
-                .recorder
-                .bitand(left, right)
-                .expect("Recorder is infallible")),
-            (BitOp::Or, W(left), W(right)) => W(self
-                .recorder
-                .bitor(left, right)
-                .expect("Recorder is infallible")),
-            (BitOp::Xor, W(left), W(right)) => W(self
-                .recorder
-                .bitxor(left, right)
-                .expect("Recorder is infallible")),
+            (BitOp::Xor, C(true), W(right)) | (BitOp::Xor, W(right), C(true)) => {
+                W(self.backend_gate(BitOp::Xor, right, self.one.clone()))
+            }
+            (BitOp::And, W(left), W(right)) => W(self.backend_gate(BitOp::And, left, right)),
+            (BitOp::Or, W(left), W(right)) => W(self.backend_gate(BitOp::Or, left, right)),
+            (BitOp::Xor, W(left), W(right)) => W(self.backend_gate(BitOp::Xor, left, right)),
+        }
+    }
+
+    fn backend_gate(
+        &mut self,
+        operation: BitOp,
+        left: Backend::Wire,
+        right: Backend::Wire,
+    ) -> Backend::Wire {
+        let result = match operation {
+            BitOp::And => self.backend.bitand(left, right),
+            BitOp::Or => self.backend.bitor(left, right),
+            BitOp::Xor => self.backend.bitxor(left, right),
+        };
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_backend_error(error);
+                self.zero.clone()
+            }
         }
     }
 
     fn mux_bit(
         &mut self,
-        condition: IdxOrConst,
-        then_value: IdxOrConst,
-        else_value: IdxOrConst,
-    ) -> IdxOrConst {
+        condition: IdxOrConst<Backend::Wire>,
+        then_value: IdxOrConst<Backend::Wire>,
+        else_value: IdxOrConst<Backend::Wire>,
+    ) -> IdxOrConst<Backend::Wire> {
         match (condition, then_value, else_value) {
             (IdxOrConst::Constant(true), then_value, _) => then_value,
             (IdxOrConst::Constant(false), _, else_value) => else_value,
             (_, IdxOrConst::Constant(left), IdxOrConst::Constant(right)) if left == right => {
                 IdxOrConst::Constant(left)
             }
-            (
-                IdxOrConst::Wire(_condition),
-                IdxOrConst::Wire(then_value),
-                IdxOrConst::Wire(else_value),
-            ) if then_value == else_value => IdxOrConst::Wire(then_value),
             (IdxOrConst::Wire(condition), then_value, else_value) => {
                 let then_value = match then_value {
                     IdxOrConst::Wire(value) => value,
-                    IdxOrConst::Constant(false) => self.zero,
-                    IdxOrConst::Constant(true) => self.one,
+                    IdxOrConst::Constant(false) => self.zero.clone(),
+                    IdxOrConst::Constant(true) => self.one.clone(),
                 };
                 let else_value = match else_value {
                     IdxOrConst::Wire(value) => value,
-                    IdxOrConst::Constant(false) => self.zero,
-                    IdxOrConst::Constant(true) => self.one,
+                    IdxOrConst::Constant(false) => self.zero.clone(),
+                    IdxOrConst::Constant(true) => self.one.clone(),
                 };
-                IdxOrConst::Wire(
-                    self.recorder
-                        .mux(condition, then_value, else_value)
-                        .expect("Recorder is infallible"),
-                )
+                let result = self.backend.mux(condition, then_value, else_value);
+                match result {
+                    Ok(value) => IdxOrConst::Wire(value),
+                    Err(error) => {
+                        self.record_backend_error(error);
+                        IdxOrConst::Wire(self.zero.clone())
+                    }
+                }
             }
         }
     }
 
-    fn bitwise(&mut self, left: SymInt, right: SymInt, op: BitOp) -> Result<SymInt, FrontendError> {
+    fn bitwise(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+        op: BitOp,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.same_width(&left, &right)?;
         if let (Some(left), Some(right)) = (left.as_concrete(), right.as_concrete()) {
             return Ok(SymInt::concrete(
@@ -1860,13 +2078,17 @@ impl Engine {
         Ok(self.from_bits(left.width, bits))
     }
 
-    fn not(&mut self, value: SymInt) -> SymInt {
+    fn not(&mut self, value: SymInt<Backend::Wire>) -> SymInt<Backend::Wire> {
         let width = value.width;
         self.bitwise(value, SymInt::concrete(width, mask(width)), BitOp::Xor)
             .expect("same width")
     }
 
-    fn add(&mut self, left: SymInt, right: SymInt) -> SymInt {
+    fn add(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+    ) -> SymInt<Backend::Wire> {
         self.same_width(&left, &right)
             .expect("LLVM operation widths match");
         if let (Some(left), Some(right)) = (left.as_concrete(), right.as_concrete()) {
@@ -1883,7 +2105,11 @@ impl Engine {
         self.from_bits(left.width, output)
     }
 
-    fn add_fixed<const N: usize>(&mut self, left: &SymInt, right: &SymInt) -> [IdxOrConst; N] {
+    fn add_fixed<const N: usize>(
+        &mut self,
+        left: &SymInt<Backend::Wire>,
+        right: &SymInt<Backend::Wire>,
+    ) -> [IdxOrConst<Backend::Wire>; N] {
         let left_bits = std::array::from_fn(|index| self.bit(left, index));
         let right_bits = std::array::from_fn(|index| self.bit(right, index));
         add_bits_with(
@@ -1896,20 +2122,28 @@ impl Engine {
                     WordBitOp::Or => BitOp::Or,
                     WordBitOp::Xor => BitOp::Xor,
                 };
-                Ok::<IdxOrConst, Infallible>(self.gate(operation, left, right))
+                Ok::<IdxOrConst<Backend::Wire>, Infallible>(self.gate(operation, left, right))
             },
         )
         .expect("LLVM circuit recorder gates are infallible")
     }
 
-    fn sub(&mut self, left: SymInt, right: SymInt) -> SymInt {
+    fn sub(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+    ) -> SymInt<Backend::Wire> {
         let width = left.width;
         let inverted = self.not(right);
         let adjusted = self.add(inverted, SymInt::concrete(width, 1));
         self.add(left, adjusted)
     }
 
-    fn mul(&mut self, left: SymInt, right: SymInt) -> Result<SymInt, FrontendError> {
+    fn mul(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.same_width(&left, &right)?;
         if let (Some(left), Some(right)) = (left.as_concrete(), right.as_concrete()) {
             return Ok(SymInt::concrete(
@@ -1925,7 +2159,7 @@ impl Engine {
                 let product_bit = if bit_index < index {
                     IdxOrConst::Constant(false)
                 } else {
-                    self.gate(BitOp::And, self.bit(&left, bit_index - index), bit)
+                    self.gate(BitOp::And, self.bit(&left, bit_index - index), bit.clone())
                 };
                 product_bits.push(product_bit);
             }
@@ -1937,10 +2171,10 @@ impl Engine {
 
     fn compare(
         &mut self,
-        left: SymInt,
-        right: SymInt,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
         predicate: IntPredicate,
-    ) -> Result<SymInt, FrontendError> {
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.same_width(&left, &right)?;
         if let (Some(left), Some(right)) = (left.as_concrete(), right.as_concrete()) {
             let signed_left = signed(left.value, left.width);
@@ -1964,28 +2198,34 @@ impl Engine {
         let unsigned_gt = self.unsigned_lt(right.clone(), left.clone())?;
         let sign_left = self.bit(&left, left.width as usize - 1);
         let sign_right = self.bit(&right, right.width as usize - 1);
-        let signs_differ = self.gate(BitOp::Xor, sign_left, sign_right);
+        let signs_differ = self.gate(BitOp::Xor, sign_left.clone(), sign_right.clone());
         let unsigned_lt_bit = self.bit(&unsigned_lt, 0);
         let unsigned_gt_bit = self.bit(&unsigned_gt, 0);
-        let signed_lt = self.mux_bit(signs_differ, sign_left, unsigned_lt_bit);
-        let signed_gt = self.mux_bit(signs_differ, sign_right, unsigned_gt_bit);
+        let signed_lt = self.mux_bit(signs_differ.clone(), sign_left, unsigned_lt_bit.clone());
+        let signed_gt = self.mux_bit(signs_differ, sign_right, unsigned_gt_bit.clone());
         let equal_bit = self.bit(&equal, 0);
         let bit = match predicate {
             IntPredicate::EQ => equal_bit,
-            IntPredicate::NE => self.gate(BitOp::Xor, equal_bit, IdxOrConst::Constant(true)),
+            IntPredicate::NE => {
+                self.gate(BitOp::Xor, equal_bit.clone(), IdxOrConst::Constant(true))
+            }
             IntPredicate::ULT => unsigned_lt_bit,
             IntPredicate::UGT => unsigned_gt_bit,
-            IntPredicate::ULE => self.gate(BitOp::Or, unsigned_lt_bit, equal_bit),
-            IntPredicate::UGE => self.gate(BitOp::Or, unsigned_gt_bit, equal_bit),
+            IntPredicate::ULE => self.gate(BitOp::Or, unsigned_lt_bit, equal_bit.clone()),
+            IntPredicate::UGE => self.gate(BitOp::Or, unsigned_gt_bit, equal_bit.clone()),
             IntPredicate::SLT => signed_lt,
             IntPredicate::SGT => signed_gt,
-            IntPredicate::SLE => self.gate(BitOp::Or, signed_lt, equal_bit),
+            IntPredicate::SLE => self.gate(BitOp::Or, signed_lt, equal_bit.clone()),
             IntPredicate::SGE => self.gate(BitOp::Or, signed_gt, equal_bit),
         };
         Ok(self.from_bits(1, vec![bit]))
     }
 
-    fn equal(&mut self, left: SymInt, right: SymInt) -> Result<SymInt, FrontendError> {
+    fn equal(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.same_width(&left, &right)?;
         let mut result = IdxOrConst::Constant(true);
         for index in 0..left.width as usize {
@@ -1996,16 +2236,20 @@ impl Engine {
         Ok(self.from_bits(1, vec![result]))
     }
 
-    fn unsigned_lt(&mut self, left: SymInt, right: SymInt) -> Result<SymInt, FrontendError> {
+    fn unsigned_lt(
+        &mut self,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.same_width(&left, &right)?;
         let mut less = IdxOrConst::Constant(false);
         let mut equal = IdxOrConst::Constant(true);
         for index in (0..left.width as usize).rev() {
             let left_bit = self.bit(&left, index);
             let right_bit = self.bit(&right, index);
-            let not_left = self.gate(BitOp::Xor, left_bit, IdxOrConst::Constant(true));
-            let this_less = self.gate(BitOp::And, not_left, right_bit);
-            let less_here = self.gate(BitOp::And, equal, this_less);
+            let not_left = self.gate(BitOp::Xor, left_bit.clone(), IdxOrConst::Constant(true));
+            let this_less = self.gate(BitOp::And, not_left, right_bit.clone());
+            let less_here = self.gate(BitOp::And, equal.clone(), this_less);
             less = self.gate(BitOp::Or, less, less_here);
             let unequal = self.gate(BitOp::Xor, left_bit, right_bit);
             let same = self.gate(BitOp::Xor, unequal, IdxOrConst::Constant(true));
@@ -2016,10 +2260,10 @@ impl Engine {
 
     fn select(
         &mut self,
-        condition: SymInt,
-        then_value: SymInt,
-        else_value: SymInt,
-    ) -> Result<SymInt, FrontendError> {
+        condition: SymInt<Backend::Wire>,
+        then_value: SymInt<Backend::Wire>,
+        else_value: SymInt<Backend::Wire>,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         if condition.width != 1 {
             return Err(FrontendError::unsupported("select condition is not i1"));
         }
@@ -2035,7 +2279,7 @@ impl Engine {
         let mut bits = Vec::with_capacity(then_value.width as usize);
         for index in 0..then_value.width as usize {
             bits.push(self.mux_bit(
-                condition,
+                condition.clone(),
                 self.bit(&then_value, index),
                 self.bit(&else_value, index),
             ));
@@ -2043,7 +2287,11 @@ impl Engine {
         Ok(self.from_bits(then_value.width, bits))
     }
 
-    fn trunc(&mut self, value: SymInt, width: u32) -> Result<SymInt, FrontendError> {
+    fn trunc(
+        &mut self,
+        value: SymInt<Backend::Wire>,
+        width: u32,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.check_width(width)?;
         if width > value.width {
             return Err(FrontendError::unsupported("integer truncation widens"));
@@ -2057,7 +2305,11 @@ impl Engine {
         }
     }
 
-    fn zext(&mut self, value: SymInt, width: u32) -> Result<SymInt, FrontendError> {
+    fn zext(
+        &mut self,
+        value: SymInt<Backend::Wire>,
+        width: u32,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.check_width(width)?;
         if width < value.width {
             return Err(FrontendError::unsupported("zero extension narrows"));
@@ -2079,7 +2331,11 @@ impl Engine {
         ))
     }
 
-    fn sext(&mut self, value: SymInt, width: u32) -> Result<SymInt, FrontendError> {
+    fn sext(
+        &mut self,
+        value: SymInt<Backend::Wire>,
+        width: u32,
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.check_width(width)?;
         if width < value.width {
             return Err(FrontendError::unsupported("sign extension narrows"));
@@ -2098,7 +2354,7 @@ impl Engine {
                     if index < value.width as usize {
                         self.bit(&value, index)
                     } else {
-                        sign
+                        sign.clone()
                     }
                 })
                 .collect(),
@@ -2107,10 +2363,10 @@ impl Engine {
 
     fn shift(
         &mut self,
-        value: SymInt,
-        amount: SymInt,
+        value: SymInt<Backend::Wire>,
+        amount: SymInt<Backend::Wire>,
         op: ShiftOp,
-    ) -> Result<SymInt, FrontendError> {
+    ) -> Result<SymInt<Backend::Wire>, FrontendError> {
         self.check_width(value.width)?;
         if let Some(amount) = amount.as_concrete() {
             return Ok(self.shift_constant(value, amount.value as usize, op));
@@ -2141,7 +2397,12 @@ impl Engine {
         self.select(in_range, output, SymInt::concrete(value.width, 0))
     }
 
-    fn shift_constant(&mut self, value: SymInt, amount: usize, op: ShiftOp) -> SymInt {
+    fn shift_constant(
+        &mut self,
+        value: SymInt<Backend::Wire>,
+        amount: usize,
+        op: ShiftOp,
+    ) -> SymInt<Backend::Wire> {
         if amount >= value.width as usize {
             // The LLVM operation is poison, regardless of shift direction.
             return SymInt::concrete(value.width, 0);
@@ -2186,11 +2447,11 @@ impl Engine {
 
     fn divrem(
         &mut self,
-        left: SymInt,
-        right: SymInt,
+        left: SymInt<Backend::Wire>,
+        right: SymInt<Backend::Wire>,
         signed_division: bool,
         _remainder: bool,
-    ) -> Result<(SymInt, SymInt), FrontendError> {
+    ) -> Result<(SymInt<Backend::Wire>, SymInt<Backend::Wire>), FrontendError> {
         self.same_width(&left, &right)?;
         if let (Some(left), Some(right)) = (left.as_concrete(), right.as_concrete()) {
             if right.value == 0 {
@@ -2245,7 +2506,7 @@ impl Engine {
         let mut remainder = SymInt::concrete(width, 0);
         for index in (0..width as usize).rev() {
             remainder = self.shift_constant(remainder, 1, ShiftOp::Left);
-            let mut bits: Vec<IdxOrConst> = match remainder.value {
+            let mut bits: Vec<IdxOrConst<Backend::Wire>> = match remainder.value {
                 SymRepr::Concrete(value) => (0..width)
                     .map(|bit| IdxOrConst::Constant((value >> bit) & 1 == 1))
                     .collect(),
@@ -2288,7 +2549,11 @@ impl Engine {
         ))
     }
 
-    fn same_width(&self, left: &SymInt, right: &SymInt) -> Result<(), FrontendError> {
+    fn same_width(
+        &self,
+        left: &SymInt<Backend::Wire>,
+        right: &SymInt<Backend::Wire>,
+    ) -> Result<(), FrontendError> {
         if left.width == right.width {
             Ok(())
         } else {
@@ -2297,13 +2562,13 @@ impl Engine {
     }
 }
 
-#[derive(Clone, Copy)]
-enum IdxOrConst {
-    Wire(Idx),
+#[derive(Clone)]
+enum IdxOrConst<W = Idx> {
+    Wire(W),
     Constant(bool),
 }
 
-impl SymInt {
+impl<W> SymInt<W> {
     fn concrete(width: u32, value: u64) -> Self {
         Self {
             width,
@@ -2331,7 +2596,7 @@ struct ConcreteInt {
     value: u64,
 }
 
-fn int_from_host(value: HostInteger) -> Result<SymInt, FrontendError> {
+fn int_from_host<W>(value: HostInteger<W>) -> Result<SymInt<W>, FrontendError> {
     let value = match value {
         HostInteger::Concrete { width, value } => SymInt::concrete(width, value),
         HostInteger::Symbolic { width, bits } => {
@@ -2410,6 +2675,16 @@ fn signed(value: u64, width: u32) -> i64 {
     } else {
         let shift = 64 - width;
         ((value << shift) as i64) >> shift
+    }
+}
+
+fn check_width(width: u32) -> Result<(), FrontendError> {
+    if matches!(width, 1 | 8 | 16 | 32 | 64) {
+        Ok(())
+    } else {
+        Err(FrontendError::unsupported(format!(
+            "integer width i{width}"
+        )))
     }
 }
 
@@ -2571,12 +2846,13 @@ mod tests {
 
     struct AddOneHost;
 
-    impl HostCall for AddOneHost {
+    impl HostCall<Recorder> for AddOneHost {
         fn lower(
             &self,
-            context: &mut HostCallContext<'_>,
-            arguments: &[HostValue],
-        ) -> Result<Option<HostValue>, FrontendError> {
+            backend: &mut Recorder,
+            context: &HostCallContext<Idx>,
+            arguments: &[HostValue<Idx>],
+        ) -> Result<Option<HostValue<Idx>>, FrontendError> {
             let [HostValue::Integer(value)] = arguments else {
                 return Err(FrontendError::request("test host expected one integer"));
             };
@@ -2584,7 +2860,130 @@ mod tests {
                 HostInteger::Concrete { width, .. } | HostInteger::Symbolic { width, .. } => *width,
             };
             let one = context.concrete(width, 1)?;
-            Ok(Some(HostValue::Integer(context.add(value.clone(), one)?)))
+            Ok(Some(HostValue::Integer(context.add(
+                backend,
+                value.clone(),
+                one,
+            )?)))
+        }
+    }
+
+    fn add_one_via_backend<Backend: ExecutionBackend<Wire = bool>>(
+        backend: &mut Backend,
+        context: &HostCallContext<bool>,
+        arguments: &[HostValue<bool>],
+    ) -> Result<Option<HostValue<bool>>, FrontendError> {
+        let [HostValue::Integer(value)] = arguments else {
+            return Err(FrontendError::request("test host expected one integer"));
+        };
+        let width = match value {
+            HostInteger::Concrete { width, .. } | HostInteger::Symbolic { width, .. } => *width,
+        };
+        let one = context.concrete(width, 1)?;
+        Ok(Some(HostValue::Integer(context.add(
+            backend,
+            value.clone(),
+            one,
+        )?)))
+    }
+
+    struct DirectAddOneHost;
+
+    impl HostCall<()> for DirectAddOneHost {
+        fn lower(
+            &self,
+            backend: &mut (),
+            context: &HostCallContext<bool>,
+            arguments: &[HostValue<bool>],
+        ) -> Result<Option<HostValue<bool>>, FrontendError> {
+            add_one_via_backend(backend, context, arguments)
+        }
+    }
+
+    /// A small direct-execution wrapper.  Its host adapter observes the
+    /// wrapper itself, proving the LLVM runner tunnels the original concrete
+    /// backend through host-call lowering rather than exposing only Recorder.
+    #[derive(Default)]
+    struct BackendWrapper {
+        inner: (),
+        host_calls: usize,
+        operations: usize,
+    }
+
+    impl HasError for BackendWrapper {
+        type Error = Infallible;
+    }
+
+    impl ContextWithValue<bool> for BackendWrapper {
+        type Wrapped = bool;
+    }
+
+    impl ContextWithCreate<bool> for BackendWrapper {
+        fn create(&mut self, value: bool) -> Result<bool, Self::Error> {
+            self.operations += 1;
+            self.inner.create(value)
+        }
+    }
+
+    impl ContextWithBitAnd<bool> for BackendWrapper {
+        fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+            self.operations += 1;
+            self.inner.bitand(left, right)
+        }
+
+        fn bitand_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+            self.operations += 1;
+            self.inner.bitand_assign(left, right)
+        }
+    }
+
+    impl ContextWithBitOr<bool> for BackendWrapper {
+        fn bitor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+            self.operations += 1;
+            self.inner.bitor(left, right)
+        }
+
+        fn bitor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+            self.operations += 1;
+            self.inner.bitor_assign(left, right)
+        }
+    }
+
+    impl ContextWithBitXor<bool> for BackendWrapper {
+        fn bitxor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+            self.operations += 1;
+            self.inner.bitxor(left, right)
+        }
+
+        fn bitxor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+            self.operations += 1;
+            self.inner.bitxor_assign(left, right)
+        }
+    }
+
+    impl ContextWithMux<bool> for BackendWrapper {
+        fn mux(
+            &mut self,
+            condition: bool,
+            then_value: bool,
+            else_value: bool,
+        ) -> Result<bool, Self::Error> {
+            self.operations += 1;
+            self.inner.mux(condition, then_value, else_value)
+        }
+    }
+
+    struct WrappedAddOneHost;
+
+    impl HostCall<BackendWrapper> for WrappedAddOneHost {
+        fn lower(
+            &self,
+            backend: &mut BackendWrapper,
+            context: &HostCallContext<bool>,
+            arguments: &[HostValue<bool>],
+        ) -> Result<Option<HostValue<bool>>, FrontendError> {
+            backend.host_calls += 1;
+            add_one_via_backend(backend, context, arguments)
         }
     }
 
@@ -2620,6 +3019,71 @@ mod tests {
             ),
             [false, true, false, false, false, false, false, false],
         );
+    }
+
+    #[test]
+    fn executes_in_memory_ir_with_ir_keyed_direct_and_wrapped_hosts() {
+        let context = Context::create();
+        let module = context
+            .create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
+                b"declare i8 @host_add_one(i8)\n\
+                  define i8 @kernel(i8 %x) {\n\
+                  entry:\n\
+                    %y = call i8 @host_add_one(i8 %x)\n\
+                    ret i8 %y\n\
+                  }",
+                "in-memory-host.ll",
+            ))
+            .unwrap();
+        let declaration = module.get_function("host_add_one").unwrap();
+        let arguments = [ArgumentBinding::Scalar(ScalarBinding::Concrete(41))];
+        let exports = [Export::Return];
+        let signature = HostCallSignature::new([HostType::Integer(8)], Some(HostType::Integer(8)));
+
+        let mut recorder_hosts = HostCallRegistry::<Recorder>::new();
+        recorder_hosts.register_ir(declaration, signature.clone(), AddOneHost);
+        let recorder_request = LowerRequest {
+            entry: "kernel",
+            arguments: &arguments,
+            globals: &[],
+            exports: &exports,
+            limits: LoweringLimits::default(),
+            host_calls: &recorder_hosts,
+        };
+        let lowered = lower_module(&module, &recorder_request).unwrap();
+        assert_eq!(interpret(&lowered, &[]), bits(42, 8));
+
+        let mut direct_hosts = HostCallRegistry::<()>::new();
+        direct_hosts.register_ir(declaration, signature.clone(), DirectAddOneHost);
+        let direct_request = LowerRequest {
+            entry: "kernel",
+            arguments: &arguments,
+            globals: &[],
+            exports: &exports,
+            limits: LoweringLimits::default(),
+            host_calls: &direct_hosts,
+        };
+        let direct = execute_module(&module, &direct_request, &mut ()).unwrap();
+        assert!(direct.inputs.is_empty());
+        assert_eq!(direct.outputs, bits(42, 8));
+
+        let mut wrapped_hosts = HostCallRegistry::<BackendWrapper>::new();
+        wrapped_hosts.register_ir(declaration, signature, WrappedAddOneHost);
+        let wrapped_request = LowerRequest {
+            entry: "kernel",
+            arguments: &arguments,
+            globals: &[],
+            exports: &exports,
+            limits: LoweringLimits::default(),
+            host_calls: &wrapped_hosts,
+        };
+        let mut backend = BackendWrapper::default();
+        let wrapped = execute_module(&module, &wrapped_request, &mut backend).unwrap();
+        assert_eq!(wrapped.outputs, bits(42, 8));
+        assert_eq!(backend.host_calls, 1);
+        // The runner constructed its two public Boolean constants through the
+        // wrapper; the host adapter then directly observed that same wrapper.
+        assert_eq!(backend.operations, 2);
     }
 
     #[test]
