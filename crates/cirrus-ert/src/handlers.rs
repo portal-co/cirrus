@@ -106,7 +106,7 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
         Inst::Sw { offset, src, base } => store(machine, offset, src, base, 32),
 
         Inst::Jal { offset, dest } => jump_and_link(machine, offset, dest),
-        Inst::Jalr { .. } => return_from_call(machine),
+        Inst::Jalr { offset, base, dest } => jump_and_link_register(machine, offset, base, dest),
         Inst::Beq { offset, src1, src2 } => branch(machine, offset, src1, src2, Branch::Equal),
         Inst::Bne { offset, src1, src2 } => branch(machine, offset, src1, src2, Branch::NotEqual),
         Inst::Bgeu { offset, src1, src2 } => {
@@ -150,7 +150,7 @@ fn add_immediate<W: Clone, E: core::error::Error>(
     if dest == Reg::SP {
         machine.sp = machine.sp.wrapping_add_signed(imm.as_i32());
         for offset in machine.offs.iter_mut().flatten() {
-            *offset = offset.wrapping_add(imm.as_i32());
+            *offset = offset.wrapping_sub(imm.as_i32());
         }
     }
     if src1 != dest {
@@ -636,21 +636,22 @@ fn load<W: Clone, E: core::error::Error>(
         LoadAddress::Concrete(address) => {
             let value = match kind {
                 LoadKind::ByteSigned => {
-                    i8::from_le_bytes(array::from_fn(|i| machine.mem[i + address as usize])) as i32
+                    i8::from_le_bytes(machine.mem.read(address).ok_or(ErtError::Unexpected)?) as i32
                         as u32
                 }
                 LoadKind::HalfSigned => {
-                    i16::from_le_bytes(array::from_fn(|i| machine.mem[i + address as usize])) as i32
-                        as u32
+                    i16::from_le_bytes(machine.mem.read(address).ok_or(ErtError::Unexpected)?)
+                        as i32 as u32
                 }
                 LoadKind::ByteUnsigned => {
-                    u8::from_le_bytes(array::from_fn(|i| machine.mem[i + address as usize])) as u32
+                    u8::from_le_bytes(machine.mem.read(address).ok_or(ErtError::Unexpected)?) as u32
                 }
                 LoadKind::HalfUnsigned => {
-                    u16::from_le_bytes(array::from_fn(|i| machine.mem[i + address as usize])) as u32
+                    u16::from_le_bytes(machine.mem.read(address).ok_or(ErtError::Unexpected)?)
+                        as u32
                 }
                 LoadKind::Word => {
-                    u32::from_le_bytes(array::from_fn(|i| machine.mem[i + address as usize]))
+                    u32::from_le_bytes(machine.mem.read(address).ok_or(ErtError::Unexpected)?)
                 }
             };
             machine.write_constant(dest, value);
@@ -665,6 +666,7 @@ fn load<W: Clone, E: core::error::Error>(
                 LoadKind::HalfUnsigned => (16, false),
                 LoadKind::Word => (32, false),
             };
+            let stack_bits = machine.stack_bits(offset, width)?;
             for bit in 0..32 {
                 let source_bit = bit.min(width - 1);
                 if !sign_extend && source_bit != bit {
@@ -672,7 +674,7 @@ fn load<W: Clone, E: core::error::Error>(
                     continue;
                 }
                 machine.regs[dest.0 as usize][bit] =
-                    machine.vstack[offset.as_u32() as usize * 8 + source_bit].clone();
+                    machine.vstack[stack_bits.start + source_bit].clone();
             }
         }
     }
@@ -687,9 +689,9 @@ fn store<W: Clone, E: core::error::Error>(
     width: usize,
 ) -> Result<Flow, ErtError<E>> {
     let offset = machine.stack_offset(base, offset)?;
+    let stack_bits = machine.stack_bits(offset, width)?;
     for bit in 0..width {
-        machine.vstack[offset.as_u32() as usize * 8 + bit] =
-            machine.regs[src.0 as usize][bit].clone();
+        machine.vstack[stack_bits.start + bit] = machine.regs[src.0 as usize][bit].clone();
     }
     next(machine)
 }
@@ -699,17 +701,43 @@ fn jump_and_link<W: Clone, E: core::error::Error>(
     offset: Imm,
     dest: Reg,
 ) -> Result<Flow, ErtError<E>> {
-    if dest.0 != 0 {
-        machine.rstack[machine.rsp as usize] = machine.pc + 4;
+    push_return(machine, dest)?;
+    Ok(Flow::Next(machine.pc.wrapping_add_signed(offset.as_i32())))
+}
+
+fn jump_and_link_register<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    offset: Imm,
+    base: Reg,
+    dest: Reg,
+) -> Result<Flow, ErtError<E>> {
+    if dest == Reg::ZERO && base == Reg::RA && offset == Imm::ZERO {
+        return return_from_call(machine);
+    }
+    let base = machine.reg_consts[base.0 as usize].ok_or(ErtError::Unexpected)?;
+    let target = base.wrapping_add_signed(offset.as_i32()) & !1;
+    push_return(machine, dest)?;
+    if dest != Reg::ZERO {
+        machine.write_constant(dest, machine.pc + 4);
+    }
+    Ok(Flow::Next(target))
+}
+
+fn push_return<W, E>(machine: &mut Machine<'_, W, E>, dest: Reg) -> Result<(), ErtError<E>> {
+    if dest != Reg::ZERO {
+        *machine
+            .rstack
+            .get_mut(machine.rsp as usize)
+            .ok_or(ErtError::Unexpected)? = machine.pc + 4;
         machine.rsp += 1;
     }
-    Ok(Flow::Next(machine.pc.wrapping_add_signed(offset.as_i32())))
+    Ok(())
 }
 
 fn return_from_call<W: Clone, E: core::error::Error>(
     machine: &mut Machine<'_, W, E>,
 ) -> Result<Flow, ErtError<E>> {
-    machine.rsp -= 1;
+    machine.rsp = machine.rsp.checked_sub(1).ok_or(ErtError::Unexpected)?;
     Ok(Flow::Next(machine.rstack[machine.rsp as usize]))
 }
 
@@ -756,7 +784,7 @@ fn ecall<W: Clone, E: core::error::Error>(
                 let value = u32::from_le_bytes(array::from_fn(|i| chunk[i]));
                 *constant = Some(value);
                 for bit in 0..32 {
-                    register[bit] = if value >> bit == 0 {
+                    register[bit] = if (value >> bit) & 1 == 0 {
                         machine.zero.clone()
                     } else {
                         machine.one.clone()
@@ -766,7 +794,7 @@ fn ecall<W: Clone, E: core::error::Error>(
             next(machine)
         }
         Some(0xffff_ffff) => {
-            if machine.sp + 1 != machine.vstack.len() as u32 {
+            if machine.sp != machine.stack_top {
                 return Err(ErtError::Unexpected);
             }
             Ok(Flow::Exit)

@@ -8,10 +8,19 @@
 //! interpreter resolve control flow and addresses that must be known while the
 //! symbolic values are emitted through [`ContextWithRvOps`].
 //!
-//! The interpreter accepts a little-endian RV32 instruction image in `mem`, a
-//! symbolic stack in `vstack` (one Boolean wire per bit), and a concrete return
-//! stack in `rstack`. `zero` and `one` are the caller's symbolic Boolean
-//! constants. The hash callback implements the supported hash environment call.
+//! The interpreter reads its little-endian RV32 instruction image through
+//! [`RawMemory`], a symbolic stack in `vstack` (one Boolean wire per bit), and a
+//! concrete return stack in `rstack`. `vstack` is byte-addressed by the guest
+//! stack pointer: [`ert_emit`] starts `sp` at its end, while [`ert_func`]
+//! reserves caller stack slots for arguments or results beyond `a7`. `zero` and
+//! `one` are the caller's symbolic Boolean constants. The hash callback
+//! implements the supported hash environment call.
+//!
+//! `RawMemory` maps guest address zero to a caller-provided raw pointer. Its
+//! optional bound is useful for ordinary host buffers; an unbounded mapping is
+//! intended for bare-metal callers that deliberately address their whole mapped
+//! address space. Constructing it is unsafe because the caller must ensure every
+//! instruction-fetch and concrete-load byte that the program reaches is readable.
 //!
 //! This is not a general RISC-V emulator. Programs must use aligned,
 //! non-compressed instructions; branch only on concrete values; use the
@@ -23,8 +32,9 @@
 //! The supported instructions are `LUI`, `AUIPC`; `ADDI`, `ADD`, `SUB`, `AND`,
 //! `OR`, `XOR`, their supported immediate forms; immediate and register shifts;
 //! and `MUL`, `MULH`, `MULHSU`, and `MULHU`; `LB`, `LBU`, `LH`, `LHU`, `LW`,
-//! `SB`, `SH`, `SW`; `JAL`, the interpreter's return form of `JALR`, and the
-//! six integer branches; plus the hash and exit `ECALL`s.
+//! `SB`, `SH`, `SW`; `JAL`, concrete-target `JALR` calls, the conventional
+//! `jalr x0, 0(ra)` return, and the six integer branches; plus the hash and exit
+//! `ECALL`s.
 //!
 //! Symbolic register shifts use a five-stage barrel shifter over `rs2[4:0]`.
 //! Symbolic multiplication uses fixed long-multiplication rounds. A concrete
@@ -43,6 +53,52 @@ mod machine;
 mod tests;
 
 use machine::{Machine, add_bits, read_abi_results, write_abi_args};
+
+/// A read-only byte mapping whose base is RV32 guest address zero.
+///
+/// The mapping is intentionally not a slice: bare-metal callers can use a null
+/// base with no bound to access instructions at their native addresses. When a
+/// bound is supplied, the interpreter rejects instruction fetches and concrete
+/// loads outside that many bytes with [`ErtError::Unexpected`].
+#[derive(Clone, Copy)]
+pub struct RawMemory {
+    base: *const u8,
+    len: Option<usize>,
+}
+
+impl RawMemory {
+    /// Create a raw guest-memory mapping.
+    ///
+    /// `base` represents guest address zero and may be null. If `len` is
+    /// `Some`, the bytes in `base..base + len` must be readable. If it is
+    /// `None`, every byte the executed program fetches or concretely loads at
+    /// `base + guest_address` must be readable for the duration of execution.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the readability requirements above. In
+    /// particular, supplying a bound only enables interpreter-side range checks;
+    /// it does not make an invalid pointer valid.
+    pub const unsafe fn new(base: *const u8, len: Option<usize>) -> Self {
+        Self { base, len }
+    }
+
+    pub(crate) fn read<const N: usize>(&self, address: u32) -> Option<[u8; N]> {
+        debug_assert!(N > 0);
+        address.checked_add(N.checked_sub(1)? as u32)?;
+        if let Some(len) = self.len {
+            let start = address as usize;
+            if start.checked_add(N)? > len {
+                return None;
+            }
+        }
+        Some(core::array::from_fn(|offset| {
+            // SAFETY: `RawMemory::new` guarantees readability. The checked
+            // address range prevents a bounded mapping from wrapping.
+            unsafe { self.base.wrapping_add(address as usize + offset).read() }
+        }))
+    }
+}
 
 /// The Boolean operations required to execute the supported RISC-V subset.
 pub trait ContextWithRvOps<Val>:
@@ -88,7 +144,7 @@ pub fn simple_add<W: Clone, E: Error>(
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
     hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
-    mem: &mut [u8],
+    mem: RawMemory,
     rstack: &mut [u32],
     vstack: &mut [W],
     pc: u32,
@@ -98,8 +154,9 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     one: W,
     args: [([W; 32], Option<u32>); N],
 ) -> Result<[([W; 32], Option<u32>); M], ErtError<E>> {
-    write_abi_args(regs, reg_consts, vstack, args);
-    ert_emit(
+    let stack_pointer = abi_stack_pointer(vstack, N.max(M)).ok_or(ErtError::Unexpected)?;
+    write_abi_args(regs, reg_consts, vstack, stack_pointer, args);
+    Machine::new(
         t,
         hash,
         mem,
@@ -110,20 +167,22 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
         reg_consts,
         zero.clone(),
         one.clone(),
-    )?;
-    Ok(read_abi_results(regs, reg_consts, vstack))
+        stack_pointer,
+    )
+    .run()?;
+    Ok(read_abi_results(regs, reg_consts, vstack, stack_pointer))
 }
 
 /// Execute a symbolic RV32 instruction image until the supported exit `ECALL`.
 ///
-/// The interpreter resets `x0` and derives `sp` at each instruction. It accepts
-/// only the subset described in the [crate documentation](self); an exit is
-/// `ECALL` with concrete `a0 = 0xffff_ffff`, and a hash call is `ECALL` with
-/// concrete `a0 = 0`.
+/// The interpreter resets `x0` and initializes `sp` to the byte length of
+/// `vstack`. It accepts only the subset described in the [crate
+/// documentation](self); an exit is `ECALL` with concrete `a0 = 0xffff_ffff`,
+/// and a hash call is `ECALL` with concrete `a0 = 0`.
 pub fn ert_emit<W: Clone, E: Error>(
     t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
     hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
-    mem: &mut [u8],
+    mem: RawMemory,
     rstack: &mut [u32],
     vstack: &mut [W],
     pc: u32,
@@ -132,8 +191,25 @@ pub fn ert_emit<W: Clone, E: Error>(
     zero: W,
     one: W,
 ) -> Result<(), ErtError<E>> {
+    let stack_pointer = u32::try_from(vstack.len() / 8).map_err(|_| ErtError::Unexpected)?;
     Machine::new(
-        t, hash, mem, rstack, vstack, pc, regs, reg_consts, zero, one,
+        t,
+        hash,
+        mem,
+        rstack,
+        vstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+        stack_pointer,
     )
     .run()
+}
+
+fn abi_stack_pointer<W>(vstack: &[W], values: usize) -> Option<u32> {
+    let extra_values = values.saturating_sub(machine::ABI_REGS.len());
+    let stack_bytes = u32::try_from(vstack.len() / 8).ok()?;
+    stack_bytes.checked_sub(u32::try_from(extra_values.checked_mul(4)?).ok()?)
 }

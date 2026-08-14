@@ -8,7 +8,7 @@ use cirrus_core::{
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{ErtError, ert_emit, ert_func, simple_add};
+use crate::{ErtError, RawMemory, ert_emit, ert_func, simple_add};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1u32 << bit) != 0)
@@ -27,8 +27,13 @@ fn program(instructions: impl IntoIterator<Item = Inst>) -> Vec<u8> {
         .collect()
 }
 
+fn bounded_memory(mem: &[u8]) -> RawMemory {
+    // SAFETY: the returned mapping is used only while `mem` remains borrowed.
+    unsafe { RawMemory::new(mem.as_ptr(), Some(mem.len())) }
+}
+
 fn run(
-    mem: &mut [u8],
+    mem: &[u8],
     regs: &mut [[bool; 32]; 32],
     constants: &mut [Option<u32>; 32],
     rstack: &mut [u32],
@@ -39,7 +44,7 @@ fn run(
     ert_emit(
         &mut context,
         &mut hash,
-        mem,
+        bounded_memory(mem),
         rstack,
         vstack,
         0,
@@ -56,6 +61,53 @@ fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
 
 fn assert_success(result: Result<(), ErtError<Infallible>>) {
     assert!(result.is_ok());
+}
+
+#[test]
+fn unbounded_raw_memory_accepts_an_address_zero_base() {
+    // SAFETY: this test only constructs the mapping; it never reads through it.
+    let _ = unsafe { RawMemory::new(core::ptr::null(), None) };
+}
+
+#[test]
+fn bounded_raw_memory_rejects_a_truncated_instruction_fetch() {
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert!(matches!(
+        run(&[0; 3], &mut regs, &mut constants, &mut rstack, &mut vstack),
+        Err(ErtError::Unexpected)
+    ));
+}
+
+#[test]
+fn bounded_raw_memory_rejects_a_concrete_load_past_its_end() {
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::A1.0 as usize] = word(12);
+    constants[Reg::A1.0 as usize] = Some(12);
+    let mem = program([
+        Inst::Lw {
+            offset: Imm::new_i32(0),
+            dest: Reg::T0,
+            base: Reg::A1,
+        },
+        Inst::Addi {
+            imm: Imm::new_i32(-1),
+            dest: Reg::A0,
+            src1: Reg::ZERO,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert!(matches!(
+        run(&mem, &mut regs, &mut constants, &mut rstack, &mut vstack),
+        Err(ErtError::Unexpected)
+    ));
 }
 
 #[derive(Default)]
@@ -119,13 +171,13 @@ fn run_counting(
 ) -> CountingContext {
     let mut context = CountingContext::default();
     let mut hash = no_hash;
-    let mut mem = program(instructions);
+    let mem = program(instructions);
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
     assert_success(ert_emit(
         &mut context,
         &mut hash,
-        &mut mem,
+        bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
         0,
@@ -169,7 +221,7 @@ fn arithmetic_immediates_and_shifts_preserve_concrete_tracking() {
     regs[Reg::T6.0 as usize] = word(u32::MAX);
     constants[Reg::T6.0 as usize] = Some(u32::MAX);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Add {
             dest: Reg::T0,
             src1: Reg::T1,
@@ -231,7 +283,7 @@ fn arithmetic_immediates_and_shifts_preserve_concrete_tracking() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -260,7 +312,7 @@ fn runtime_shifts_use_low_five_bits_and_snapshot_aliased_sources() {
     regs[Reg::T4.0 as usize] = word(0x8000_0003);
     regs[Reg::T5.0 as usize] = word(1);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Sll {
             dest: Reg::T1,
             src1: Reg::T1,
@@ -282,7 +334,7 @@ fn runtime_shifts_use_low_five_bits_and_snapshot_aliased_sources() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -354,7 +406,7 @@ fn symbolic_multiplication_supports_low_and_high_product_variants() {
     regs[Reg::T1.0 as usize] = word(left);
     regs[Reg::T2.0 as usize] = word(right);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Mul {
             dest: Reg::T0,
             src1: Reg::T1,
@@ -381,7 +433,7 @@ fn symbolic_multiplication_supports_low_and_high_product_variants() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -412,7 +464,7 @@ fn high_products_apply_each_required_signed_correction() {
         regs[Reg::T1.0 as usize] = word(left);
         regs[Reg::T2.0 as usize] = word(right);
         exit_register(&mut regs, &mut constants);
-        let mut mem = program([
+        let mem = program([
             Inst::Mulh {
                 dest: Reg::T3,
                 src1: Reg::T1,
@@ -434,7 +486,7 @@ fn high_products_apply_each_required_signed_correction() {
         let mut vstack = [false; 64];
 
         assert_success(run(
-            &mut mem,
+            &mem,
             &mut regs,
             &mut constants,
             &mut rstack,
@@ -460,7 +512,7 @@ fn multiplication_snapshots_aliased_operands() {
     regs[Reg::T2.0 as usize] = word(right);
     regs[Reg::T3.0 as usize] = word(left);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Mul {
             dest: Reg::T1,
             src1: Reg::T1,
@@ -477,7 +529,7 @@ fn multiplication_snapshots_aliased_operands() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -655,7 +707,7 @@ fn constants_and_concrete_loads_update_register_metadata() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -678,9 +730,9 @@ fn symbolic_stack_memory_preserves_width_and_extension_rules() {
     let source = word(0x8001_80ff);
     regs[Reg::T0.0 as usize] = source;
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Addi {
-            imm: Imm::new_i32(-1796),
+            imm: Imm::new_i32(-16),
             dest: Reg::SP,
             src1: Reg::SP,
         },
@@ -725,7 +777,7 @@ fn symbolic_stack_memory_preserves_width_and_extension_rules() {
             base: Reg::SP,
         },
         Inst::Addi {
-            imm: Imm::new_i32(1796),
+            imm: Imm::new_i32(16),
             dest: Reg::SP,
             src1: Reg::SP,
         },
@@ -735,7 +787,7 @@ fn symbolic_stack_memory_preserves_width_and_extension_rules() {
     let mut vstack = [false; 2048];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -748,7 +800,11 @@ fn symbolic_stack_memory_preserves_width_and_extension_rules() {
     assert_eq!(value(&regs[Reg::T4.0 as usize]), 0x80ff);
     assert_eq!(value(&regs[Reg::T5.0 as usize]), 0x8001_80ff);
     assert!(constants[Reg::T1.0 as usize].is_none());
-    assert_eq!(&vstack[..8], &word(0x8001_80ff)[..8]);
+    let frame_start = (vstack.len() / 8 - 16) * 8;
+    assert_eq!(
+        &vstack[frame_start..frame_start + 8],
+        &word(0x8001_80ff)[..8]
+    );
 }
 
 #[test]
@@ -760,7 +816,7 @@ fn branches_and_call_return_follow_the_private_control_stack() {
     constants[Reg::T1.0 as usize] = Some(1);
     constants[Reg::T2.0 as usize] = Some(2);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Beq {
             offset: Imm::new_i32(8),
             src1: Reg::T1,
@@ -805,7 +861,7 @@ fn branches_and_call_return_follow_the_private_control_stack() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -817,6 +873,45 @@ fn branches_and_call_return_follow_the_private_control_stack() {
 }
 
 #[test]
+fn jalr_calls_use_concrete_targets_and_the_private_return_stack() {
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T0.0 as usize] = word(12);
+    constants[Reg::T0.0 as usize] = Some(12);
+    let mem = program([
+        Inst::Jalr {
+            offset: Imm::ZERO,
+            base: Reg::T0,
+            dest: Reg::RA,
+        },
+        Inst::Addi {
+            imm: Imm::new_i32(-1),
+            dest: Reg::A0,
+            src1: Reg::ZERO,
+        },
+        Inst::Ecall,
+        Inst::Jalr {
+            offset: Imm::ZERO,
+            base: Reg::RA,
+            dest: Reg::ZERO,
+        },
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert_success(run(
+        &mem,
+        &mut regs,
+        &mut constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+
+    assert_eq!(rstack[0], 4);
+    assert_eq!(constants[Reg::RA.0 as usize], Some(4));
+}
+
+#[test]
 fn a_not_taken_branch_falls_through() {
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
@@ -825,7 +920,7 @@ fn a_not_taken_branch_falls_through() {
     constants[Reg::T1.0 as usize] = Some(1);
     constants[Reg::T2.0 as usize] = Some(2);
     exit_register(&mut regs, &mut constants);
-    let mut mem = program([
+    let mem = program([
         Inst::Beq {
             offset: Imm::new_i32(8),
             src1: Reg::T1,
@@ -842,7 +937,7 @@ fn a_not_taken_branch_falls_through() {
     let mut vstack = [false; 64];
 
     assert_success(run(
-        &mut mem,
+        &mem,
         &mut regs,
         &mut constants,
         &mut rstack,
@@ -862,7 +957,7 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
         regs[Reg::A1.0 as usize + i] = word(i as u32 + 1);
         constants[Reg::A1.0 as usize + i] = Some(i as u32 + 1);
     }
-    let mut mem = program([
+    let mem = program([
         Inst::Ecall,
         Inst::Addi {
             imm: Imm::new_i32(-1),
@@ -883,7 +978,7 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
     assert_success(ert_emit(
         &mut context,
         &mut hash,
-        &mut mem,
+        bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
         0,
@@ -903,7 +998,7 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
 fn ert_func_moves_register_and_stack_abi_values() {
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
-    let mut mem = program([Inst::Ecall]);
+    let mem = program([Inst::Ecall]);
     let mut rstack = [0; 8];
     let mut vstack = [false; 128];
     let args = array::from_fn(|i| {
@@ -916,7 +1011,7 @@ fn ert_func_moves_register_and_stack_abi_values() {
     let results = match ert_func::<_, _, 10, 10>(
         &mut context,
         &mut hash,
-        &mut mem,
+        bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
         0,
@@ -939,10 +1034,42 @@ fn ert_func_moves_register_and_stack_abi_values() {
 }
 
 #[test]
+fn ert_func_rejects_a_symbolic_stack_too_small_for_abi_words() {
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    let mem = program([Inst::Ecall]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 31];
+    let args = array::from_fn(|i| {
+        let constant = if i == 0 { u32::MAX } else { i as u32 };
+        (word(constant), Some(constant))
+    });
+    let mut context = ();
+    let mut hash = no_hash;
+
+    assert!(matches!(
+        ert_func::<_, _, 9, 0>(
+            &mut context,
+            &mut hash,
+            bounded_memory(&mem),
+            &mut rstack,
+            &mut vstack,
+            0,
+            &mut regs,
+            &mut constants,
+            false,
+            true,
+            args,
+        ),
+        Err(ErtError::Unexpected)
+    ));
+}
+
+#[test]
 fn dynamic_control_and_invalid_words_are_reported() {
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
-    let mut mem = program([Inst::Beq {
+    let mem = program([Inst::Beq {
         offset: Imm::new_i32(4),
         src1: Reg::T0,
         src2: Reg::ZERO,
@@ -951,20 +1078,14 @@ fn dynamic_control_and_invalid_words_are_reported() {
     let mut vstack = [false; 64];
 
     assert!(matches!(
-        run(
-            &mut mem,
-            &mut regs,
-            &mut constants,
-            &mut rstack,
-            &mut vstack,
-        ),
+        run(&mem, &mut regs, &mut constants, &mut rstack, &mut vstack,),
         Err(ErtError::Unexpected)
     ));
 
-    let mut invalid = [0u8; 4];
+    let invalid = [0u8; 4];
     assert!(matches!(
         run(
-            &mut invalid,
+            &invalid,
             &mut regs,
             &mut constants,
             &mut rstack,

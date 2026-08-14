@@ -1,8 +1,8 @@
-use core::{array, error::Error, mem::MaybeUninit};
+use core::{array, error::Error, mem::MaybeUninit, ops::Range};
 
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
-use crate::{ContextWithRvOps, ErtError, handlers};
+use crate::{ContextWithRvOps, ErtError, RawMemory, handlers};
 
 pub(crate) const ABI_REGS: [Reg; 8] = [
     Reg::A0,
@@ -18,7 +18,7 @@ pub(crate) const ABI_REGS: [Reg; 8] = [
 pub(crate) struct Machine<'a, W, E> {
     pub(crate) t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
     pub(crate) hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
-    pub(crate) mem: &'a mut [u8],
+    pub(crate) mem: RawMemory,
     pub(crate) rstack: &'a mut [u32],
     pub(crate) vstack: &'a mut [W],
     pub(crate) pc: u32,
@@ -27,6 +27,7 @@ pub(crate) struct Machine<'a, W, E> {
     pub(crate) zero: W,
     pub(crate) one: W,
     pub(crate) sp: u32,
+    pub(crate) stack_top: u32,
     pub(crate) rsp: u32,
     pub(crate) offs: [Option<i32>; 32],
 }
@@ -65,7 +66,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     pub(crate) fn new(
         t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
         hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
-        mem: &'a mut [u8],
+        mem: RawMemory,
         rstack: &'a mut [u32],
         vstack: &'a mut [W],
         pc: u32,
@@ -73,8 +74,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         reg_consts: &'a mut [Option<u32>; 32],
         zero: W,
         one: W,
+        sp: u32,
     ) -> Self {
-        let sp = vstack.len() as u32 - 1;
         Self {
             t,
             hash,
@@ -87,6 +88,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             zero,
             one,
             sp,
+            stack_top: sp,
             rsp: 0,
             offs: [const { None }; 32],
         }
@@ -106,7 +108,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     fn decode(&self) -> Result<Inst, ErtError<E>> {
         rv_asm::Inst::decode(
-            u32::from_le_bytes(array::from_fn(|i| self.mem[i + self.pc as usize])),
+            u32::from_le_bytes(self.mem.read(self.pc).ok_or(ErtError::Unexpected)?),
             Xlen::Rv32,
         )
         .map(|(instruction, _)| instruction)
@@ -123,7 +125,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         self.reg_consts[Reg::SP.0 as usize] = None;
         self.offs[Reg::SP.0 as usize] = Some(0);
         for (i, register_bit) in self.regs[Reg::SP.0 as usize].iter_mut().enumerate() {
-            *register_bit = if self.sp >> i == 0 {
+            *register_bit = if (self.sp >> i) & 1 == 0 {
                 self.zero.clone()
             } else {
                 self.one.clone()
@@ -133,7 +135,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     pub(crate) fn word_from_constant(&self, value: u32) -> [W; 32] {
         array::from_fn(|i| {
-            if value >> i == 0 {
+            if (value >> i) & 1 == 0 {
                 self.zero.clone()
             } else {
                 self.one.clone()
@@ -148,25 +150,36 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     pub(crate) fn stack_offset(&self, base: Reg, offset: Imm) -> Result<Imm, ErtError<E>> {
-        match base {
-            x if x == Reg::SP => Ok(offset),
-            x if self.offs[x.0 as usize].is_some() => Ok(Imm::new_i32(
-                self.offs[base.0 as usize]
-                    .unwrap()
-                    .wrapping_add(offset.as_i32()),
-            )),
-            _ => Err(ErtError::Unexpected),
+        let relative = match base {
+            x if x == Reg::SP => offset.as_i32(),
+            x if self.offs[x.0 as usize].is_some() => self.offs[base.0 as usize]
+                .unwrap()
+                .wrapping_add(offset.as_i32()),
+            _ => return Err(ErtError::Unexpected),
+        };
+        Ok(Imm::new_i32(self.sp.wrapping_add_signed(relative) as i32))
+    }
+
+    pub(crate) fn stack_bits(
+        &self,
+        address: Imm,
+        width: usize,
+    ) -> Result<Range<usize>, ErtError<E>> {
+        let start = (address.as_u32() as usize)
+            .checked_mul(8)
+            .ok_or(ErtError::Unexpected)?;
+        let end = start.checked_add(width).ok_or(ErtError::Unexpected)?;
+        if end > self.vstack.len() {
+            return Err(ErtError::Unexpected);
         }
+        Ok(start..end)
     }
 
     pub(crate) fn load_address(&self, base: Reg, offset: Imm) -> Result<LoadAddress, ErtError<E>> {
         match base {
-            x if x == Reg::SP => Ok(LoadAddress::Stack(offset)),
-            x if self.offs[x.0 as usize].is_some() => Ok(LoadAddress::Stack(Imm::new_i32(
-                self.offs[base.0 as usize]
-                    .unwrap()
-                    .wrapping_add(offset.as_i32()),
-            ))),
+            x if x == Reg::SP || self.offs[x.0 as usize].is_some() => {
+                Ok(LoadAddress::Stack(self.stack_offset(base, offset)?))
+            }
             x if self.reg_consts[x.0 as usize].is_some() => Ok(LoadAddress::Concrete(
                 self.reg_consts[x.0 as usize].unwrap(),
             )),
@@ -179,6 +192,7 @@ pub(crate) fn write_abi_args<W, const N: usize>(
     regs: &mut [[W; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
     vstack: &mut [W],
+    sp: u32,
     args: [([W; 32], Option<u32>); N],
 ) {
     for (i, (value, constant)) in args.into_iter().enumerate() {
@@ -188,10 +202,10 @@ pub(crate) fn write_abi_args<W, const N: usize>(
                 reg_consts[register.0 as usize] = constant;
             }
             None => {
-                let stack_end = vstack.len() - 32 * (i - ABI_REGS.len());
-                let stack_slot = &mut vstack[..stack_end];
+                let stack_start = sp as usize * 8 + 32 * (i - ABI_REGS.len());
+                let stack_slot = &mut vstack[stack_start..stack_start + 32];
                 for (bit, value) in value.into_iter().enumerate() {
-                    stack_slot[stack_slot.len() - 32 + bit] = value;
+                    stack_slot[bit] = value;
                 }
             }
         }
@@ -202,6 +216,7 @@ pub(crate) fn read_abi_results<W: Clone, const M: usize>(
     regs: &[[W; 32]; 32],
     reg_consts: &[Option<u32>; 32],
     vstack: &[W],
+    sp: u32,
 ) -> [([W; 32], Option<u32>); M] {
     array::from_fn(|i| match ABI_REGS.get(i).copied() {
         Some(register) => (
@@ -209,12 +224,9 @@ pub(crate) fn read_abi_results<W: Clone, const M: usize>(
             reg_consts[register.0 as usize],
         ),
         None => {
-            let stack_end = vstack.len() - 32 * (i - ABI_REGS.len());
-            let stack_slot = &vstack[..stack_end];
-            (
-                array::from_fn(|bit| stack_slot[stack_slot.len() - 32 + bit].clone()),
-                None,
-            )
+            let stack_start = sp as usize * 8 + 32 * (i - ABI_REGS.len());
+            let stack_slot = &vstack[stack_start..stack_start + 32];
+            (array::from_fn(|bit| stack_slot[bit].clone()), None)
         }
     })
 }

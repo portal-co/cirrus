@@ -16,5 +16,10 @@ It is intended for circuit-oriented execution, not as a general RISC-V
 emulator. Programs must use the documented supported instruction subset,
 aligned non-compressed control flow, concrete branch decisions, conventional
 calls and returns, and caller-provided stacks with sufficient capacity. The
-crate documentation in `crates/cirrus-ert/src/lib.rs` describes the supported
+[crate documentation](crates/cirrus-ert/src/lib.rs) describes the supported
 instructions, buffers, ECALLs, and public entry points.
+
+Instruction images are supplied through `RawMemory`, an unsafe raw guest-memory
+mapping rather than a slice. A bounded mapping is appropriate for a host buffer;
+an unbounded mapping can address a bare-metal RV32 image at its native addresses
+without claiming that address zero is the start of a valid 4 GiB slice.
