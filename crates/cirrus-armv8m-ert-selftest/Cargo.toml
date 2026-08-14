@@ -1,20 +1,20 @@
 [package]
-name = "cirrus-ert-selftest"
+name = "cirrus-armv8m-ert-selftest"
 edition = "2024"
 version.workspace = true
-description = "Bare-metal RV32IM cirrus-ert self-test"
+description = "Bare-metal Armv8-M cirrus ERT self-test"
 autobins = false
 
 [features]
 bare-metal = []
 
 [[bin]]
-name = "cirrus-ert-selftest"
+name = "cirrus-armv8m-ert-selftest"
 path = "src/main.rs"
 test = false
 bench = false
 required-features = ["bare-metal"]
 
 [dependencies]
-cirrus-ert = { path = "../cirrus-ert" }
+cirrus-armv8m-ert = { path = "../cirrus-armv8m-ert" }
 cirrus-ert-sha256-fixture = { path = "../cirrus-ert-sha256-fixture" }

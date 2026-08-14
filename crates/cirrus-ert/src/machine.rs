@@ -1,5 +1,6 @@
-use core::{array, error::Error, mem::MaybeUninit, ops::Range};
+use core::{array, error::Error, ops::Range};
 
+pub(crate) use cirrus_ert_core::add_bits;
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
 use crate::{ContextWithRvOps, ErtError, RawMemory, handlers};
@@ -35,30 +36,6 @@ pub(crate) struct Machine<'a, W, E> {
 pub(crate) enum LoadAddress {
     Stack(Imm),
     Concrete(u32),
-}
-
-pub(crate) fn add_bits<W: Clone, E: Error, const N: usize>(
-    t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
-    v: &[W; N],
-    w: &[W; N],
-    mut carry: W,
-) -> Result<[W; N], E> {
-    let mut output: [MaybeUninit<W>; N] = [const { MaybeUninit::uninit() }; N];
-    for i in 0..N {
-        let sum_without_carry = t.bitxor(v[i].clone(), w[i].clone())?;
-        output[i] = MaybeUninit::new(t.bitxor(sum_without_carry, carry.clone())?);
-        let inputs = [v[i].clone(), w[i].clone(), carry.clone()];
-        let mut pairs: [MaybeUninit<W>; 3] = [const { MaybeUninit::uninit() }; 3];
-        for i in 0..3 {
-            pairs[i] = MaybeUninit::new(
-                t.bitand(inputs[(i + 2) % 3].clone(), inputs[(i + 1) % 3].clone())?,
-            );
-        }
-        let [a, b, c] = pairs.map(|value| unsafe { value.assume_init() });
-        let carry_without_a = t.bitor(c, b)?;
-        carry = t.bitor(a, carry_without_a)?;
-    }
-    Ok(output.map(|value| unsafe { value.assume_init() }))
 }
 
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {

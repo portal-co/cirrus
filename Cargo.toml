@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cirrus-asm","crates/cirrus-core", "crates/cirrus-ert", "crates/cirrus-ert-rt", "crates/cirrus-ert-selftest", "crates/cirrus-garbled-circuit", "crates/cirrus-mpc-common", "crates/cirrus-vole", "crates/miniot"]
+members = ["crates/cirrus-asm","crates/cirrus-core", "crates/cirrus-ert-core", "crates/cirrus-ert", "crates/cirrus-armv8m-ert", "crates/cirrus-ert-rt", "crates/cirrus-ert-sha256-fixture", "crates/cirrus-ert-selftest", "crates/cirrus-armv8m-ert-selftest", "crates/cirrus-garbled-circuit", "crates/cirrus-mpc-common", "crates/cirrus-vole", "crates/miniot"]
 resolver = "3"
 
 [workspace.package]

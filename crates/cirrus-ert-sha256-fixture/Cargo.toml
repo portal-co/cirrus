@@ -1,0 +1,8 @@
+[package]
+name = "cirrus-ert-sha256-fixture"
+edition = "2024"
+version.workspace = true
+description = "Shared no-std SHA-256 compression workload for ERT self-tests"
+
+[lib]
+crate-type = ["rlib"]

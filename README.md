@@ -2,6 +2,34 @@
 
 New circuit compiler, for everywhere
 
+## Symbolic execution runtimes
+
+`cirrus` includes two small, circuit-oriented symbolic interpreters that share
+their Boolean-word circuits, symbolic-stack model, concrete-value tracking,
+raw-memory mapping, and host-call convention through the internal
+`cirrus-ert-core` crate.
+
+- [`cirrus-ert`](crates/cirrus-ert/src/lib.rs) is the compatible RV32 RISC-V
+  facade.
+- [`cirrus-armv8m-ert`](crates/cirrus-armv8m-ert/src/lib.rs) is the non-secure,
+  Thumb-only Armv8-M Mainline/Cortex-M33 facade. Its ABI wrapper follows
+  AAPCS32; it accepts an odd Thumb entry address and sixteen core registers.
+
+Both interpret a deliberately well-behaved compiler-oriented subset, not an
+entire machine: control flow, flags, and non-stack addresses must stay
+concrete; stacks and return stacks are caller supplied; unsupported encodings
+and violations report `Unexpected`. ARM additionally excludes exception and
+interrupt entry, TrustZone transitions, MPU state, floating point, DSP/MVE,
+atomics, and semihosting.
+
+Each facade has a bare-metal QEMU SHA-256 compression compatibility gate. The
+same no-std workload is compiled for RV32IM and `thumbv8m.main-none-eabi`; the
+ARM image uses the `mps2-an505` Cortex-M33 board, with its workload linked at
+`0x2000_0000` to exercise unbounded raw guest addresses. These are bare-metal
+tests, not Linux VMs. QEMU's AN505 model boots from its remapped flash vector
+at `0x1000_0000`, so the fixture places only its vector/reset stub there while
+keeping the interpreted code and constants at the high RAM address.
+
 ## `cirrus-ert`
 
 `cirrus-ert` is a symbolic interpreter for a deliberately well-behaved subset

@@ -1,10 +1,48 @@
 #![no_std]
 pub use core::arch::asm;
+use core::array;
 use core::convert::Infallible;
-use core::{array, iter};
 
 use rand_core::{TryCryptoRng, TryRng};
 use sha2::Digest;
+
+#[cfg(target_arch = "arm")]
+core::arch::global_asm!(
+    r#"
+    .syntax unified
+    .thumb
+    .global __cirrus_ert_hash_words
+    .type __cirrus_ert_hash_words,%function
+    .thumb_func
+__cirrus_ert_hash_words:
+    push.w {{r4, r5, r6, r7, r8, lr}}
+    mov r12, r0
+    ldr r1, [r12, #0]
+    ldr r2, [r12, #4]
+    ldr r3, [r12, #8]
+    ldr r4, [r12, #12]
+    ldr r5, [r12, #16]
+    ldr r6, [r12, #20]
+    ldr r7, [r12, #24]
+    ldr r8, [r12, #28]
+    movs r0, #0
+    svc #0
+    str r1, [r12, #0]
+    str r2, [r12, #4]
+    str r3, [r12, #8]
+    str r4, [r12, #12]
+    str r5, [r12, #16]
+    str r6, [r12, #20]
+    str r7, [r12, #24]
+    str r8, [r12, #28]
+    pop.w {{r4, r5, r6, r7, r8, pc}}
+"#
+);
+
+#[cfg(target_arch = "arm")]
+unsafe extern "C" {
+    fn __cirrus_ert_hash_words(words: *mut u32);
+}
 /// Exit the program
 #[inline(always)]
 pub fn exit<T>() -> T {
@@ -22,7 +60,19 @@ macro_rules! exit_with {
         }
     };
 }
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+#[cfg(target_arch = "arm")]
+#[macro_export]
+/// Exit the program through the Armv8-M ERT `SVC #0` convention.
+macro_rules! exit_with {
+    ($($a:tt)*) => {
+        loop {
+            unsafe {
+                $crate::asm!("svc 0", in("r0") u32::MAX, $($a)*)
+            }
+        }
+    };
+}
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
 #[macro_export]
 /// Exit the program, with extra register arguments
 macro_rules! exit_with {
@@ -30,7 +80,10 @@ macro_rules! exit_with {
         loop {}
     };
 }
-/// Hash a value, with host-provided salts
+/// Hash a value, with host-provided salts.
+///
+/// On Armv8-M this sends the eight little-endian words through the ERT
+/// `SVC #0` hash convention (`r0 = 0`, payload/result in `r1` through `r8`).
 pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
     v = sha2::Sha256::digest(&v).0;
     #[cfg(target_arch = "riscv32")]
@@ -49,6 +102,23 @@ pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
         }
         return v;
     }
+    #[cfg(target_arch = "arm")]
+    {
+        let mut words: [u32; 8] =
+            array::from_fn(|i| u32::from_le_bytes(array::from_fn(|j| v[j + i * 4])));
+        unsafe {
+            __cirrus_ert_hash_words(words.as_mut_ptr());
+        }
+        for (index, byte) in words
+            .into_iter()
+            .flat_map(|word| word.to_le_bytes())
+            .enumerate()
+        {
+            v[index] = byte;
+        }
+        return v;
+    }
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "arm")))]
     unreachable!()
 }
 /// Sponge construction/XOF of [`hash`]

@@ -41,9 +41,9 @@
 //! shift amount or multiplicand selects a smaller fixed-shift or constant-product
 //! path, so callers should retain concrete metadata whenever it is known.
 
-use core::{error::Error, marker::PhantomData};
+use core::error::Error;
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
+pub use cirrus_ert_core::RawMemory;
 use rv_asm::DecodeError;
 
 mod handlers;
@@ -54,90 +54,10 @@ mod tests;
 
 use machine::{Machine, add_bits, read_abi_results, write_abi_args};
 
-/// A read-only byte mapping whose base is RV32 guest address zero.
-///
-/// [`RawMemory::from_slice`] safely creates a bounded mapping that borrows a
-/// host buffer. The lifetime prevents the mapping from outliving that buffer.
-/// Bare-metal callers can instead use a null base with no bound to access
-/// instructions at their native addresses. When a bound is supplied, the
-/// interpreter rejects instruction fetches and concrete loads outside that many
-/// bytes with [`ErtError::Unexpected`].
-#[derive(Clone, Copy)]
-pub struct RawMemory<'a> {
-    base: *const u8,
-    len: Option<usize>,
-    marker: PhantomData<&'a [u8]>,
-}
-
-impl<'a> RawMemory<'a> {
-    /// Borrow a host byte slice as a bounded guest-memory mapping.
-    ///
-    /// Guest address zero maps to the first byte of `memory`; instruction
-    /// fetches and concrete loads outside the slice return
-    /// [`ErtError::Unexpected`].
-    pub fn from_slice(memory: &'a [u8]) -> Self {
-        Self {
-            base: memory.as_ptr(),
-            len: Some(memory.len()),
-            marker: PhantomData,
-        }
-    }
-
-    pub(crate) fn read<const N: usize>(&self, address: u32) -> Option<[u8; N]> {
-        debug_assert!(N > 0);
-        address.checked_add(N.checked_sub(1)? as u32)?;
-        if let Some(len) = self.len {
-            let start = address as usize;
-            if start.checked_add(N)? > len {
-                return None;
-            }
-        }
-        Some(core::array::from_fn(|offset| {
-            // SAFETY: `RawMemory::new` guarantees readability. The checked
-            // address range prevents a bounded mapping from wrapping.
-            unsafe { self.base.wrapping_add(address as usize + offset).read() }
-        }))
-    }
-}
-
-impl<'a> From<&'a [u8]> for RawMemory<'a> {
-    fn from(memory: &'a [u8]) -> Self {
-        Self::from_slice(memory)
-    }
-}
-
-impl RawMemory<'static> {
-    /// Create a raw guest-memory mapping.
-    ///
-    /// `base` represents guest address zero and may be null. If `len` is
-    /// `Some`, the bytes in `base..base + len` must be readable. If it is
-    /// `None`, every byte the executed program fetches or concretely loads at
-    /// `base + guest_address` must be readable for the duration of execution.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the readability requirements above. In
-    /// particular, supplying a bound only enables interpreter-side range checks;
-    /// it does not make an invalid pointer valid.
-    pub const unsafe fn new(base: *const u8, len: Option<usize>) -> Self {
-        Self {
-            base,
-            len,
-            marker: PhantomData,
-        }
-    }
-}
-
 /// The Boolean operations required to execute the supported RISC-V subset.
-pub trait ContextWithRvOps<Val>:
-    ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<Val>
-{
-}
+pub trait ContextWithRvOps<Val>: cirrus_ert_core::ContextWithErtOps<Val> {}
 
-impl<Val, T: ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<Val>>
-    ContextWithRvOps<Val> for T
-{
-}
+impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val>> ContextWithRvOps<Val> for T {}
 
 /// An error while decoding or symbolically executing a program.
 pub enum ErtError<E> {

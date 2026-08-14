@@ -1,10 +1,12 @@
 [package]
-name = "cirrus-ert"
+name = "cirrus-armv8m-ert"
 edition = "2024"
 version.workspace = true
-description.workspace = true
+description = "Symbolic Armv8-M Thumb-2 interpreter facade"
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
-rv-asm.workspace = true
+
+[dev-dependencies]
+cirrus-ert-sha256-fixture = { version = "0.1.0", path = "../cirrus-ert-sha256-fixture" }
