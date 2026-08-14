@@ -1,0 +1,11 @@
+[package]
+name = "cirrus-llvm-frontend"
+edition = "2024"
+version.workspace = true
+description = "Bounded concrete-control LLVM IR frontend for Cirrus programs"
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-ert-core = { version = "0.1.0", path = "../../ert/cirrus-ert-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+inkwell = { workspace = true, features = ["llvm22-1"] }

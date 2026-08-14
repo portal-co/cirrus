@@ -38,7 +38,7 @@
 /// name (or at all).
 pub use cirrus_core;
 
-use cirrus_recompile_core::{Op, Program};
+use cirrus_recompile_core::{Op, PreparedProgram, PreparedStep, Program, ScheduledOp};
 
 /// Define one backend's pinned functions: `create`, `bitand`, `bitor`,
 /// `bitxor`, `mux`, generic only over the lifetimes named in `[$lt,*]` --
@@ -196,7 +196,11 @@ define_pinned_backend!(pub mod plaintext for [] () as "plaintext");
 /// `Backend::Wrapped` must be `Copy`: buffer slots are read and written
 /// freely (never dropped), matching every source type this project defines
 /// (`bool`, a garbled-circuit `Label<N>`, an evaluator's `[u8; N]`).
-pub fn execute<Backend>(backend: &mut Backend, program: &Program, inputs: &[Backend::Wrapped]) -> Vec<Backend::Wrapped>
+pub fn execute<Backend>(
+    backend: &mut Backend,
+    program: &Program,
+    inputs: &[Backend::Wrapped],
+) -> Vec<Backend::Wrapped>
 where
     Backend: cirrus_core::ContextWithBitAnd<bool>
         + cirrus_core::ContextWithBitOr<bool>
@@ -222,21 +226,26 @@ where
             continue;
         }
         let result = match *op {
-            Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val).unwrap_or_else(|_| {
-                panic!("cirrus_recompile_rt::execute: create failed")
-            }),
-            Op::BitAnd(a, b) => {
-                cirrus_core::ContextWithBitAnd::bitand(backend, buf[a.get()].unwrap(), buf[b.get()].unwrap())
-                    .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitand failed"))
-            }
-            Op::BitOr(a, b) => {
-                cirrus_core::ContextWithBitOr::bitor(backend, buf[a.get()].unwrap(), buf[b.get()].unwrap())
-                    .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitor failed"))
-            }
-            Op::BitXor(a, b) => {
-                cirrus_core::ContextWithBitXor::bitxor(backend, buf[a.get()].unwrap(), buf[b.get()].unwrap())
-                    .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitxor failed"))
-            }
+            Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)
+                .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: create failed")),
+            Op::BitAnd(a, b) => cirrus_core::ContextWithBitAnd::bitand(
+                backend,
+                buf[a.get()].unwrap(),
+                buf[b.get()].unwrap(),
+            )
+            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitand failed")),
+            Op::BitOr(a, b) => cirrus_core::ContextWithBitOr::bitor(
+                backend,
+                buf[a.get()].unwrap(),
+                buf[b.get()].unwrap(),
+            )
+            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitor failed")),
+            Op::BitXor(a, b) => cirrus_core::ContextWithBitXor::bitxor(
+                backend,
+                buf[a.get()].unwrap(),
+                buf[b.get()].unwrap(),
+            )
+            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitxor failed")),
             Op::Mux { cond, then, r#else } => cirrus_core::ContextWithMux::mux(
                 backend,
                 buf[cond.get()].unwrap(),
@@ -247,7 +256,108 @@ where
         };
         buf[i] = Some(result);
     }
-    program.outputs.iter().map(|idx| buf[idx.get()].unwrap()).collect()
+    program
+        .outputs
+        .iter()
+        .map(|idx| buf[idx.get()].unwrap())
+        .collect()
+}
+
+/// Run a [`PreparedProgram`] against a generic backend.
+///
+/// This is the reference executor for table-loop lowering.  It uses the same
+/// pinned-operation semantics as [`execute`], but resolves each loop row to
+/// the raw program's absolute scratch slots before calling the backend.
+pub fn execute_prepared<Backend>(
+    backend: &mut Backend,
+    program: &PreparedProgram,
+    inputs: &[Backend::Wrapped],
+) -> Vec<Backend::Wrapped>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>,
+    Backend::Wrapped: Copy,
+{
+    assert_eq!(
+        inputs.len(),
+        program.inputs.len(),
+        "input count must match the recorded program's input slots"
+    );
+    let mut buf: Vec<Option<Backend::Wrapped>> = vec![None; program.slots];
+    for (&idx, &value) in program.inputs.iter().zip(inputs) {
+        buf[idx.get()] = Some(value);
+    }
+    for step in &program.steps {
+        match step {
+            PreparedStep::Flat(ops) => {
+                for &op in ops {
+                    execute_scheduled(backend, &mut buf, op);
+                }
+            }
+            PreparedStep::Loop(loop_step) => {
+                for iteration in 0..loop_step.iterations as usize {
+                    for &op in &loop_step.ops {
+                        execute_scheduled(backend, &mut buf, loop_step.scheduled_op(iteration, op));
+                    }
+                }
+            }
+        }
+    }
+    program
+        .outputs
+        .iter()
+        .map(|idx| buf[idx.get()].unwrap())
+        .collect()
+}
+
+fn execute_scheduled<Backend>(
+    backend: &mut Backend,
+    buf: &mut [Option<Backend::Wrapped>],
+    scheduled: ScheduledOp,
+) where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>,
+    Backend::Wrapped: Copy,
+{
+    if buf[scheduled.out.get()].is_some() {
+        return;
+    }
+    let result = match scheduled.op {
+        Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)
+            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: create failed")),
+        Op::BitAnd(a, b) => cirrus_core::ContextWithBitAnd::bitand(
+            backend,
+            buf[a.get()].unwrap(),
+            buf[b.get()].unwrap(),
+        )
+        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitand failed")),
+        Op::BitOr(a, b) => cirrus_core::ContextWithBitOr::bitor(
+            backend,
+            buf[a.get()].unwrap(),
+            buf[b.get()].unwrap(),
+        )
+        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitor failed")),
+        Op::BitXor(a, b) => cirrus_core::ContextWithBitXor::bitxor(
+            backend,
+            buf[a.get()].unwrap(),
+            buf[b.get()].unwrap(),
+        )
+        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitxor failed")),
+        Op::Mux { cond, then, r#else } => cirrus_core::ContextWithMux::mux(
+            backend,
+            buf[cond.get()].unwrap(),
+            buf[then.get()].unwrap(),
+            buf[r#else.get()].unwrap(),
+        )
+        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: mux failed")),
+    };
+    buf[scheduled.out.get()] = Some(result);
 }
 
 #[cfg(test)]
@@ -256,7 +366,11 @@ mod tests {
     use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate};
     use cirrus_recompile_core::Recorder;
 
-    fn sample_program() -> (Program, cirrus_recompile_core::Idx, cirrus_recompile_core::Idx) {
+    fn sample_program() -> (
+        Program,
+        cirrus_recompile_core::Idx,
+        cirrus_recompile_core::Idx,
+    ) {
         let mut recorder = Recorder::new();
         let a = recorder.create(true).unwrap();
         let b = recorder.create(false).unwrap();
@@ -294,13 +408,26 @@ mod tests {
                 }
                 unsafe {
                     match *op {
-                        Op::Create(v) => plaintext::create(&mut backend, buf.as_mut_ptr(), v as u8, out),
-                        Op::BitAnd(a, b) => plaintext::bitand(&mut backend, buf.as_mut_ptr(), a.0, b.0, out),
-                        Op::BitOr(a, b) => plaintext::bitor(&mut backend, buf.as_mut_ptr(), a.0, b.0, out),
-                        Op::BitXor(a, b) => plaintext::bitxor(&mut backend, buf.as_mut_ptr(), a.0, b.0, out),
-                        Op::Mux { cond, then, r#else } => {
-                            plaintext::mux(&mut backend, buf.as_mut_ptr(), cond.0, then.0, r#else.0, out)
+                        Op::Create(v) => {
+                            plaintext::create(&mut backend, buf.as_mut_ptr(), v as u8, out)
                         }
+                        Op::BitAnd(a, b) => {
+                            plaintext::bitand(&mut backend, buf.as_mut_ptr(), a.0, b.0, out)
+                        }
+                        Op::BitOr(a, b) => {
+                            plaintext::bitor(&mut backend, buf.as_mut_ptr(), a.0, b.0, out)
+                        }
+                        Op::BitXor(a, b) => {
+                            plaintext::bitxor(&mut backend, buf.as_mut_ptr(), a.0, b.0, out)
+                        }
+                        Op::Mux { cond, then, r#else } => plaintext::mux(
+                            &mut backend,
+                            buf.as_mut_ptr(),
+                            cond.0,
+                            then.0,
+                            r#else.0,
+                            out,
+                        ),
                     }
                 }
             }

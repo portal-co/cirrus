@@ -201,24 +201,44 @@ pub fn constant_word<W: Clone>(zero: &W, one: &W, value: u32) -> [W; 32] {
     })
 }
 
+/// Add fixed-width little-endian words with an initial carry through a
+/// caller-supplied Boolean gate constructor.
+///
+/// This is the architecture-neutral core of the symbolic adder.  ERT routes
+/// it through a [`ContextWithErtOps`] implementation below, while frontends
+/// that retain concrete-bit metadata can use it with a simplifying gate
+/// constructor and still share the exact carry circuit.
+pub fn add_bits_with<W: Clone, E, const N: usize>(
+    v: &[W; N],
+    w: &[W; N],
+    mut carry: W,
+    mut gate: impl FnMut(BitOp, W, W) -> Result<W, E>,
+) -> Result<[W; N], E> {
+    let mut output: [MaybeUninit<W>; N] = [const { MaybeUninit::uninit() }; N];
+    for i in 0..N {
+        let without_carry = gate(BitOp::Xor, v[i].clone(), w[i].clone())?;
+        output[i] = MaybeUninit::new(gate(BitOp::Xor, without_carry, carry.clone())?);
+        let a = gate(BitOp::And, v[i].clone(), w[i].clone())?;
+        let b = gate(BitOp::And, v[i].clone(), carry.clone())?;
+        let c = gate(BitOp::And, w[i].clone(), carry.clone())?;
+        let remaining_pairs = gate(BitOp::Or, b, c)?;
+        carry = gate(BitOp::Or, a, remaining_pairs)?;
+    }
+    Ok(output.map(|value| unsafe { value.assume_init() }))
+}
+
 /// Add fixed-width little-endian words with an initial carry.
 pub fn add_bits<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     v: &[W; N],
     w: &[W; N],
-    mut carry: W,
+    carry: W,
 ) -> Result<[W; N], E> {
-    let mut output: [MaybeUninit<W>; N] = [const { MaybeUninit::uninit() }; N];
-    for i in 0..N {
-        let without_carry = t.bitxor(v[i].clone(), w[i].clone())?;
-        output[i] = MaybeUninit::new(t.bitxor(without_carry, carry.clone())?);
-        let a = t.bitand(v[i].clone(), w[i].clone())?;
-        let b = t.bitand(v[i].clone(), carry.clone())?;
-        let c = t.bitand(w[i].clone(), carry.clone())?;
-        let remaining_pairs = t.bitor(b, c)?;
-        carry = t.bitor(a, remaining_pairs)?;
-    }
-    Ok(output.map(|value| unsafe { value.assume_init() }))
+    add_bits_with(v, w, carry, |operation, left, right| match operation {
+        BitOp::And => t.bitand(left, right),
+        BitOp::Or => t.bitor(left, right),
+        BitOp::Xor => t.bitxor(left, right),
+    })
 }
 
 /// Add two 32-bit words.
