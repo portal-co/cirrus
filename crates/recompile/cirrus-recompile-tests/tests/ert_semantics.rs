@@ -18,7 +18,7 @@ use core::array;
 use core::convert::Infallible;
 
 use cirrus_core::{ContextWithCreate, HasError};
-use cirrus_ert::{DefaultHandler, RawMemory, ert_func};
+use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_recompile_core::{Idx, Program, Recorder};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
@@ -56,7 +56,7 @@ fn program_image() -> Vec<u8> {
     ])
 }
 
-fn no_hash_bool(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash_bool<C>(_: &mut C, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     unreachable!("this test program never issues the hash ECALL")
 }
 
@@ -67,11 +67,11 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
     let mut reg_consts = [None; 32];
     let mut rstack = [0u32; 8];
     let mut vstack = [false; 128];
-    let mut context = ();
-    let mut hash = no_hash_bool;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash_bool,
+        },
     };
 
     let results = ert_func::<_, _, 2, 5>(
@@ -91,7 +91,7 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
     (value(&results[2].0), value(&results[3].0), value(&results[4].0))
 }
 
-fn no_hash_idx(_: &[[Idx; 32]]) -> Result<[u8; 32], <Recorder as HasError>::Error> {
+fn no_hash_idx<C>(_: &mut C, _: &[[Idx; 32]]) -> Result<[u8; 32], <Recorder as HasError>::Error> {
     unreachable!("this test program never issues the hash ECALL")
 }
 
@@ -110,10 +110,11 @@ fn record_program(mem: &[u8]) -> Program {
     let mut reg_consts = [None; 32];
     let mut rstack = [0u32; 8];
     let mut vstack = [Idx(0); 128];
-    let mut hash = no_hash_idx;
-    let mut handler = DefaultHandler {
-        context: &mut recorder,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: recorder,
+            hash: no_hash_idx,
+        },
     };
 
     let results = ert_func::<_, _, 2, 5>(
@@ -139,7 +140,7 @@ fn record_program(mem: &[u8]) -> Program {
     outputs.extend_from_slice(&results[3].0); // a3 = a & b
     outputs.extend_from_slice(&results[4].0); // a4 = a ^ b
 
-    recorder.finish(inputs, outputs)
+    handler.inner.context.finish(inputs, outputs)
 }
 
 fn bits_of(program: &Program, a: u32, b: u32) -> Vec<bool> {

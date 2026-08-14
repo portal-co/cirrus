@@ -1,5 +1,6 @@
 use core::array;
 
+use cirrus_ert_core::{BitOp, partial_bitwise_word};
 use rv_asm::{Imm, Inst, Reg};
 
 use crate::machine::{Machine, add_bits};
@@ -8,13 +9,6 @@ use crate::{EcallOutcome, ErtError, machine::LoadAddress};
 pub(crate) enum Flow {
     Next(u32),
     Exit,
-}
-
-#[derive(Clone, Copy)]
-enum BitOp {
-    And,
-    Or,
-    Xor,
 }
 
 #[derive(Clone, Copy)]
@@ -122,10 +116,17 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
             branch(machine, offset, src1, src2, Branch::LessThanSigned)
         }
 
-        Inst::Ecall => match machine.t.ecall(machine.regs, machine.reg_consts, &machine.zero, &machine.one)? {
-            EcallOutcome::Continue => next(machine),
-            EcallOutcome::Exit if machine.sp == machine.stack_top => Ok(Flow::Exit),
-            EcallOutcome::Exit => Err(ErtError::Unexpected),
+        Inst::Ecall => match machine.t.ecall(
+            &mut machine.regs[..],
+            &mut machine.reg_consts[..],
+            &mut machine.offs[..],
+            &machine.zero,
+            &machine.one,
+        ) {
+            Ok(EcallOutcome::Continue) => next(machine),
+            Ok(EcallOutcome::Exit) if machine.sp == machine.stack_top => Ok(Flow::Exit),
+            Ok(EcallOutcome::Exit) | Ok(EcallOutcome::Unexpected) => Err(ErtError::Unexpected),
+            Err(e) => Err(ErtError::Emitted(e)),
         },
         _ => Err(ErtError::Unexpected),
     }
@@ -289,6 +290,30 @@ fn subtract<W: Clone, E: core::error::Error>(
     next(machine)
 }
 
+fn fold(operation: BitOp, a: u32, b: u32) -> u32 {
+    match operation {
+        BitOp::And => a & b,
+        BitOp::Or => a | b,
+        BitOp::Xor => a ^ b,
+    }
+}
+
+fn degenerate(operation: BitOp, constant: u32) -> bool {
+    match operation {
+        BitOp::And => constant == 0,
+        BitOp::Or => constant == u32::MAX,
+        BitOp::Xor => false,
+    }
+}
+
+fn degenerate_value(operation: BitOp) -> u32 {
+    match operation {
+        BitOp::And => 0,
+        BitOp::Or => u32::MAX,
+        BitOp::Xor => unreachable!("Xor is never degenerate"),
+    }
+}
+
 fn bitwise<W: Clone, E: core::error::Error>(
     machine: &mut Machine<'_, W, E>,
     dest: Reg,
@@ -297,18 +322,32 @@ fn bitwise<W: Clone, E: core::error::Error>(
     operation: BitOp,
 ) -> Result<Flow, ErtError<E>> {
     machine.offs[dest.0 as usize] = None;
-    if let (Some(a), Some(b)) = (
-        machine.reg_consts[src1.0 as usize],
-        machine.reg_consts[src2.0 as usize],
-    ) {
-        machine.write_constant(
-            dest,
-            match operation {
-                BitOp::And => a & b,
-                BitOp::Or => a | b,
-                BitOp::Xor => a ^ b,
-            },
-        );
+    let c1 = machine.reg_consts[src1.0 as usize];
+    let c2 = machine.reg_consts[src2.0 as usize];
+    if let (Some(a), Some(b)) = (c1, c2) {
+        machine.write_constant(dest, fold(operation, a, b));
+        return next(machine);
+    }
+    let partial = match (c1, c2) {
+        (Some(constant), None) => Some((constant, src2)),
+        (None, Some(constant)) => Some((constant, src1)),
+        _ => None,
+    };
+    if let Some((constant, symbolic)) = partial {
+        if degenerate(operation, constant) {
+            machine.write_constant(dest, degenerate_value(operation));
+            return next(machine);
+        }
+        machine.reg_consts[dest.0 as usize] = None;
+        machine.regs[dest.0 as usize] = partial_bitwise_word(
+            machine.t,
+            constant,
+            &machine.regs[symbolic.0 as usize],
+            &machine.zero,
+            &machine.one,
+            operation,
+        )
+        .map_err(ErtError::Emitted)?;
         return next(machine);
     }
     machine.reg_consts[dest.0 as usize] = None;
@@ -341,32 +380,24 @@ fn bitwise_immediate<W: Clone, E: core::error::Error>(
 ) -> Result<Flow, ErtError<E>> {
     let immediate = imm.as_i32() as u32;
     machine.offs[dest.0 as usize] = None;
-    machine.reg_consts[dest.0 as usize] =
-        machine.reg_consts[src1.0 as usize].map(|value| match operation {
-            BitOp::And => value & immediate,
-            BitOp::Or => value | immediate,
-            BitOp::Xor => value ^ immediate,
-        });
-    for bit in 0..32 {
-        machine.regs[dest.0 as usize][bit] = if immediate & (1 << bit) == 0 {
-            match operation {
-                BitOp::And => machine.zero.clone(),
-                BitOp::Or | BitOp::Xor => machine.regs[src1.0 as usize][bit].clone(),
-            }
-        } else {
-            match operation {
-                BitOp::And => machine.regs[src1.0 as usize][bit].clone(),
-                BitOp::Or => machine.one.clone(),
-                BitOp::Xor => machine
-                    .t
-                    .bitxor(
-                        machine.regs[src1.0 as usize][bit].clone(),
-                        machine.one.clone(),
-                    )
-                    .map_err(ErtError::Emitted)?,
-            }
-        };
+    if let Some(value) = machine.reg_consts[src1.0 as usize] {
+        machine.write_constant(dest, fold(operation, value, immediate));
+        return next(machine);
     }
+    if degenerate(operation, immediate) {
+        machine.write_constant(dest, degenerate_value(operation));
+        return next(machine);
+    }
+    machine.reg_consts[dest.0 as usize] = None;
+    machine.regs[dest.0 as usize] = partial_bitwise_word(
+        machine.t,
+        immediate,
+        &machine.regs[src1.0 as usize],
+        &machine.zero,
+        &machine.one,
+        operation,
+    )
+    .map_err(ErtError::Emitted)?;
     next(machine)
 }
 

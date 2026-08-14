@@ -8,7 +8,9 @@ use std::{
     vec::Vec,
 };
 
-use cirrus_armv8m_ert::{DefaultHandler, RawMemory, ert_func};
+use cirrus_armv8m_ert::{
+    ArmDefaultHandler, DefaultHandler, RawMemory, SecurityAttribute, SecurityState, ert_func,
+};
 use cirrus_core::Pusher;
 use cirrus_ert_sha256_fixture::sha256_compress;
 use cirrus_garbled_circuit_row_reduced::{Evaluator, GC, GarblingRecord, Label};
@@ -256,11 +258,12 @@ fn evaluation_args(one: [u8; 16]) -> [([[u8; 16]; 32], Option<u32>); 16] {
     array::from_fn(|word_index| (word(INPUT[word_index], word_index, one), None))
 }
 
-fn no_hash(_: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash<C>(_: &mut C, _: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
-fn evaluator_no_hash(
+fn evaluator_no_hash<C>(
+    _: &mut C,
     _: &[[[u8; 16]; 32]],
 ) -> Result<[u8; 32], cirrus_garbled_circuit_row_reduced::EvaluationError> {
     Ok([0; 32])
@@ -270,8 +273,16 @@ fn bool_word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn bool_no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn bool_no_hash<C>(_: &mut C, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
+}
+
+fn permit_all<H>(_: &mut H, _: SecurityState) -> bool {
+    true
+}
+
+fn always_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+    SecurityAttribute::Secure
 }
 
 #[test]
@@ -296,11 +307,13 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut bool_constants = [None; 16];
     let mut bool_rstack = [u32::MAX; 512];
     let mut bool_vstack = vec![false; STACK_SLOTS];
-    let mut bool_context = ();
-    let mut bool_hash = bool_no_hash;
-    let mut bool_handler = DefaultHandler {
-        context: &mut bool_context,
-        hash: &mut bool_hash,
+    let mut bool_handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: bool_no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let bool_result = ert_func::<_, _, 16, 2>(
         &mut bool_handler,
@@ -330,11 +343,14 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let stack_sentinel = Label::new([0xa5; 16]);
     let mut garbled_vstack = vec![stack_sentinel; STACK_SLOTS];
     let mut records = Records::new();
-    let mut garbler = GC::<Sha256, 16>::new(&mut records, delta);
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut garbler,
-        hash: &mut hash,
+    let garbler = GC::<Sha256, 16>::new(&mut records, delta);
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: garbler,
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
 
     let started = Instant::now();
@@ -359,9 +375,9 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
         Ok(result) => result,
         Err(_) => unreachable!("the result was checked above"),
     };
-    drop(garbler);
+    drop(handler);
     let tables = records.0.len();
-    assert_eq!(tables, 124_160, "the locked workload's AND count is stable");
+    assert_eq!(tables, 124_064, "the locked workload's AND count is stable");
     let touched_stack_slots = garbled_vstack
         .iter()
         .position(|label| *label != stack_sentinel)
@@ -380,12 +396,15 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut evaluated_constants = [None; 16];
     let mut evaluated_rstack = [u32::MAX; 512];
     let mut evaluated_vstack = vec![[0xa5; 16]; STACK_SLOTS];
-    let mut evaluator =
+    let evaluator =
         Evaluator::<Sha256, _, 16>::new(records.0.into_iter().map(GarblingRecord::Table));
-    let mut hash = evaluator_no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut evaluator,
-        hash: &mut hash,
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: evaluator,
+            hash: evaluator_no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let started = Instant::now();
     let evaluated = ert_func::<_, _, 16, 2>(
@@ -429,7 +448,7 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     }
 
     let table_bytes = tables * 3 * 16;
-    assert_eq!(table_bytes, 5_959_680);
+    assert_eq!(table_bytes, 5_955_072);
     eprintln!(
         "Thumb SHA-256 three-row GC: tables={tables}, table_bytes={table_bytes}, touched_stack_slots={touched_stack_slots}, return_stack_slots={return_stack_slots}, garbling={garbling_elapsed:?}, evaluation={evaluation_elapsed:?}"
     );

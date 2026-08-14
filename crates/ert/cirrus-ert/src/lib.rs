@@ -44,7 +44,7 @@
 use core::{array, error::Error};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
-pub use cirrus_ert_core::RawMemory;
+pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 use rv_asm::{DecodeError, Reg};
 
 mod handlers;
@@ -70,98 +70,78 @@ pub enum ErtError<E> {
     Unexpected,
 }
 
-/// A handler for the hash and exit `ECALL`s, and any others a caller adds.
-///
-/// `Machine` reaches [`Handler::ecall`] for every `ECALL` it decodes. The
-/// caller-balanced-stack requirement for a successful exit is enforced by the
-/// interpreter itself, not by the handler.
-pub trait Handler<Val>: ContextWithRvOps<Val> {
-    /// Handle an `ECALL`. `regs` and `reg_consts` are the full register file
-    /// at the call; `zero` and `one` are the caller's symbolic Boolean
-    /// constants, useful for turning a concrete result into a symbolic word.
-    fn ecall(
-        &mut self,
-        regs: &mut [[Self::Wrapped; 32]; 32],
-        reg_consts: &mut [Option<u32>; 32],
-        zero: &Self::Wrapped,
-        one: &Self::Wrapped,
-    ) -> Result<EcallOutcome, ErtError<Self::Error>>;
-}
-
-/// The effect of a handled `ECALL` on control flow.
-pub enum EcallOutcome {
-    /// Continue execution at the next instruction.
-    Continue,
-    /// Exit the program, once the interpreter confirms the stack is balanced.
-    Exit,
-}
-
 /// A [`Handler`] that reproduces the historical `ECALL` convention: concrete
 /// `a0 = 0` calls the `hash` callback on the eight words following `a1`, and
 /// concrete `a0 = 0xffff_ffff` exits.
-pub struct DefaultHandler<'a, W, E> {
-    /// The Boolean context bit operations are delegated to.
-    pub context: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
-    /// The hash callback invoked for the hash `ECALL`.
-    pub hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+pub struct DefaultHandler<C, F> {
+    /// The Boolean context bit operations, and the hash callback's own
+    /// concrete-type access, are both delegated to this context.
+    pub context: C,
+    /// The hash callback invoked for the hash `ECALL`. Its first argument is
+    /// the same context passed via `context`, letting a caller's closure use
+    /// inherent/concrete methods beyond the three bit-op trait methods (e.g.
+    /// a `MeasuredGc`'s own gate counters) while computing a hash.
+    pub hash: F,
 }
 
-impl<W, E: Error> HasError for DefaultHandler<'_, W, E> {
-    type Error = E;
+impl<C: HasError, F> HasError for DefaultHandler<C, F> {
+    type Error = C::Error;
 }
 
-impl<W, E: Error> ContextWithValue<bool> for DefaultHandler<'_, W, E> {
-    type Wrapped = W;
+impl<C: ContextWithValue<bool>, F> ContextWithValue<bool> for DefaultHandler<C, F> {
+    type Wrapped = C::Wrapped;
 }
 
-impl<W, E: Error> ContextWithBitAnd<bool> for DefaultHandler<'_, W, E> {
-    fn bitand(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitAnd<bool>, F> ContextWithBitAnd<bool> for DefaultHandler<C, F> {
+    fn bitand(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitand(a, b)
     }
-    fn bitand_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitand_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitand_assign(a, b)
     }
 }
 
-impl<W, E: Error> ContextWithBitOr<bool> for DefaultHandler<'_, W, E> {
-    fn bitor(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitOr<bool>, F> ContextWithBitOr<bool> for DefaultHandler<C, F> {
+    fn bitor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitor(a, b)
     }
-    fn bitor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitor_assign(a, b)
     }
 }
 
-impl<W, E: Error> ContextWithBitXor<bool> for DefaultHandler<'_, W, E> {
-    fn bitxor(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitXor<bool>, F> ContextWithBitXor<bool> for DefaultHandler<C, F> {
+    fn bitxor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitxor(a, b)
     }
-    fn bitxor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitxor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitxor_assign(a, b)
     }
 }
 
-impl<W: Clone, E: Error> Handler<bool> for DefaultHandler<'_, W, E> {
+impl<C, F, W: Clone, E: Error> Handler<bool> for DefaultHandler<C, F>
+where
+    C: ContextWithRvOps<bool, Wrapped = W, Error = E>,
+    F: FnMut(&mut C, &[[W; 32]]) -> Result<[u8; 32], E>,
+{
     fn ecall(
         &mut self,
-        regs: &mut [[W; 32]; 32],
-        reg_consts: &mut [Option<u32>; 32],
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
         zero: &W,
         one: &W,
-    ) -> Result<EcallOutcome, ErtError<E>> {
+    ) -> Result<EcallOutcome, E> {
         match reg_consts[Reg::A0.0 as usize] {
             Some(0) => {
-                let hash = (self.hash)(&regs[Reg::A1.0 as usize..][..(256 / 32)])
-                    .map_err(ErtError::Emitted)?;
-                for ((register, constant), chunk) in regs[Reg::A1.0 as usize..][..(256 / 32)]
-                    .iter_mut()
-                    .zip(reg_consts[Reg::A1.0 as usize..][..(256 / 32)].iter_mut())
-                    .zip(hash.chunks_exact(4))
-                {
+                let hash = (self.hash)(&mut self.context, &regs[Reg::A1.0 as usize..][..8])?;
+                for (index, chunk) in hash.chunks_exact(4).enumerate() {
+                    let register = Reg::A1.0 as usize + index;
                     let value = u32::from_le_bytes(array::from_fn(|i| chunk[i]));
-                    *constant = Some(value);
+                    reg_consts[register] = Some(value);
+                    offsets[register] = None;
                     for bit in 0..32 {
-                        register[bit] = if (value >> bit) & 1 == 0 {
+                        regs[register][bit] = if (value >> bit) & 1 == 0 {
                             zero.clone()
                         } else {
                             one.clone()
@@ -171,10 +151,74 @@ impl<W: Clone, E: Error> Handler<bool> for DefaultHandler<'_, W, E> {
                 Ok(EcallOutcome::Continue)
             }
             Some(0xffff_ffff) => Ok(EcallOutcome::Exit),
-            _ => Err(ErtError::Unexpected),
+            _ => Ok(EcallOutcome::Unexpected),
         }
     }
 }
+
+/// An RV32-specific [`Handler`] extension point, currently without
+/// additional requirements beyond [`Handler`] itself. Reserved so a future
+/// RV32 capability can be added here later without changing the shared
+/// [`Handler`] trait.
+pub trait RvHandler<Val>: Handler<Val> {}
+
+/// Tunnels any [`Handler`] through as an [`RvHandler`], with no added
+/// behavior today — the RV32 half of the extension pattern Arm's
+/// `ArmDefaultHandler` establishes for real.
+pub struct RvDefaultHandler<H> {
+    /// The wrapped handler.
+    pub inner: H,
+}
+
+impl<H: HasError> HasError for RvDefaultHandler<H> {
+    type Error = H::Error;
+}
+
+impl<H: ContextWithValue<bool>> ContextWithValue<bool> for RvDefaultHandler<H> {
+    type Wrapped = H::Wrapped;
+}
+
+impl<H: ContextWithBitAnd<bool>> ContextWithBitAnd<bool> for RvDefaultHandler<H> {
+    fn bitand(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitand_assign(a, b)
+    }
+}
+
+impl<H: ContextWithBitOr<bool>> ContextWithBitOr<bool> for RvDefaultHandler<H> {
+    fn bitor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitor_assign(a, b)
+    }
+}
+
+impl<H: ContextWithBitXor<bool>> ContextWithBitXor<bool> for RvDefaultHandler<H> {
+    fn bitxor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitxor_assign(a, b)
+    }
+}
+
+impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[H::Wrapped; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &H::Wrapped,
+        one: &H::Wrapped,
+    ) -> Result<EcallOutcome, H::Error> {
+        self.inner.ecall(regs, reg_consts, offsets, zero, one)
+    }
+}
+
+impl<H: Handler<bool>> RvHandler<bool> for RvDefaultHandler<H> {}
 
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
@@ -197,7 +241,7 @@ pub fn simple_add<W: Clone, E: Error>(
 /// are placed in or read from the symbolic stack. `args` carries both the
 /// symbolic word and, when known, its concrete value.
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn RvHandler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -233,7 +277,7 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 /// documentation](self); an exit is `ECALL` with concrete `a0 = 0xffff_ffff`,
 /// and a hash call is `ECALL` with concrete `a0 = 0`.
 pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn RvHandler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],

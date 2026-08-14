@@ -3,7 +3,10 @@
 
 use core::{array, convert::Infallible, panic::PanicInfo, ptr};
 
-use cirrus_armv8m_ert::{DecodeError, DefaultHandler, ErtError, RawMemory, ert_func};
+use cirrus_armv8m_ert::{
+    ArmDefaultHandler, DecodeError, DefaultHandler, ErtError, RawMemory, SecurityAttribute,
+    SecurityState, ert_func,
+};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 core::arch::global_asm!(
@@ -57,11 +60,13 @@ extern "C" fn rust_main() -> ! {
         INPUT[0], INPUT[1], INPUT[2], INPUT[3], INPUT[4], INPUT[5], INPUT[6], INPUT[7], INPUT[8],
         INPUT[9], INPUT[10], INPUT[11], INPUT[12], INPUT[13], INPUT[14], INPUT[15],
     );
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let mut regs = [[false; 32]; 16];
     let mut constants = [None; 16];
@@ -106,8 +111,16 @@ extern "C" fn rust_main() -> ! {
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
-fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
+}
+
+fn permit_all<H>(_: &mut H, _: SecurityState) -> bool {
+    true
+}
+
+fn always_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+    SecurityAttribute::Secure
 }
 
 fn finish(code: u32) -> ! {

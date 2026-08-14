@@ -1,8 +1,8 @@
 #![no_std]
 #![warn(missing_docs)]
 
-//! Symbolically execute a deliberately small, non-secure Armv8-M Thumb-2
-//! subset.
+//! Symbolically execute a deliberately small Armv8-M Thumb-2 subset,
+//! including virtual Secure/Non-secure TrustZone-M interworking.
 //!
 //! The interpreter represents every architectural word as 32 little-endian
 //! Boolean wires and keeps an optional concrete word beside it. Concrete data
@@ -15,16 +15,16 @@
 //! substantially fewer non-free gates than its RV32IM counterpart. RV32IM
 //! remains a supported compatibility target rather than a deprecated facade.
 //!
-//! This facade is for one Thumb-only Armv8-M Mainline/Cortex-M33 thread in the
-//! non-secure state. It does not emulate exceptions, TrustZone transitions,
-//! MPU state, floating point, DSP/MVE, atomics, or semihosting. The entry
-//! address must have bit zero set; the interpreter clears that bit only for
-//! fetching Thumb instructions.
+//! This facade is for one Thumb-only Armv8-M Mainline/Cortex-M33 thread. It
+//! does not emulate exceptions, MPU state, floating point, DSP/MVE, atomics,
+//! or semihosting. The entry address must have bit zero set; the interpreter
+//! clears that bit only for fetching Thumb instructions.
 //!
 //! Supported compiler-oriented forms include scalar moves and constants,
 //! arithmetic and logical instructions, immediate and register shifts/rotates,
 //! scalar and long multiplication, stack and concrete loads/stores, Thumb
-//! branches/calls/returns, IT blocks, and `SVC #0`. ARM uses its architectural
+//! branches/calls/returns, IT blocks, `SVC #0`, and the Secure/Non-secure
+//! interworking instructions `SG`, `BXNS`, and `BLXNS`. ARM uses its architectural
 //! register-shift count rules rather than RV32's low-five-bit rule. Symbolic
 //! shifts and multiplications synthesize selection circuits; a known shift
 //! count or multiplicand takes the smaller constant path.
@@ -35,6 +35,18 @@
 //! `r0 = u32::MAX` exits once `sp` is restored. [`ert_func`] applies the
 //! AAPCS32 word ABI: `r0` through `r3`, then a full-descending stack aligned to
 //! eight bytes at the public interface.
+//!
+//! The interpreter starts in the Secure state and tracks Secure/Non-secure
+//! transitions through `SG`, `BXNS`, and `BLXNS`, gated against a
+//! caller-supplied [`SecurityAttribute`] classifier reached through
+//! [`ArmHandler::security_attribute`] — mirroring real SAU/IDAU address
+//! attribution, but as a purely virtual, host-tracked concept with no real
+//! hardware backing. A host can pass a real attribution map through
+//! unchanged, narrow it into a stricter sandboxing policy, or synthesize an
+//! entirely virtual one for an emulated or user-mode desktop context.
+//! [`ArmHandler::svc_permitted`] additionally gates `SVC #0` on the current
+//! [`SecurityState`]. [`ArmDefaultHandler`] tunnels any [`Handler`] through
+//! as an [`ArmHandler`] with caller-supplied policy closures for both.
 //!
 //! # References
 //!
@@ -49,10 +61,10 @@ use core::{array, error::Error, ops::Range};
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
 use cirrus_ert_core::{
     BitOp, Product, Shift, add_bits, bitwise_word, concrete_product, constant_word, fixed_shift,
-    invert_word, select_word,
+    invert_word, partial_and_not_word, partial_bitwise_word, select_word,
 };
 
-pub use cirrus_ert_core::RawMemory;
+pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 
 #[cfg(test)]
 mod tests;
@@ -66,7 +78,7 @@ const ABI_REGS: [u8; 4] = [0, 1, 2, 3];
 /// Boolean operations required by the Armv8-M facade.
 pub trait ContextWithArmv8mOps<Val>: cirrus_ert_core::ContextWithErtOps<Val> {}
 
-impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val>> ContextWithArmv8mOps<Val> for T {}
+impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ?Sized> ContextWithArmv8mOps<Val> for T {}
 
 /// A Thumb image decoding failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,104 +101,202 @@ pub enum ErtError<E> {
     Unexpected,
 }
 
-/// A handler for the hash and exit `SVC #0`s, and any others a caller adds.
-///
-/// `Machine` reaches [`Handler::ecall`] for every `SVC #0` it decodes. The
-/// caller-balanced-stack requirement for a successful exit is enforced by the
-/// interpreter itself, not by the handler.
-pub trait Handler<Val>: ContextWithArmv8mOps<Val> {
-    /// Handle an `SVC #0`. `regs`, `reg_consts`, and `offsets` are the full
-    /// register file at the call (`offsets[r] = Some(_)` marks `r` as a
-    /// tracked stack-relative descriptor, which a written register must
-    /// clear); `zero` and `one` are the caller's symbolic Boolean constants,
-    /// useful for turning a concrete result into a symbolic word.
-    fn ecall(
-        &mut self,
-        regs: &mut [[Self::Wrapped; 32]; 16],
-        reg_consts: &mut [Option<u32>; 16],
-        offsets: &mut [Option<i32>; 16],
-        zero: &Self::Wrapped,
-        one: &Self::Wrapped,
-    ) -> Result<EcallOutcome, ErtError<Self::Error>>;
-}
-
-/// The effect of a handled `SVC #0` on control flow.
-pub enum EcallOutcome {
-    /// Continue execution at the next instruction.
-    Continue,
-    /// Exit the program, once the interpreter confirms the stack is balanced.
-    Exit,
-}
-
 /// A [`Handler`] that reproduces the historical `SVC #0` convention: concrete
 /// `r0 = 0` calls the `hash` callback on the eight words `r1` through `r8`,
 /// and concrete `r0 = u32::MAX` exits.
-pub struct DefaultHandler<'a, W, E> {
-    /// The Boolean context bit operations are delegated to.
-    pub context: &'a mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + 'a),
-    /// The hash callback invoked for the hash `SVC #0`.
-    pub hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+pub struct DefaultHandler<C, F> {
+    /// The Boolean context bit operations, and the hash callback's own
+    /// concrete-type access, are both delegated to this context.
+    pub context: C,
+    /// The hash callback invoked for the hash `SVC #0`. Its first argument is
+    /// the same context passed via `context`, letting a caller's closure use
+    /// inherent/concrete methods beyond the three bit-op trait methods while
+    /// computing a hash.
+    pub hash: F,
 }
 
-impl<W, E: Error> HasError for DefaultHandler<'_, W, E> {
-    type Error = E;
+impl<C: HasError, F> HasError for DefaultHandler<C, F> {
+    type Error = C::Error;
 }
 
-impl<W, E: Error> ContextWithValue<bool> for DefaultHandler<'_, W, E> {
-    type Wrapped = W;
+impl<C: ContextWithValue<bool>, F> ContextWithValue<bool> for DefaultHandler<C, F> {
+    type Wrapped = C::Wrapped;
 }
 
-impl<W, E: Error> ContextWithBitAnd<bool> for DefaultHandler<'_, W, E> {
-    fn bitand(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitAnd<bool>, F> ContextWithBitAnd<bool> for DefaultHandler<C, F> {
+    fn bitand(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitand(a, b)
     }
-    fn bitand_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitand_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitand_assign(a, b)
     }
 }
 
-impl<W, E: Error> ContextWithBitOr<bool> for DefaultHandler<'_, W, E> {
-    fn bitor(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitOr<bool>, F> ContextWithBitOr<bool> for DefaultHandler<C, F> {
+    fn bitor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitor(a, b)
     }
-    fn bitor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitor_assign(a, b)
     }
 }
 
-impl<W, E: Error> ContextWithBitXor<bool> for DefaultHandler<'_, W, E> {
-    fn bitxor(&mut self, a: W, b: W) -> Result<W, E> {
+impl<C: ContextWithBitXor<bool>, F> ContextWithBitXor<bool> for DefaultHandler<C, F> {
+    fn bitxor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
         self.context.bitxor(a, b)
     }
-    fn bitxor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+    fn bitxor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
         self.context.bitxor_assign(a, b)
     }
 }
 
-impl<W: Clone, E: Error> Handler<bool> for DefaultHandler<'_, W, E> {
+impl<C, F, W: Clone, E: Error> Handler<bool> for DefaultHandler<C, F>
+where
+    C: ContextWithArmv8mOps<bool, Wrapped = W, Error = E>,
+    F: FnMut(&mut C, &[[W; 32]]) -> Result<[u8; 32], E>,
+{
     fn ecall(
         &mut self,
-        regs: &mut [[W; 32]; 16],
-        reg_consts: &mut [Option<u32>; 16],
-        offsets: &mut [Option<i32>; 16],
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
         zero: &W,
         one: &W,
-    ) -> Result<EcallOutcome, ErtError<E>> {
+    ) -> Result<EcallOutcome, E> {
         match reg_consts[0] {
             Some(0) => {
-                let output = (self.hash)(&regs[1..9]).map_err(ErtError::Emitted)?;
+                let output = (self.hash)(&mut self.context, &regs[1..9])?;
                 for (index, bytes) in output.chunks_exact(4).enumerate() {
-                    let register = (index + 1) as u8;
+                    let register = index + 1;
                     let value = u32::from_le_bytes(array::from_fn(|byte| bytes[byte]));
-                    offsets[register as usize] = None;
-                    reg_consts[register as usize] = Some(value);
-                    regs[register as usize] = constant_word(zero, one, value);
+                    offsets[register] = None;
+                    reg_consts[register] = Some(value);
+                    regs[register] = constant_word(zero, one, value);
                 }
                 Ok(EcallOutcome::Continue)
             }
             Some(u32::MAX) => Ok(EcallOutcome::Exit),
-            _ => Err(ErtError::Unexpected),
+            _ => Ok(EcallOutcome::Unexpected),
         }
+    }
+}
+
+/// A concrete, host-only virtual security state — mirrors real Armv8-M
+/// TrustZone-M security states, but is a purely virtual/host-tracked concept
+/// with no real hardware backing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecurityState {
+    /// The guest's current virtual state is Non-secure.
+    NonSecure,
+    /// The guest's current virtual state is Secure.
+    Secure,
+}
+
+/// The virtual security attribution of an address — mirrors real SAU/IDAU
+/// region classification. `NonSecureCallable` behaves as `Secure` for
+/// fetch-permission purposes (only reachable from Non-secure state by
+/// landing exactly on `SG`); the distinction exists for a caller's own
+/// attribution policy to make (e.g. only NSC regions contain `SG` gateways).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecurityAttribute {
+    /// The address is Non-secure.
+    NonSecure,
+    /// The address is Secure and Non-secure-callable (an `SG` gateway may
+    /// live here).
+    NonSecureCallable,
+    /// The address is Secure and not Non-secure-callable.
+    Secure,
+}
+
+/// An Arm-specific [`Handler`] extension gating `SVC #0` and Secure/Non-secure
+/// state transitions on the interpreter's tracked virtual security state
+/// (see [`SecurityState`]) and a caller-supplied address attribution.
+pub trait ArmHandler<Val>: Handler<Val> {
+    /// Whether an `SVC #0` reached while the CPU is in `state` may proceed
+    /// to [`Handler::ecall`]. Called by the interpreter before dispatch;
+    /// returning `false` rejects the call as if it were unrecognized.
+    fn svc_permitted(&mut self, state: SecurityState) -> bool;
+
+    /// The virtual security attribution of `address` (see
+    /// [`SecurityAttribute`]). Called by the interpreter on every fetch
+    /// while the CPU is Non-secure, and by `SG`. A caller can pass a real
+    /// host attribution map through unchanged, narrow it to a stricter
+    /// policy, or supply an entirely synthetic map when there is no real
+    /// hardware backing (e.g. a desktop/user-mode test).
+    fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
+}
+
+/// Tunnels any [`Handler`] through as an [`ArmHandler`], adding both policy
+/// closures — like [`DefaultHandler`]'s `hash` receiving `context` — as
+/// closures that receive the wrapped `inner` handler directly.
+pub struct ArmDefaultHandler<H, G, A> {
+    /// The wrapped handler.
+    pub inner: H,
+    /// The `SVC #0` gate policy. Receives `inner` and the current
+    /// [`SecurityState`]; `|_inner, _state| true` permits every call.
+    pub svc_permitted: G,
+    /// The address attribution policy. Receives `inner` and the address
+    /// being classified.
+    pub security_attribute: A,
+}
+
+impl<H: HasError, G, A> HasError for ArmDefaultHandler<H, G, A> {
+    type Error = H::Error;
+}
+
+impl<H: ContextWithValue<bool>, G, A> ContextWithValue<bool> for ArmDefaultHandler<H, G, A> {
+    type Wrapped = H::Wrapped;
+}
+
+impl<H: ContextWithBitAnd<bool>, G, A> ContextWithBitAnd<bool> for ArmDefaultHandler<H, G, A> {
+    fn bitand(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitand_assign(a, b)
+    }
+}
+
+impl<H: ContextWithBitOr<bool>, G, A> ContextWithBitOr<bool> for ArmDefaultHandler<H, G, A> {
+    fn bitor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitor_assign(a, b)
+    }
+}
+
+impl<H: ContextWithBitXor<bool>, G, A> ContextWithBitXor<bool> for ArmDefaultHandler<H, G, A> {
+    fn bitxor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.inner.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.inner.bitxor_assign(a, b)
+    }
+}
+
+impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[H::Wrapped; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &H::Wrapped,
+        one: &H::Wrapped,
+    ) -> Result<EcallOutcome, H::Error> {
+        self.inner.ecall(regs, reg_consts, offsets, zero, one)
+    }
+}
+
+impl<H: Handler<bool>, G: FnMut(&mut H, SecurityState) -> bool, A: FnMut(&mut H, u32) -> SecurityAttribute>
+    ArmHandler<bool> for ArmDefaultHandler<H, G, A>
+{
+    fn svc_permitted(&mut self, state: SecurityState) -> bool {
+        (self.svc_permitted)(&mut self.inner, state)
+    }
+
+    fn security_attribute(&mut self, address: u32) -> SecurityAttribute {
+        (self.security_attribute)(&mut self.inner, address)
     }
 }
 
@@ -212,7 +322,7 @@ pub fn simple_add<W: Clone, E: Error>(
 /// eight-byte aligned. `pc` must be an odd Thumb function pointer.
 #[allow(clippy::too_many_arguments)]
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -251,7 +361,7 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 /// aligned.
 #[allow(clippy::too_many_arguments)]
 pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -503,6 +613,13 @@ enum Op {
     BranchRegister {
         register: u8,
     },
+    /// `SG`: the Secure Gateway instruction.
+    SecureGateway,
+    /// `BXNS`/`BLXNS`: branch (and, if `link`, link) exchange Non-secure.
+    BranchExchangeNonSecure {
+        register: u8,
+        link: bool,
+    },
     Svc(u8),
 }
 
@@ -512,7 +629,7 @@ struct Decoded {
 }
 
 struct Machine<'a, W, E> {
-    t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
+    t: &'a mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + 'a),
     mem: RawMemory<'a>,
     rstack: &'a mut [u32],
     vstack: &'a mut [W],
@@ -527,12 +644,13 @@ struct Machine<'a, W, E> {
     offsets: [Option<i32>; REG_COUNT],
     flags: [Option<bool>; 4],
     itstate: u8,
+    security_state: SecurityState,
 }
 
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
+        t: &'a mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
         vstack: &'a mut [W],
@@ -559,6 +677,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             offsets: [None; REG_COUNT],
             flags: [Some(false); 4],
             itstate: 0,
+            security_state: SecurityState::Secure,
         };
         machine.offsets[SP as usize] = Some(0);
         machine.constants[SP as usize] = None;
@@ -647,6 +766,12 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+        if self.security_state == SecurityState::NonSecure
+            && !matches!(operation, Op::SecureGateway)
+            && self.t.security_attribute(self.pc) != SecurityAttribute::NonSecure
+        {
+            return Err(ErtError::Unexpected);
+        }
         match operation {
             Op::Nop => self.next(len),
             Op::It { condition, mask } => {
@@ -718,18 +843,32 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             } => {
                 let (left_word, left_value) = self.operand(left)?;
                 let (right_word, right_value) = self.operand(right)?;
-                let value = match (left_value, right_value) {
-                    (Some(left), Some(right)) => Some(match kind {
-                        BitOp::And => left & right,
-                        BitOp::Or => left | right,
-                        BitOp::Xor => left ^ right,
-                    }),
+                let (word, value) = if let (Some(l), Some(r)) = (left_value, right_value) {
+                    let value = fold(kind, l, r);
+                    (self.word_from_constant(value), Some(value))
+                } else if let Some((constant, symbolic)) = match (left_value, right_value) {
+                    (Some(l), None) => Some((l, &right_word)),
+                    (None, Some(r)) => Some((r, &left_word)),
                     _ => None,
-                };
-                let word = if let Some(value) = value {
-                    self.word_from_constant(value)
+                } {
+                    if degenerate(kind, constant) {
+                        let value = degenerate_value(kind);
+                        (self.word_from_constant(value), Some(value))
+                    } else {
+                        (
+                            partial_bitwise_word(
+                                self.t, constant, symbolic, &self.zero, &self.one, kind,
+                            )
+                            .map_err(ErtError::Emitted)?,
+                            None,
+                        )
+                    }
                 } else {
-                    bitwise_word(self.t, &left_word, &right_word, kind).map_err(ErtError::Emitted)?
+                    (
+                        bitwise_word(self.t, &left_word, &right_word, kind)
+                            .map_err(ErtError::Emitted)?,
+                        None,
+                    )
                 };
                 self.write(dest, word, value);
                 if set_flags {
@@ -745,16 +884,44 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             } => {
                 let (left_word, left_value) = self.operand(left)?;
                 let (right_word, right_value) = self.operand(right)?;
-                let value = left_value
-                    .zip(right_value)
-                    .map(|(left, right)| left & !right);
-                let word = if let Some(value) = value {
-                    self.word_from_constant(value)
+                let (word, value) = if let (Some(l), Some(r)) = (left_value, right_value) {
+                    let value = l & !r;
+                    (self.word_from_constant(value), Some(value))
+                } else if let Some(right) = right_value {
+                    if right == u32::MAX {
+                        (self.word_from_constant(0), Some(0))
+                    } else {
+                        (
+                            partial_bitwise_word(
+                                self.t,
+                                !right,
+                                &left_word,
+                                &self.zero,
+                                &self.one,
+                                BitOp::And,
+                            )
+                            .map_err(ErtError::Emitted)?,
+                            None,
+                        )
+                    }
+                } else if let Some(left) = left_value {
+                    if left == 0 {
+                        (self.word_from_constant(0), Some(0))
+                    } else {
+                        (
+                            partial_and_not_word(self.t, left, &right_word, &self.zero, &self.one)
+                                .map_err(ErtError::Emitted)?,
+                            None,
+                        )
+                    }
                 } else {
                     let inverted = invert_word(self.t, &right_word, self.one.clone())
                         .map_err(ErtError::Emitted)?;
-                    bitwise_word(self.t, &left_word, &inverted, BitOp::And)
-                        .map_err(ErtError::Emitted)?
+                    (
+                        bitwise_word(self.t, &left_word, &inverted, BitOp::And)
+                            .map_err(ErtError::Emitted)?,
+                        None,
+                    )
                 };
                 self.write(dest, word, value);
                 if set_flags {
@@ -892,14 +1059,29 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 self.call(target & !1, len)
             }
             Op::BranchRegister { register } => self.branch_register(register),
-            Op::Svc(0) => match self
-                .t
-                .ecall(self.regs, self.constants, &mut self.offsets, &self.zero, &self.one)?
-            {
-                EcallOutcome::Continue => self.next(len),
-                EcallOutcome::Exit if self.sp == self.stack_top => Ok(Flow::Exit),
-                EcallOutcome::Exit => Err(ErtError::Unexpected),
-            },
+            Op::SecureGateway => self.secure_gateway(len),
+            Op::BranchExchangeNonSecure { register, link } => {
+                self.branch_exchange_non_secure(register, link, len)
+            }
+            Op::Svc(0) => {
+                if !self.t.svc_permitted(self.security_state) {
+                    return Err(ErtError::Unexpected);
+                }
+                match self.t.ecall(
+                    &mut self.regs[..],
+                    &mut self.constants[..],
+                    &mut self.offsets[..],
+                    &self.zero,
+                    &self.one,
+                ) {
+                    Ok(EcallOutcome::Continue) => self.next(len),
+                    Ok(EcallOutcome::Exit) if self.sp == self.stack_top => Ok(Flow::Exit),
+                    Ok(EcallOutcome::Exit) | Ok(EcallOutcome::Unexpected) => {
+                        Err(ErtError::Unexpected)
+                    }
+                    Err(e) => Err(ErtError::Emitted(e)),
+                }
+            }
             Op::Svc(_) => Err(ErtError::Unexpected),
         }
     }
@@ -1470,6 +1652,63 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         Ok(Flow::Next(self.rstack[self.rsp]))
     }
 
+    fn secure_gateway(&mut self, len: u32) -> Result<Flow, ErtError<E>> {
+        if self.t.security_attribute(self.pc) != SecurityAttribute::NonSecure
+            && self.security_state == SecurityState::NonSecure
+        {
+            self.security_state = SecurityState::Secure;
+            if let Some(lr) = self.constants[LR as usize] {
+                self.write_constant(LR, lr & !1);
+            }
+        }
+        self.next(len)
+    }
+
+    fn branch_exchange_non_secure(
+        &mut self,
+        register: u8,
+        link: bool,
+        len: u32,
+    ) -> Result<Flow, ErtError<E>> {
+        if self.security_state == SecurityState::NonSecure {
+            return Err(ErtError::Unexpected);
+        }
+        let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
+        if target & 1 == 0 {
+            self.security_state = SecurityState::NonSecure;
+        }
+        if link {
+            let return_pc = self.pc.wrapping_add(len);
+            *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
+            self.rsp += 1;
+            self.write_constant(LR, return_pc | 1);
+        }
+        Ok(Flow::Next(target & !1))
+    }
+}
+
+fn fold(operation: BitOp, a: u32, b: u32) -> u32 {
+    match operation {
+        BitOp::And => a & b,
+        BitOp::Or => a | b,
+        BitOp::Xor => a ^ b,
+    }
+}
+
+fn degenerate(operation: BitOp, constant: u32) -> bool {
+    match operation {
+        BitOp::And => constant == 0,
+        BitOp::Or => constant == u32::MAX,
+        BitOp::Xor => false,
+    }
+}
+
+fn degenerate_value(operation: BitOp) -> u32 {
+    match operation {
+        BitOp::And => 0,
+        BitOp::Or => u32::MAX,
+        BitOp::Xor => unreachable!("Xor is never degenerate"),
+    }
 }
 
 fn load_width(kind: LoadKind) -> usize {
@@ -2004,8 +2243,21 @@ fn decode16_special(instruction: u16) -> Result<Decoded, DecodeError> {
             source: Operand::Register(source),
             set_flags: false,
         },
-        3 if instruction & 0x0080 == 0 => Op::BranchRegister { register: source },
-        3 => Op::CallRegister { register: source },
+        3 => {
+            let non_secure = instruction & 0x0004 != 0;
+            match (instruction & 0x0080 == 0, non_secure) {
+                (true, false) => Op::BranchRegister { register: source },
+                (true, true) => Op::BranchExchangeNonSecure {
+                    register: source,
+                    link: false,
+                },
+                (false, false) => Op::CallRegister { register: source },
+                (false, true) => Op::BranchExchangeNonSecure {
+                    register: source,
+                    link: true,
+                },
+            }
+        }
         _ => unreachable!(),
     };
     Ok(Decoded { operation, len: 2 })
@@ -2110,6 +2362,12 @@ fn decode32(pc: u32, first: u16, second: u16) -> Result<Decoded, DecodeError> {
     let dest = ((second >> 8) & 15) as u8;
     let data_register = ((second >> 12) & 15) as u8;
     let source = (second & 15) as u8;
+
+    // SG: the Secure Gateway instruction, a fixed 32-bit encoding with both
+    // halfwords identical.
+    if first == 0xe97f && second == 0xe97f {
+        return decoded(Op::SecureGateway);
+    }
 
     // Load/store multiple and the wide PUSH/POP forms used by compiler
     // prologues. The shared stack handlers retain their usual static model.

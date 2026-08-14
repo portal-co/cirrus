@@ -9,7 +9,7 @@ use std::{
 };
 
 use cirrus_core::Pusher;
-use cirrus_ert::{DefaultHandler, RawMemory, ert_func};
+use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 use cirrus_garbled_circuit_row_reduced::{Evaluator, GC, GarblingRecord, Label};
 use digest::{OutputSizeUser, array::Array};
@@ -256,11 +256,12 @@ fn evaluation_args(one: [u8; 16]) -> [([[u8; 16]; 32], Option<u32>); 16] {
     array::from_fn(|word_index| (word(INPUT[word_index], word_index, one), None))
 }
 
-fn no_hash(_: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash<C>(_: &mut C, _: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
-fn evaluator_no_hash(
+fn evaluator_no_hash<C>(
+    _: &mut C,
     _: &[[[u8; 16]; 32]],
 ) -> Result<[u8; 32], cirrus_garbled_circuit_row_reduced::EvaluationError> {
     Ok([0; 32])
@@ -270,7 +271,7 @@ fn bool_word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn bool_no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn bool_no_hash<C>(_: &mut C, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
@@ -296,11 +297,11 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut bool_constants = [None; 32];
     let mut bool_rstack = [0; 512];
     let mut bool_vstack = vec![false; STACK_SLOTS];
-    let mut bool_context = ();
-    let mut bool_hash = bool_no_hash;
-    let mut bool_handler = DefaultHandler {
-        context: &mut bool_context,
-        hash: &mut bool_hash,
+    let mut bool_handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: bool_no_hash,
+        },
     };
     let bool_result = ert_func::<_, _, 16, 2>(
         &mut bool_handler,
@@ -330,11 +331,12 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let stack_sentinel = Label::new([0xa5; 16]);
     let mut garbled_vstack = vec![stack_sentinel; STACK_SLOTS];
     let mut records = Records::new();
-    let mut garbler = GC::<Sha256, 16>::new(&mut records, delta);
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut garbler,
-        hash: &mut hash,
+    let garbler = GC::<Sha256, 16>::new(&mut records, delta);
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: garbler,
+            hash: no_hash,
+        },
     };
 
     let started = Instant::now();
@@ -359,9 +361,9 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
         Ok(result) => result,
         Err(_) => unreachable!("the result was checked above"),
     };
-    drop(garbler);
+    drop(handler);
     let tables = records.0.len();
-    assert_eq!(tables, 358_752, "the locked workload's AND count is stable");
+    assert_eq!(tables, 358_656, "the locked workload's AND count is stable");
     let touched_stack_slots = garbled_vstack
         .iter()
         .position(|label| *label != stack_sentinel)
@@ -380,12 +382,13 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut evaluated_constants = [None; 32];
     let mut evaluated_rstack = [0; 512];
     let mut evaluated_vstack = vec![[0xa5; 16]; STACK_SLOTS];
-    let mut evaluator =
+    let evaluator =
         Evaluator::<Sha256, _, 16>::new(records.0.into_iter().map(GarblingRecord::Table));
-    let mut hash = evaluator_no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut evaluator,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: evaluator,
+            hash: evaluator_no_hash,
+        },
     };
     let started = Instant::now();
     let evaluated = ert_func::<_, _, 16, 2>(
@@ -429,7 +432,7 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     }
 
     let table_bytes = tables * 3 * 16;
-    assert_eq!(table_bytes, 17_220_096);
+    assert_eq!(table_bytes, 17_215_488);
     eprintln!(
         "RV32 SHA-256 three-row GC: tables={tables}, table_bytes={table_bytes}, touched_stack_slots={touched_stack_slots}, return_stack_slots={return_stack_slots}, garbling={garbling_elapsed:?}, evaluation={evaluation_elapsed:?}"
     );

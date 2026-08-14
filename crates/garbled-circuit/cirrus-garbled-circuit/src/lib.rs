@@ -384,11 +384,17 @@ mod tests {
         vec::Vec,
     };
 
-    use cirrus_armv8m_ert::{DefaultHandler as ArmDefaultHandler, ert_func as arm_ert_func};
+    use cirrus_armv8m_ert::{
+        ArmDefaultHandler, DefaultHandler as ArmHashHandler, SecurityAttribute, SecurityState,
+        ert_func as arm_ert_func,
+    };
     use cirrus_core::{
         ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError, Pusher,
     };
-    use cirrus_ert::{DefaultHandler, RawMemory, ert_emit, ert_func as riscv_ert_func};
+    use cirrus_ert::{
+        DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit,
+        ert_func as riscv_ert_func,
+    };
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
@@ -566,12 +572,23 @@ mod tests {
             .collect()
     }
 
-    fn no_hash<const N: usize>(_: &[[Label<N>; 32]]) -> Result<[u8; 32], Infallible> {
+    fn no_hash<const N: usize, C>(_: &mut C, _: &[[Label<N>; 32]]) -> Result<[u8; 32], Infallible> {
         Ok([0; 32])
     }
 
-    fn evaluator_no_hash<const N: usize>(_: &[[[u8; N]; 32]]) -> Result<[u8; 32], EvaluationError> {
+    fn evaluator_no_hash<const N: usize, C>(
+        _: &mut C,
+        _: &[[[u8; N]; 32]],
+    ) -> Result<[u8; 32], EvaluationError> {
         Ok([0; 32])
+    }
+
+    fn permit_all<H>(_: &mut H, _: SecurityState) -> bool {
+        true
+    }
+
+    fn always_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+        SecurityAttribute::Secure
     }
 
     fn encoded_label(zero_label: [u8; 16], value: bool) -> [u8; 16] {
@@ -718,11 +735,12 @@ mod tests {
         let mut garbled_rstack = [0; 8];
         let mut garbled_vstack = [garbling_zero; 64];
         let mut tables = RecordedTables::default();
-        let mut gc = context(&mut tables);
-        let mut hash = no_hash;
-        let mut handler = DefaultHandler {
-            context: &mut gc,
-            hash: &mut hash,
+        let gc = context(&mut tables);
+        let mut handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: gc,
+                hash: no_hash,
+            },
         };
 
         let garbled = ert_emit(
@@ -740,7 +758,7 @@ mod tests {
             garbled.is_ok(),
             "garbling the supported add program succeeds"
         );
-        drop(gc);
+        drop(handler);
 
         let garbled_result = garbled_registers[Reg::T0.0 as usize];
         let mut evaluator = Evaluator::new(tables.tables.into_iter().map(GarblingRecord::Table));
@@ -752,10 +770,11 @@ mod tests {
         evaluated_constants[Reg::A0.0 as usize] = Some(u32::MAX);
         let mut evaluated_rstack = [0; 8];
         let mut evaluated_vstack = [zero; 64];
-        let mut evaluator_hash = evaluator_no_hash;
-        let mut evaluator_handler = DefaultHandler {
-            context: &mut evaluator,
-            hash: &mut evaluator_hash,
+        let mut evaluator_handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: evaluator,
+                hash: evaluator_no_hash,
+            },
         };
 
         let evaluated = ert_emit(
@@ -783,7 +802,7 @@ mod tests {
             );
         }
         assert_eq!(
-            evaluator.bitand(zero, zero),
+            evaluator_handler.inner.context.bitand(zero, zero),
             Err(EvaluationError::Exhausted)
         );
     }
@@ -854,11 +873,12 @@ mod tests {
         let mut rstack = [0; 8];
         let mut vstack = [garbling_zero; 64];
         let mut tables = RecordedTables::default();
-        let mut gc = MeasuredGc::new(context(&mut tables));
-        let mut hash = no_hash;
-        let mut handler = DefaultHandler {
-            context: &mut gc,
-            hash: &mut hash,
+        let gc = MeasuredGc::new(context(&mut tables));
+        let mut handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: gc,
+                hash: no_hash,
+            },
         };
 
         let result = ert_emit(
@@ -873,8 +893,8 @@ mod tests {
             garbling_one,
         );
 
-        let counts = gc.counts;
-        drop(gc);
+        let counts = handler.inner.context.counts;
+        drop(handler);
 
         assert!(result.is_ok());
         assert_eq!(constants[Reg::T0.0 as usize], None);
@@ -913,11 +933,12 @@ mod tests {
         let mut rstack = [0; 8];
         let mut vstack = [garbling_zero; 64];
         let mut sink = CountingPusher::default();
-        let mut gc = MeasuredGc::new(measuring_context(&mut sink));
-        let mut hash = no_hash::<16>;
-        let mut handler = DefaultHandler {
-            context: &mut gc,
-            hash: &mut hash,
+        let gc = MeasuredGc::new(measuring_context(&mut sink));
+        let mut handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: gc,
+                hash: no_hash::<16, _>,
+            },
         };
 
         let result = ert_emit(
@@ -931,8 +952,8 @@ mod tests {
             garbling_zero,
             garbling_one,
         );
-        let counts = gc.counts;
-        drop(gc);
+        let counts = handler.inner.context.counts;
+        drop(handler);
 
         assert!(result.is_ok());
         assert_eq!(sink.tables, counts.and_tables());
@@ -1219,11 +1240,12 @@ mod tests {
         let mut rstack = [u32::MAX; 256];
         let mut vstack = std::vec![sentinel; STACK_SLOTS];
         let mut sink = CountingPusher::default();
-        let mut gc = MeasuredGc::new(measuring_context(&mut sink));
-        let mut hash = no_hash::<N>;
-        let mut handler = DefaultHandler {
-            context: &mut gc,
-            hash: &mut hash,
+        let gc = MeasuredGc::new(measuring_context(&mut sink));
+        let mut handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: gc,
+                hash: no_hash::<N, _>,
+            },
         };
 
         let outcome = riscv_ert_func::<_, _, 16, 2>(
@@ -1238,8 +1260,8 @@ mod tests {
             one,
             symbolic_args(),
         );
-        let counts = gc.counts;
-        drop(gc);
+        let counts = handler.inner.context.counts;
+        drop(handler);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(_) => panic!("the locked RV32 SHA-256 workload must stay in the ERT subset"),
@@ -1271,11 +1293,14 @@ mod tests {
         let mut rstack = [u32::MAX; 512];
         let mut vstack = std::vec![sentinel; STACK_SLOTS];
         let mut sink = CountingPusher::default();
-        let mut gc = MeasuredGc::new(measuring_context(&mut sink));
-        let mut hash = no_hash::<N>;
+        let gc = MeasuredGc::new(measuring_context(&mut sink));
         let mut handler = ArmDefaultHandler {
-            context: &mut gc,
-            hash: &mut hash,
+            inner: ArmHashHandler {
+                context: gc,
+                hash: no_hash::<N, _>,
+            },
+            svc_permitted: permit_all,
+            security_attribute: always_secure,
         };
 
         let outcome = arm_ert_func::<_, _, 16, 2>(
@@ -1290,8 +1315,8 @@ mod tests {
             one,
             symbolic_args(),
         );
-        let counts = gc.counts;
-        drop(gc);
+        let counts = handler.inner.context.counts;
+        drop(handler);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(_) => panic!("the locked Arm SHA-256 workload must stay in the ERT subset"),

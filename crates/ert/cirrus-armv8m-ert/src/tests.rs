@@ -2,7 +2,14 @@ extern crate std;
 
 use core::{array, convert::Infallible};
 
-use crate::{DefaultHandler, ErtError, RawMemory, ert_emit, simple_add};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError,
+};
+
+use crate::{
+    ArmDefaultHandler, DefaultHandler, ErtError, RawMemory, SecurityAttribute, SecurityState,
+    ert_emit, simple_add,
+};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
@@ -18,8 +25,66 @@ fn image(words: &[u16]) -> std::vec::Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash<C>(_: &mut C, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
+}
+
+fn permit_all<H>(_: &mut H, _: SecurityState) -> bool {
+    true
+}
+
+fn always_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+    SecurityAttribute::Secure
+}
+
+fn all_non_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+    SecurityAttribute::NonSecure
+}
+
+fn secure_only<H>(_: &mut H, state: SecurityState) -> bool {
+    state == SecurityState::Secure
+}
+
+#[allow(clippy::type_complexity)]
+fn run_with<G, A>(
+    code: &[u16],
+    regs: &mut [[bool; 32]; 16],
+    constants: &mut [Option<u32>; 16],
+    svc_permitted: G,
+    security_attribute: A,
+) -> Result<(), ErtError<Infallible>>
+where
+    G: FnMut(
+        &mut DefaultHandler<(), fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>>,
+        SecurityState,
+    ) -> bool,
+    A: FnMut(
+        &mut DefaultHandler<(), fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>>,
+        u32,
+    ) -> SecurityAttribute,
+{
+    let image = image(code);
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash as fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>,
+        },
+        svc_permitted,
+        security_attribute,
+    };
+    let mut rstack = [0; 16];
+    let mut vstack = [false; 128];
+    ert_emit(
+        &mut handler,
+        RawMemory::from(&image[..]),
+        &mut rstack,
+        &mut vstack,
+        1,
+        regs,
+        constants,
+        false,
+        true,
+    )
 }
 
 fn run(
@@ -28,11 +93,13 @@ fn run(
     constants: &mut [Option<u32>; 16],
 ) -> Result<(), ErtError<Infallible>> {
     let image = image(code);
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
@@ -52,6 +119,227 @@ fn run(
 fn exit(regs: &mut [[bool; 32]; 16], constants: &mut [Option<u32>; 16]) {
     regs[0] = word(u32::MAX);
     constants[0] = Some(u32::MAX);
+}
+
+#[derive(Default)]
+struct CountingContext {
+    bitand: usize,
+    bitor: usize,
+    bitxor: usize,
+}
+
+impl HasError for CountingContext {
+    type Error = Infallible;
+}
+
+impl ContextWithValue<bool> for CountingContext {
+    type Wrapped = bool;
+}
+
+impl ContextWithBitAnd<bool> for CountingContext {
+    fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitand += 1;
+        Ok(left & right)
+    }
+
+    fn bitand_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitand += 1;
+        *left &= right;
+        Ok(())
+    }
+}
+
+impl ContextWithBitOr<bool> for CountingContext {
+    fn bitor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitor += 1;
+        Ok(left | right)
+    }
+
+    fn bitor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitor += 1;
+        *left |= right;
+        Ok(())
+    }
+}
+
+impl ContextWithBitXor<bool> for CountingContext {
+    fn bitxor(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
+        self.bitxor += 1;
+        Ok(left ^ right)
+    }
+
+    fn bitxor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Self::Error> {
+        self.bitxor += 1;
+        *left ^= right;
+        Ok(())
+    }
+}
+
+fn run_counting(
+    code: &[u16],
+    regs: &mut [[bool; 32]; 16],
+    constants: &mut [Option<u32>; 16],
+) -> CountingContext {
+    let image = image(code);
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: CountingContext::default(),
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
+    };
+    let mut rstack = [0; 16];
+    let mut vstack = [false; 128];
+    assert!(
+        ert_emit(
+            &mut handler,
+            RawMemory::from(&image[..]),
+            &mut rstack,
+            &mut vstack,
+            1,
+            regs,
+            constants,
+            false,
+            true,
+        )
+        .is_ok()
+    );
+    handler.inner.context
+}
+
+#[test]
+fn a_constant_and_or_operand_avoids_bitwise_gates() {
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    let symbolic = 0b1010_1100_1111_0000_0000_1111_0011_0101u32;
+    regs[1] = word(symbolic);
+    regs[2] = word(0x0f0f_0f0f);
+    constants[2] = Some(0x0f0f_0f0f);
+    regs[3] = word(symbolic);
+    regs[4] = word(0x0f0f_0f0f);
+    constants[4] = Some(0x0f0f_0f0f);
+    exit(&mut regs, &mut constants);
+
+    // ands r1, r2; orrs r3, r4; svc 0
+    let counts = run_counting(&[0x4011, 0x4323, 0xdf00], &mut regs, &mut constants);
+
+    assert_eq!(counts.bitand, 0);
+    assert_eq!(counts.bitor, 0);
+    assert_eq!(value(&regs[1]), symbolic & 0x0f0f_0f0f);
+    assert_eq!(constants[1], None);
+    assert_eq!(value(&regs[3]), symbolic | 0x0f0f_0f0f);
+    assert_eq!(constants[3], None);
+}
+
+#[test]
+fn a_degenerate_and_or_mask_folds_to_a_full_constant() {
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    regs[1] = word(0x1234_5678);
+    regs[2] = word(0);
+    constants[2] = Some(0);
+    regs[3] = word(0x1234_5678);
+    regs[4] = word(u32::MAX);
+    constants[4] = Some(u32::MAX);
+    exit(&mut regs, &mut constants);
+
+    // ands r1, r2; orrs r3, r4; svc 0
+    let counts = run_counting(&[0x4011, 0x4323, 0xdf00], &mut regs, &mut constants);
+
+    assert_eq!(counts.bitand, 0);
+    assert_eq!(counts.bitor, 0);
+    assert_eq!(value(&regs[1]), 0);
+    assert_eq!(constants[1], Some(0));
+    assert_eq!(value(&regs[3]), u32::MAX);
+    assert_eq!(constants[3], Some(u32::MAX));
+}
+
+#[test]
+fn bic_with_a_concrete_left_operand_avoids_bitand_gates() {
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    let symbolic = 0b1010_1100_1111_0000_0000_1111_0011_0101u32;
+    regs[1] = word(0x0f0f_0f0f);
+    constants[1] = Some(0x0f0f_0f0f);
+    regs[2] = word(symbolic);
+    exit(&mut regs, &mut constants);
+
+    // bics r1, r2; svc 0
+    let counts = run_counting(&[0x4391, 0xdf00], &mut regs, &mut constants);
+
+    assert_eq!(counts.bitand, 0);
+    assert_eq!(counts.bitxor, 0x0f0f_0f0fu32.count_ones() as usize);
+    assert_eq!(value(&regs[1]), 0x0f0f_0f0f & !symbolic);
+    assert_eq!(constants[1], None);
+}
+
+#[test]
+fn bxns_transitions_to_non_secure_and_execution_continues() {
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    // movs r0, #4; bxns r0; movs r1, #9; movs r0, #0; subs r0, #1; svc 0.
+    // Every address is treated as Non-secure, so the fetch gate never fires
+    // after the Secure -> Non-secure transition.
+    let code = [0x2004, 0x4704, 0x2109, 0x2000, 0x3801, 0xdf00];
+
+    assert!(run_with(&code, &mut regs, &mut constants, permit_all, all_non_secure).is_ok());
+
+    assert_eq!(constants[1], Some(9));
+}
+
+#[test]
+fn fetching_secure_attributed_memory_while_non_secure_faults() {
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    // movs r0, #4; bxns r0; movs r1, #9; movs r0, #0; subs r0, #1; svc 0.
+    // Every address is treated as Secure, so the instruction right after the
+    // Secure -> Non-secure transition (address 4, not `SG`) is rejected.
+    let code = [0x2004, 0x4704, 0x2109, 0x2000, 0x3801, 0xdf00];
+
+    assert!(matches!(
+        run_with(&code, &mut regs, &mut constants, permit_all, always_secure),
+        Err(ErtError::Unexpected)
+    ));
+}
+
+#[test]
+fn secure_gateway_re_enters_secure_state_and_permits_a_gated_svc() {
+    fn non_secure_callable_at_four<H>(_: &mut H, address: u32) -> SecurityAttribute {
+        if address == 4 {
+            SecurityAttribute::NonSecureCallable
+        } else {
+            SecurityAttribute::Secure
+        }
+    }
+
+    // Without a gateway: movs r0, #4; bxns r0; movs r0, #0; subs r0, #1;
+    // svc 0. `svc_permitted` only allows the call while Secure, and no `SG`
+    // is executed, so the CPU is still Non-secure when it is reached.
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    let no_gateway = [0x2004, 0x4704, 0x2000, 0x3801, 0xdf00];
+    assert!(matches!(
+        run_with(&no_gateway, &mut regs, &mut constants, secure_only, all_non_secure),
+        Err(ErtError::Unexpected)
+    ));
+
+    // With a gateway: movs r0, #4; bxns r0; sg; movs r0, #0; subs r0, #1;
+    // svc 0. `SG` sits at address 4, attributed Non-secure-callable, so it
+    // re-enters Secure state before the gated `svc` is reached.
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    let with_gateway = [0x2004, 0x4704, 0xe97f, 0xe97f, 0x2000, 0x3801, 0xdf00];
+    assert!(
+        run_with(
+            &with_gateway,
+            &mut regs,
+            &mut constants,
+            secure_only,
+            non_secure_callable_at_four,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -137,11 +425,13 @@ fn non_thumb_entry_and_invalid_encoding_are_rejected() {
     let mut regs = [[false; 32]; 16];
     let mut constants = [None; 16];
     let bytes = [0u8; 2];
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let mut rstack = [0; 2];
     let mut vstack = [false; 128];
@@ -173,11 +463,13 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let memory = RawMemory::from(&code[..]).with_ert_detect(0x40, 0xdead_beef);
     let mut regs = [[false; 32]; 16];
     let mut constants = [None; 16];
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = ArmDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
+        svc_permitted: permit_all,
+        security_attribute: always_secure,
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];

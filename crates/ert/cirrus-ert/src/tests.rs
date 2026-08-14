@@ -8,7 +8,7 @@ use cirrus_core::{
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{DefaultHandler, ErtError, RawMemory, ert_emit, ert_func, simple_add};
+use crate::{DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_emit, ert_func, simple_add};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1u32 << bit) != 0)
@@ -38,11 +38,11 @@ fn run(
     rstack: &mut [u32],
     vstack: &mut [bool],
 ) -> Result<(), ErtError<Infallible>> {
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
     };
     ert_emit(
         &mut handler,
@@ -57,7 +57,7 @@ fn run(
     )
 }
 
-fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash<C>(_: &mut C, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
@@ -180,14 +180,14 @@ fn run_counting(
     regs: &mut [[bool; 32]; 32],
     constants: &mut [Option<u32>; 32],
 ) -> CountingContext {
-    let mut context = CountingContext::default();
-    let mut hash = no_hash;
     let mem = program(instructions);
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: CountingContext::default(),
+            hash: no_hash,
+        },
     };
     assert_success(ert_emit(
         &mut handler,
@@ -200,7 +200,7 @@ fn run_counting(
         false,
         true,
     ));
-    context
+    handler.inner.context
 }
 
 fn exit_register(regs: &mut [[bool; 32]; 32], constants: &mut [Option<u32>; 32]) {
@@ -398,6 +398,71 @@ fn concrete_shift_amounts_avoid_barrel_selector_gates() {
     assert_eq!(constant.bitor, 0);
     assert_eq!(value(&constant_regs[Reg::T0.0 as usize]), 0x0246_8ace);
     assert_eq!(constant_metadata[Reg::T0.0 as usize], Some(0x0246_8ace));
+}
+
+#[test]
+fn a_constant_and_or_operand_avoids_bitwise_gates() {
+    let instructions = [
+        Inst::And {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Or {
+            dest: Reg::T3,
+            src1: Reg::T2,
+            src2: Reg::T1,
+        },
+        Inst::Ecall,
+    ];
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    let t1 = 0b1010_1100_1111_0000_0000_1111_0011_0101u32;
+    regs[Reg::T1.0 as usize] = word(t1);
+    regs[Reg::T2.0 as usize] = word(0x0f0f_0f0f);
+    constants[Reg::T2.0 as usize] = Some(0x0f0f_0f0f);
+    exit_register(&mut regs, &mut constants);
+    let counts = run_counting(instructions, &mut regs, &mut constants);
+
+    assert_eq!(counts.bitand, 0);
+    assert_eq!(counts.bitor, 0);
+    assert_eq!(value(&regs[Reg::T0.0 as usize]), t1 & 0x0f0f_0f0f);
+    assert_eq!(constants[Reg::T0.0 as usize], None);
+    assert_eq!(value(&regs[Reg::T3.0 as usize]), t1 | 0x0f0f_0f0f);
+    assert_eq!(constants[Reg::T3.0 as usize], None);
+}
+
+#[test]
+fn a_degenerate_and_or_mask_folds_to_a_full_constant() {
+    let instructions = [
+        Inst::And {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Or {
+            dest: Reg::T3,
+            src1: Reg::T1,
+            src2: Reg::T4,
+        },
+        Inst::Ecall,
+    ];
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T1.0 as usize] = word(0x1234_5678);
+    regs[Reg::T2.0 as usize] = word(0);
+    constants[Reg::T2.0 as usize] = Some(0);
+    regs[Reg::T4.0 as usize] = word(u32::MAX);
+    constants[Reg::T4.0 as usize] = Some(u32::MAX);
+    exit_register(&mut regs, &mut constants);
+    let counts = run_counting(instructions, &mut regs, &mut constants);
+
+    assert_eq!(counts.bitand, 0);
+    assert_eq!(counts.bitor, 0);
+    assert_eq!(value(&regs[Reg::T0.0 as usize]), 0);
+    assert_eq!(constants[Reg::T0.0 as usize], Some(0));
+    assert_eq!(value(&regs[Reg::T3.0 as usize]), u32::MAX);
+    assert_eq!(constants[Reg::T3.0 as usize], Some(u32::MAX));
 }
 
 fn signed_high(left: u32, right: u32) -> u32 {
@@ -984,14 +1049,12 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
     let mut observed = [[false; 32]; 8];
-    let mut context = ();
-    let mut hash = |words: &[[bool; 32]]| {
+    let hash = |_: &mut (), words: &[[bool; 32]]| {
         observed.copy_from_slice(words);
         Ok::<_, Infallible>(array::from_fn(|byte| byte as u8))
     };
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler { context: (), hash },
     };
 
     assert_success(ert_emit(
@@ -1039,11 +1102,11 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let mut constants = [None; 32];
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
     };
 
     assert_success(ert_emit(
@@ -1072,11 +1135,11 @@ fn ert_func_moves_register_and_stack_abi_values() {
         let constant = if i == 0 { u32::MAX } else { i as u32 };
         (word(constant), Some(constant))
     });
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
     };
 
     let results = match ert_func::<_, _, 10, 10>(
@@ -1114,11 +1177,11 @@ fn ert_func_rejects_a_symbolic_stack_too_small_for_abi_words() {
         let constant = if i == 0 { u32::MAX } else { i as u32 };
         (word(constant), Some(constant))
     });
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
     };
 
     assert!(matches!(

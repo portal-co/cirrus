@@ -3,7 +3,7 @@
 
 use core::{array, convert::Infallible, panic::PanicInfo, ptr};
 
-use cirrus_ert::{DefaultHandler, RawMemory, ert_func};
+use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 core::arch::global_asm!(
@@ -52,11 +52,11 @@ extern "C" fn rust_main() -> ! {
         INPUT[0], INPUT[1], INPUT[2], INPUT[3], INPUT[4], INPUT[5], INPUT[6], INPUT[7], INPUT[8],
         INPUT[9], INPUT[10], INPUT[11], INPUT[12], INPUT[13], INPUT[14], INPUT[15],
     );
-    let mut context = ();
-    let mut hash = no_hash;
-    let mut handler = DefaultHandler {
-        context: &mut context,
-        hash: &mut hash,
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: (),
+            hash: no_hash,
+        },
     };
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
@@ -100,7 +100,7 @@ fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 

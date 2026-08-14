@@ -374,7 +374,7 @@ mod tests {
     use std::vec::Vec;
 
     use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, Pusher};
-    use cirrus_ert::{DefaultHandler, RawMemory, ert_emit};
+    use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_emit};
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
@@ -400,11 +400,11 @@ mod tests {
             .collect()
     }
 
-    fn garbler_hash(_: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
+    fn garbler_hash<C>(_: &mut C, _: &[[Label<16>; 32]]) -> Result<[u8; 32], Infallible> {
         Ok([0; 32])
     }
 
-    fn evaluator_hash(_: &[[[u8; 16]; 32]]) -> Result<[u8; 32], EvaluationError> {
+    fn evaluator_hash<C>(_: &mut C, _: &[[[u8; 16]; 32]]) -> Result<[u8; 32], EvaluationError> {
         Ok([0; 32])
     }
 
@@ -496,11 +496,12 @@ mod tests {
         let mut garbled_rstack = [0; 8];
         let mut garbled_vstack = [garbling_zero; 64];
         let mut records = Records::default();
-        let mut garbler = GC::<Sha256, 16>::new(&mut records, delta);
-        let mut hash = garbler_hash;
-        let mut handler = DefaultHandler {
-            context: &mut garbler,
-            hash: &mut hash,
+        let garbler = GC::<Sha256, 16>::new(&mut records, delta);
+        let mut handler = RvDefaultHandler {
+            inner: DefaultHandler {
+                context: garbler,
+                hash: garbler_hash,
+            },
         };
 
         let garbled = ert_emit(
@@ -518,7 +519,7 @@ mod tests {
             garbled.is_ok(),
             "garbling the supported add program succeeds"
         );
-        drop(garbler);
+        drop(handler);
 
         let garbled_result = garbled_registers[Reg::T0.0 as usize];
         let mut evaluator =
@@ -531,10 +532,11 @@ mod tests {
         evaluated_constants[Reg::A0.0 as usize] = Some(u32::MAX);
         let mut evaluated_rstack = [0; 8];
         let mut evaluated_vstack = [zero; 64];
-        let mut hash = evaluator_hash;
-        let mut handler = DefaultHandler {
-            context: &mut evaluator,
-            hash: &mut hash,
+        let mut handler = RvDefaultHandler {
+            inner: DefaultHandler {
+                context: evaluator,
+                hash: evaluator_hash,
+            },
         };
 
         let evaluated = ert_emit(
@@ -559,7 +561,7 @@ mod tests {
             );
         }
         assert_eq!(
-            evaluator.bitand(zero, zero),
+            handler.inner.context.bitand(zero, zero),
             Err(EvaluationError::Exhausted)
         );
     }

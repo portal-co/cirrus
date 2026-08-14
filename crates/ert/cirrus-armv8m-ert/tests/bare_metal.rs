@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cirrus_armv8m_ert::{DefaultHandler, ErtError, RawMemory, ert_func};
+use cirrus_armv8m_ert::{
+    ArmDefaultHandler, DefaultHandler, ErtError, RawMemory, SecurityAttribute, SecurityState,
+    ert_func,
+};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 const TARGET: &str = "thumbv8m.main-none-eabi";
@@ -99,9 +102,13 @@ fn run_host_image(image: &PathBuf) {
     let mut vstack = [false; 131_072];
     let args = input.map(|value| (array::from_fn(|bit| value & (1 << bit) != 0), None));
     let result = ert_func::<_, _, 16, 2>(
-        &mut DefaultHandler {
-            context: &mut (),
-            hash: &mut |_| Ok::<_, Infallible>([0; 32]),
+        &mut ArmDefaultHandler {
+            inner: DefaultHandler {
+                context: (),
+                hash: no_hash,
+            },
+            svc_permitted: permit_all,
+            security_attribute: always_secure,
         },
         memory,
         &mut rstack,
@@ -135,6 +142,18 @@ fn run_host_image(image: &PathBuf) {
         Err(ErtError::Unexpected) => panic!("host image violated the interpreter subset"),
         Err(ErtError::Emitted(error)) => match error {},
     }
+}
+
+fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+    Ok([0; 32])
+}
+
+fn permit_all<H>(_: &mut H, _: SecurityState) -> bool {
+    true
+}
+
+fn always_secure<H>(_: &mut H, _: u32) -> SecurityAttribute {
+    SecurityAttribute::Secure
 }
 
 fn ensure_target() {

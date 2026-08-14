@@ -26,6 +26,44 @@ impl<Val, T: ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<
 {
 }
 
+/// A handler for a facade's environment-call instruction (RV32 `ECALL`,
+/// Armv8-M `SVC #0`), and any others a caller adds.
+///
+/// `regs`/`reg_consts`/`offsets` are slices over the full register file at
+/// the call — sliced rather than fixed-size-array-typed so this one trait
+/// shape serves both RV32's 32 registers and Armv8-M's 16 registers. An
+/// implementation is expected to index only known ABI-fixed positions (e.g.
+/// "register 0" and "the eight registers following it"); nothing about a
+/// well-behaved `ecall` implementation needs the total register count.
+/// `zero`/`one` are the caller's symbolic Boolean constants. Returning `Err`
+/// aborts execution with a caller-emitted error; return
+/// [`EcallOutcome::Unexpected`] instead to reject just this particular call
+/// (e.g. an unrecognized register-zero value) without fabricating one.
+///
+/// The caller-balanced-stack requirement for a successful exit is enforced
+/// by each facade's own interpreter, not by the handler.
+pub trait Handler<Val>: ContextWithErtOps<Val> {
+    /// Handle an environment call.
+    fn ecall(
+        &mut self,
+        regs: &mut [[Self::Wrapped; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &Self::Wrapped,
+        one: &Self::Wrapped,
+    ) -> Result<EcallOutcome, Self::Error>;
+}
+
+/// The effect of a handled environment call on control flow.
+pub enum EcallOutcome {
+    /// Continue execution at the next instruction.
+    Continue,
+    /// Exit the program, once the interpreter confirms the stack is balanced.
+    Exit,
+    /// This specific call (e.g. an unrecognized register-zero value) is invalid.
+    Unexpected,
+}
+
 /// A read-only byte mapping whose base is guest address zero.
 ///
 /// A bounded mapping is normally made with [`RawMemory::from_slice`]. The
@@ -221,6 +259,51 @@ pub fn bitwise_word<W: Clone, E>(
         BitOp::And => t.bitand(left[bit].clone(), right[bit].clone()),
         BitOp::Or => t.bitor(left[bit].clone(), right[bit].clone()),
         BitOp::Xor => t.bitxor(left[bit].clone(), right[bit].clone()),
+    })
+}
+
+/// AND/OR/XOR a host-known `constant` against a symbolic word, hardcoding
+/// every bit the constant alone determines with zero `t.bitand`/`t.bitor`
+/// calls for AND/OR. XOR is accepted for call-site uniformity only — it
+/// still calls `t.bitxor` once per set bit, identical in cost to
+/// `bitwise_word`, since XOR has no constant-side shortcut to exploit.
+pub fn partial_bitwise_word<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    constant: u32,
+    symbolic: &[W; 32],
+    zero: &W,
+    one: &W,
+    operation: BitOp,
+) -> Result<[W; 32], E> {
+    try_array(|bit| {
+        let set = (constant >> bit) & 1 != 0;
+        Ok(match operation {
+            BitOp::And if set => symbolic[bit].clone(),
+            BitOp::And => zero.clone(),
+            BitOp::Or if set => one.clone(),
+            BitOp::Or => symbolic[bit].clone(),
+            BitOp::Xor if set => t.bitxor(symbolic[bit].clone(), one.clone())?,
+            BitOp::Xor => symbolic[bit].clone(),
+        })
+    })
+}
+
+/// `constant & !symbolic`, for BitClear's concrete-left-operand case (not
+/// expressible via [`partial_bitwise_word`], since it needs a per-bit
+/// inverted copy rather than a direct copy).
+pub fn partial_and_not_word<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    constant: u32,
+    symbolic: &[W; 32],
+    zero: &W,
+    one: &W,
+) -> Result<[W; 32], E> {
+    try_array(|bit| {
+        if (constant >> bit) & 1 == 0 {
+            Ok(zero.clone())
+        } else {
+            t.bitxor(symbolic[bit].clone(), one.clone())
+        }
     })
 }
 
