@@ -1,14 +1,16 @@
 //! The LLVM recompile backend.
 //!
 //! [`CompiledProgram::compile`] lowers a `cirrus_recompile_core::Program`
-//! into an LLVM module -- one function that, given a pointer to a
-//! `program.ops.len()`-byte scratch buffer, performs the recorded trace by
-//! calling `cirrus-recompile-rt`'s pinned functions, declared as external
-//! symbols with matching signatures -- and JIT-compiles it via `inkwell`'s
-//! `ExecutionEngine`. The pinned functions are wired in with
-//! `add_global_mapping` against `cirrus-recompile-rt`'s real, in-process
-//! function pointers, so no separate linking step is needed the way the Rust
-//! backend needs `rustc`.
+//! into an LLVM module -- one function that, given a pointer to a backend
+//! instance and a pointer to a `program.ops.len()`-element scratch buffer,
+//! performs the recorded trace by calling out to that backend's pinned
+//! functions, declared as external symbols -- and JIT-compiles it via
+//! `inkwell`'s `ExecutionEngine`. The caller supplies each pinned function's
+//! address ([`PinnedAddresses`], mirroring `cirrus-asm`'s identically-named
+//! type); this crate does not depend on any particular
+//! `cirrus-recompile-rt` backend, so the *same* emitted IR calls a native
+//! `bool` context, a garbled-circuit garbler, or an evaluator depending only
+//! on which addresses the caller wires in with `add_global_mapping`.
 
 use inkwell::AddressSpace;
 use inkwell::builder::Builder;
@@ -19,6 +21,22 @@ use inkwell::values::FunctionValue;
 use inkwell::OptimizationLevel;
 
 use cirrus_recompile_core::{Op, Program};
+
+/// The address of each pinned runtime function this backend calls, by exact
+/// name -- matching whichever `cirrus-recompile-rt` backend module (e.g.
+/// `plaintext`, `gc`, `eval`) the caller targets.
+pub struct PinnedAddresses {
+    /// `create(backend, buf, val, out)`.
+    pub create: usize,
+    /// `bitand(backend, buf, a, b, out)`.
+    pub bitand: usize,
+    /// `bitor(backend, buf, a, b, out)`.
+    pub bitor: usize,
+    /// `bitxor(backend, buf, a, b, out)`.
+    pub bitxor: usize,
+    /// `mux(backend, buf, cond, then, r#else, out)`.
+    pub mux: usize,
+}
 
 /// A [`Program`] compiled to an LLVM module and JIT-loaded, ready to run.
 ///
@@ -31,21 +49,28 @@ pub struct CompiledProgram<'ctx> {
 }
 
 impl<'ctx> CompiledProgram<'ctx> {
-    /// Build an LLVM module for `program`, declaring calls to
-    /// `cirrus-recompile-rt`'s pinned functions, and JIT-compile it.
-    pub fn compile(context: &'ctx Context, program: &Program, fn_name: &str) -> Self {
+    /// Build an LLVM module for `program`, declaring calls to `pinned`'s
+    /// functions, and JIT-compile it.
+    pub fn compile(context: &'ctx Context, program: &Program, fn_name: &str, pinned: &PinnedAddresses) -> Self {
         let module = context.create_module(fn_name);
         let builder = context.create_builder();
-        emit(context, &module, &builder, program, fn_name);
+        let declared = emit(context, &module, &builder, program, fn_name);
 
         let engine = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .expect("create LLVM JIT execution engine");
 
-        // Wire the declared externs to `cirrus-recompile-rt`'s real, already
-        // in-process function pointers -- the same functions the Rust and
-        // assembly backends call by these same names.
-        map_pinned_functions(&module, &engine);
+        // Wire the declared externs to the caller's chosen backend's real,
+        // in-process function pointers.
+        for (function, addr) in [
+            (declared.create, pinned.create),
+            (declared.bitand, pinned.bitand),
+            (declared.bitor, pinned.bitor),
+            (declared.bitxor, pinned.bitxor),
+            (declared.mux, pinned.mux),
+        ] {
+            engine.add_global_mapping(&function, addr);
+        }
 
         Self {
             engine,
@@ -53,29 +78,45 @@ impl<'ctx> CompiledProgram<'ctx> {
         }
     }
 
+    /// Run the JIT-compiled artifact against an arbitrary backend instance
+    /// and scratch buffer.
+    ///
+    /// # Safety
+    ///
+    /// `Backend`/`Wrapped` must be exactly the types `compile`'s
+    /// [`PinnedAddresses`] were taken from; `backend` must be valid for
+    /// whatever mutable access that backend's pinned functions need, and
+    /// `buf` must have at least as many `Wrapped` elements as `program` has
+    /// ops.
+    pub unsafe fn run_raw<Backend, Wrapped>(&self, backend: *mut Backend, buf: *mut Wrapped) {
+        // SAFETY: forwarded to the caller's own safety obligations above;
+        // `fn_name` names the single such function `compile` built.
+        unsafe {
+            let function: inkwell::execution_engine::JitFunction<unsafe extern "C" fn(*mut Backend, *mut Wrapped)> =
+                self.engine
+                    .get_function(&self.fn_name)
+                    .expect("resolve the JIT-compiled function");
+            function.call(backend, buf);
+        }
+    }
+
     /// Run the JIT-compiled artifact against `inputs`, in `program.inputs`
-    /// order, and read back `program.outputs`.
-    pub fn run(&self, program: &Program, inputs: &[bool]) -> Vec<bool> {
+    /// order, and read back `program.outputs`. Only valid for an artifact
+    /// compiled against the native `bool` (`plaintext`) backend.
+    pub fn run_plaintext(&self, program: &Program, inputs: &[bool]) -> Vec<bool> {
         assert_eq!(
             inputs.len(),
             program.inputs.len(),
             "input count must match the recorded program's input slots"
         );
-        let mut buf = vec![0u8; program.ops.len()];
+        let mut buf = vec![false; program.ops.len()];
         for (&idx, &value) in program.inputs.iter().zip(inputs) {
-            buf[idx.get()] = value as u8;
+            buf[idx.get()] = value;
         }
-        // SAFETY: `fn_name` names the single `void(i8*)` function `compile`
-        // built, and `buf` has exactly the `program.ops.len()` bytes every
-        // emitted pinned-function call assumes.
-        unsafe {
-            let function: inkwell::execution_engine::JitFunction<unsafe extern "C" fn(*mut u8)> =
-                self.engine
-                    .get_function(&self.fn_name)
-                    .expect("resolve the JIT-compiled function");
-            function.call(buf.as_mut_ptr());
-        }
-        program.outputs.iter().map(|idx| buf[idx.get()] != 0).collect()
+        // SAFETY: `()`/`bool` are the `plaintext` backend's `Backend`/
+        // `Wrapped` types, and `buf` has `program.ops.len()` elements.
+        unsafe { self.run_raw(&mut () as *mut (), buf.as_mut_ptr()) };
+        program.outputs.iter().map(|idx| buf[idx.get()]).collect()
     }
 }
 
@@ -93,13 +134,19 @@ fn declare_pinned_functions<'ctx>(context: &'ctx Context, module: &Module<'ctx>)
     let i32_type = context.i32_type();
     let ptr_type = context.ptr_type(AddressSpace::default());
 
-    let create_type = void_type.fn_type(&[ptr_type.into(), i8_type.into(), i32_type.into()], false);
+    // Every pinned function takes the backend and the buffer as two
+    // separate opaque pointers; LLVM's opaque-pointer model means this
+    // declared signature is valid for whichever concrete `Backend`/
+    // `Wrapped` layout the caller's chosen `PinnedAddresses` actually point
+    // at -- the pointee type never appears in the IR.
+    let create_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), i8_type.into(), i32_type.into()], false);
     let binop_type = void_type.fn_type(
-        &[ptr_type.into(), i32_type.into(), i32_type.into(), i32_type.into()],
+        &[ptr_type.into(), ptr_type.into(), i32_type.into(), i32_type.into(), i32_type.into()],
         false,
     );
     let mux_type = void_type.fn_type(
         &[
+            ptr_type.into(),
             ptr_type.into(),
             i32_type.into(),
             i32_type.into(),
@@ -118,29 +165,13 @@ fn declare_pinned_functions<'ctx>(context: &'ctx Context, module: &Module<'ctx>)
     }
 }
 
-fn map_pinned_functions(module: &Module<'_>, engine: &ExecutionEngine<'_>) {
-    let mappings: [(&str, usize); 5] = [
-        ("cirrus_rt_create", cirrus_recompile_rt::cirrus_rt_create as *const () as usize),
-        ("cirrus_rt_bitand", cirrus_recompile_rt::cirrus_rt_bitand as *const () as usize),
-        ("cirrus_rt_bitor", cirrus_recompile_rt::cirrus_rt_bitor as *const () as usize),
-        ("cirrus_rt_bitxor", cirrus_recompile_rt::cirrus_rt_bitxor as *const () as usize),
-        ("cirrus_rt_mux", cirrus_recompile_rt::cirrus_rt_mux as *const () as usize),
-    ];
-    for (name, addr) in mappings {
-        let function = module
-            .get_function(name)
-            .unwrap_or_else(|| panic!("module declares {name}"));
-        engine.add_global_mapping(&function, addr);
-    }
-}
-
 fn emit<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
     program: &Program,
     fn_name: &str,
-) {
+) -> PinnedFns<'ctx> {
     let pinned = declare_pinned_functions(context, module);
 
     let void_type = context.void_type();
@@ -148,19 +179,24 @@ fn emit<'ctx>(
     let i32_type = context.i32_type();
     let ptr_type = context.ptr_type(AddressSpace::default());
 
-    let fn_type = void_type.fn_type(&[ptr_type.into()], false);
+    let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
     let function = module.add_function(fn_name, fn_type, None);
     let entry = context.append_basic_block(function, "entry");
     builder.position_at_end(entry);
-    let buf = function
+    let backend = function
         .get_nth_param(0)
-        .expect("generated function takes exactly one buffer-pointer argument")
+        .expect("generated function takes a backend pointer and a buffer pointer")
+        .into_pointer_value();
+    let buf = function
+        .get_nth_param(1)
+        .expect("generated function takes a backend pointer and a buffer pointer")
         .into_pointer_value();
 
     for (i, op) in program.ops.iter().enumerate() {
         if program.inputs.iter().any(|idx| idx.get() == i) {
-            // Populated by the caller before `run`; see `generate_source`'s
-            // matching convention in the Rust backend for why.
+            // Populated by the caller before `run_raw`; see
+            // `generate_source`'s matching convention in the Rust backend
+            // for why.
             continue;
         }
         let out = i32_type.const_int(i as u64, false);
@@ -168,28 +204,28 @@ fn emit<'ctx>(
             Op::Create(v) => {
                 let val = i8_type.const_int(v as u64, false);
                 builder
-                    .build_call(pinned.create, &[buf.into(), val.into(), out.into()], "")
+                    .build_call(pinned.create, &[backend.into(), buf.into(), val.into(), out.into()], "")
                     .expect("build call to cirrus_rt_create");
             }
             Op::BitAnd(a, b) => {
                 let a = i32_type.const_int(a.0 as u64, false);
                 let b = i32_type.const_int(b.0 as u64, false);
                 builder
-                    .build_call(pinned.bitand, &[buf.into(), a.into(), b.into(), out.into()], "")
+                    .build_call(pinned.bitand, &[backend.into(), buf.into(), a.into(), b.into(), out.into()], "")
                     .expect("build call to cirrus_rt_bitand");
             }
             Op::BitOr(a, b) => {
                 let a = i32_type.const_int(a.0 as u64, false);
                 let b = i32_type.const_int(b.0 as u64, false);
                 builder
-                    .build_call(pinned.bitor, &[buf.into(), a.into(), b.into(), out.into()], "")
+                    .build_call(pinned.bitor, &[backend.into(), buf.into(), a.into(), b.into(), out.into()], "")
                     .expect("build call to cirrus_rt_bitor");
             }
             Op::BitXor(a, b) => {
                 let a = i32_type.const_int(a.0 as u64, false);
                 let b = i32_type.const_int(b.0 as u64, false);
                 builder
-                    .build_call(pinned.bitxor, &[buf.into(), a.into(), b.into(), out.into()], "")
+                    .build_call(pinned.bitxor, &[backend.into(), buf.into(), a.into(), b.into(), out.into()], "")
                     .expect("build call to cirrus_rt_bitxor");
             }
             Op::Mux { cond, then, r#else } => {
@@ -199,7 +235,7 @@ fn emit<'ctx>(
                 builder
                     .build_call(
                         pinned.mux,
-                        &[buf.into(), cond.into(), then.into(), r#else.into(), out.into()],
+                        &[backend.into(), buf.into(), cond.into(), then.into(), r#else.into(), out.into()],
                         "",
                     )
                     .expect("build call to cirrus_rt_mux");
@@ -207,6 +243,7 @@ fn emit<'ctx>(
         }
     }
     builder.build_return(None).expect("build return");
+    pinned
 }
 
 #[cfg(test)]
@@ -214,6 +251,16 @@ mod tests {
     use super::*;
     use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux};
     use cirrus_recompile_core::Recorder;
+
+    fn plaintext_pinned() -> PinnedAddresses {
+        PinnedAddresses {
+            create: cirrus_recompile_rt::plaintext::create as *const () as usize,
+            bitand: cirrus_recompile_rt::plaintext::bitand as *const () as usize,
+            bitor: cirrus_recompile_rt::plaintext::bitor as *const () as usize,
+            bitxor: cirrus_recompile_rt::plaintext::bitxor as *const () as usize,
+            mux: cirrus_recompile_rt::plaintext::mux as *const () as usize,
+        }
+    }
 
     #[test]
     fn compiled_program_matches_the_reference_interpreter() {
@@ -227,11 +274,11 @@ mod tests {
         let program = recorder.finish(vec![a, b], vec![and, or, xor, mux]);
 
         let context = Context::create();
-        let compiled = CompiledProgram::compile(&context, &program, "cirrus_llvm_test_fn");
+        let compiled = CompiledProgram::compile(&context, &program, "cirrus_llvm_test_fn", &plaintext_pinned());
 
         for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
-            let expected = cirrus_recompile_rt::execute(&program, &[x, y]);
-            let actual = compiled.run(&program, &[x, y]);
+            let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]);
+            let actual = compiled.run_plaintext(&program, &[x, y]);
             assert_eq!(actual, expected, "mismatch for inputs ({x}, {y})");
         }
     }

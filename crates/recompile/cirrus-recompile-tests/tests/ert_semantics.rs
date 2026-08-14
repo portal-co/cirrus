@@ -174,7 +174,7 @@ fn recorded_ert_program_matches_native_execution_via_pinned_rt() {
     let program = record_program(&mem);
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let outputs = cirrus_recompile_rt::execute(&program, &bits_of(&program, a, b));
+        let outputs = cirrus_recompile_rt::execute(&mut (), &program, &bits_of(&program, a, b));
         assert_eq!(triple_of(&outputs), golden, "cirrus_recompile_rt::execute mismatch for ({a:#x}, {b:#x})");
     }
 }
@@ -183,11 +183,25 @@ fn recorded_ert_program_matches_native_execution_via_pinned_rt() {
 fn recorded_ert_program_matches_native_execution_via_rust_backend() {
     let mem = program_image();
     let program = record_program(&mem);
-    let compiled = cirrus_rust_codegen::CompiledProgram::compile(&program, "cirrus_recompile_tests_rust_fn");
+    let compiled = cirrus_rust_codegen::CompiledProgram::compile(
+        &program,
+        "cirrus_recompile_tests_rust_fn",
+        &cirrus_rust_codegen::BackendTarget::plaintext(),
+    );
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let outputs = compiled.run(&program, &bits_of(&program, a, b));
+        let outputs = compiled.run_plaintext(&program, &bits_of(&program, a, b));
         assert_eq!(triple_of(&outputs), golden, "Rust backend mismatch for ({a:#x}, {b:#x})");
+    }
+}
+
+fn plaintext_pinned() -> cirrus_llvm::PinnedAddresses {
+    cirrus_llvm::PinnedAddresses {
+        create: cirrus_recompile_rt::plaintext::create as *const () as usize,
+        bitand: cirrus_recompile_rt::plaintext::bitand as *const () as usize,
+        bitor: cirrus_recompile_rt::plaintext::bitor as *const () as usize,
+        bitxor: cirrus_recompile_rt::plaintext::bitxor as *const () as usize,
+        mux: cirrus_recompile_rt::plaintext::mux as *const () as usize,
     }
 }
 
@@ -196,10 +210,15 @@ fn recorded_ert_program_matches_native_execution_via_llvm_backend() {
     let mem = program_image();
     let program = record_program(&mem);
     let context = inkwell::context::Context::create();
-    let compiled = cirrus_llvm::CompiledProgram::compile(&context, &program, "cirrus_recompile_tests_llvm_fn");
+    let compiled = cirrus_llvm::CompiledProgram::compile(
+        &context,
+        &program,
+        "cirrus_recompile_tests_llvm_fn",
+        &plaintext_pinned(),
+    );
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let outputs = compiled.run(&program, &bits_of(&program, a, b));
+        let outputs = compiled.run_plaintext(&program, &bits_of(&program, a, b));
         assert_eq!(triple_of(&outputs), golden, "LLVM backend mismatch for ({a:#x}, {b:#x})");
     }
 }
@@ -232,9 +251,10 @@ fn recorded_ert_program_matches_native_execution_via_asm_backend() {
             assert_eq!(status, 0, "mprotect failed");
             Self { ptr, len }
         }
-        unsafe fn call(&self, buf: *mut u8) {
-            let function: unsafe extern "C" fn(*mut u8) = unsafe { core::mem::transmute(self.ptr) };
-            unsafe { function(buf) };
+        unsafe fn call<Backend, Wrapped>(&self, backend: *mut Backend, buf: *mut Wrapped) {
+            let function: unsafe extern "C" fn(*mut Backend, *mut Wrapped) =
+                unsafe { core::mem::transmute(self.ptr) };
+            unsafe { function(backend, buf) };
         }
     }
     impl Drop for ExecMem {
@@ -246,23 +266,23 @@ fn recorded_ert_program_matches_native_execution_via_asm_backend() {
     let mem = program_image();
     let program = record_program(&mem);
     let pinned = PinnedAddresses {
-        create: cirrus_recompile_rt::cirrus_rt_create as *const () as usize,
-        bitand: cirrus_recompile_rt::cirrus_rt_bitand as *const () as usize,
-        bitor: cirrus_recompile_rt::cirrus_rt_bitor as *const () as usize,
-        bitxor: cirrus_recompile_rt::cirrus_rt_bitxor as *const () as usize,
-        mux: cirrus_recompile_rt::cirrus_rt_mux as *const () as usize,
+        create: cirrus_recompile_rt::plaintext::create as *const () as usize,
+        bitand: cirrus_recompile_rt::plaintext::bitand as *const () as usize,
+        bitor: cirrus_recompile_rt::plaintext::bitor as *const () as usize,
+        bitxor: cirrus_recompile_rt::plaintext::bitxor as *const () as usize,
+        mux: cirrus_recompile_rt::plaintext::mux as *const () as usize,
     };
     let code = compile_aarch64(&program, &pinned);
     let exec = ExecMem::new(&code);
 
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let mut buf = vec![0u8; program.ops.len()];
+        let mut buf = vec![false; program.ops.len()];
         for (&idx, bit) in program.inputs.iter().zip(bits_of(&program, a, b)) {
-            buf[idx.get()] = bit as u8;
+            buf[idx.get()] = bit;
         }
-        unsafe { exec.call(buf.as_mut_ptr()) };
-        let outputs: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()] != 0).collect();
+        unsafe { exec.call(&mut () as *mut (), buf.as_mut_ptr()) };
+        let outputs: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()]).collect();
         assert_eq!(triple_of(&outputs), golden, "asm backend mismatch for ({a:#x}, {b:#x})");
     }
 }

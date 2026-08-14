@@ -48,16 +48,18 @@ impl ExecMem {
         Self { ptr, len }
     }
 
-    /// Call the compiled `void(uint8_t *buf)` function this buffer holds.
+    /// Call the compiled `void(void *backend, void *buf)` function this
+    /// buffer holds.
     ///
     /// # Safety
     ///
-    /// `self` must hold a valid AAPCS64 `void(uint8_t *)` function starting
-    /// at its first byte, and `buf` must be valid for whatever reads/writes
-    /// that function performs.
-    unsafe fn call(&self, buf: *mut u8) {
-        let function: unsafe extern "C" fn(*mut u8) = unsafe { core::mem::transmute(self.ptr) };
-        unsafe { function(buf) };
+    /// `self` must hold a valid AAPCS64 `void(void *, void *)` function
+    /// starting at its first byte, and `backend`/`buf` must be valid for
+    /// whatever reads/writes that function performs.
+    unsafe fn call<Backend, Wrapped>(&self, backend: *mut Backend, buf: *mut Wrapped) {
+        let function: unsafe extern "C" fn(*mut Backend, *mut Wrapped) =
+            unsafe { core::mem::transmute(self.ptr) };
+        unsafe { function(backend, buf) };
     }
 }
 
@@ -80,25 +82,26 @@ fn compiled_aarch64_matches_reference_interpreter() {
     let program = recorder.finish(vec![a, b], vec![and, or, xor, mux]);
 
     let pinned = PinnedAddresses {
-        create: cirrus_recompile_rt::cirrus_rt_create as *const () as usize,
-        bitand: cirrus_recompile_rt::cirrus_rt_bitand as *const () as usize,
-        bitor: cirrus_recompile_rt::cirrus_rt_bitor as *const () as usize,
-        bitxor: cirrus_recompile_rt::cirrus_rt_bitxor as *const () as usize,
-        mux: cirrus_recompile_rt::cirrus_rt_mux as *const () as usize,
+        create: cirrus_recompile_rt::plaintext::create as *const () as usize,
+        bitand: cirrus_recompile_rt::plaintext::bitand as *const () as usize,
+        bitor: cirrus_recompile_rt::plaintext::bitor as *const () as usize,
+        bitxor: cirrus_recompile_rt::plaintext::bitxor as *const () as usize,
+        mux: cirrus_recompile_rt::plaintext::mux as *const () as usize,
     };
     let code = compile_aarch64(&program, &pinned);
     let exec = ExecMem::new(&code);
 
     for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
-        let expected = cirrus_recompile_rt::execute(&program, &[x, y]);
+        let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]);
 
-        let mut buf = vec![0u8; program.ops.len()];
-        buf[a.get()] = x as u8;
-        buf[b.get()] = y as u8;
-        // SAFETY: `buf` has exactly `program.ops.len()` bytes, matching
-        // every buffer-slot index `code` was compiled against.
-        unsafe { exec.call(buf.as_mut_ptr()) };
-        let actual: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()] != 0).collect();
+        let mut buf = vec![false; program.ops.len()];
+        buf[a.get()] = x;
+        buf[b.get()] = y;
+        // SAFETY: `buf` has exactly `program.ops.len()` bools, matching
+        // every buffer-slot index `code` was compiled against, and `()` is
+        // the `plaintext` backend's zero-sized `Backend` type.
+        unsafe { exec.call(&mut () as *mut (), buf.as_mut_ptr()) };
+        let actual: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()]).collect();
 
         assert_eq!(actual, expected, "mismatch for inputs ({x}, {y})");
     }

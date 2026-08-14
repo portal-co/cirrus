@@ -12,10 +12,13 @@ path = "src/lib.rs"
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
 cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
-cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt", features = ["gc"] }
 cirrus-rust-codegen = { version = "0.1.0", path = "../cirrus-rust-codegen" }
 cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
 cirrus-asm = { version = "0.1.0", path = "../../cirrus-asm" }
+cirrus-garbled-circuit = { version = "0.1.0", path = "../../garbled-circuit/cirrus-garbled-circuit" }
+digest = "0.11.3"
+sha2 = { version = "0.11.0", default-features = false }
 rv-asm.workspace = true
 libc = "0.2"
 inkwell = { workspace = true, features = ["llvm22-1"] }
