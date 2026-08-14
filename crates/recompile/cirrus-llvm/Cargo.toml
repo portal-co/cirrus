@@ -1,0 +1,13 @@
+[package]
+name = "cirrus-llvm"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt" }
+inkwell = { workspace = true, features = ["llvm22-1"] }
+
+[dev-dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }

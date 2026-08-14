@@ -6,7 +6,12 @@ description.workspace = true
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../recompile/cirrus-recompile-core" }
 portal-pc-asm-common.workspace = true
-portal-solutions-asm-aarch64.workspace = true
+portal-solutions-asm-aarch64 = { workspace = true, features = ["bin-backend"] }
 portal-solutions-asm-regalloc.workspace = true
 portal-solutions-asm-x86-64.workspace = true
+
+[dev-dependencies]
+cirrus-recompile-rt = { version = "0.1.0", path = "../recompile/cirrus-recompile-rt" }
+libc = "0.2"

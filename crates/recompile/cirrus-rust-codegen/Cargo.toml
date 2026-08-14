@@ -1,0 +1,13 @@
+[package]
+name = "cirrus-rust-codegen"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+libloading.workspace = true
+
+[dev-dependencies]
+cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt" }
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }

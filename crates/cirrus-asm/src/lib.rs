@@ -6,6 +6,10 @@ use cirrus_core::{ContextWithValue, HasError};
 use portal_pc_asm_common::types::{mem::MemorySize, reg::Reg};
 use portal_solutions_asm_aarch64::AArch64Arch;
 use portal_solutions_asm_x86_64::X64Arch;
+
+/// Lower a recorded [`cirrus_recompile_core::Program`] to real machine code
+/// that calls pinned runtime functions, over buffer-slot indices.
+pub mod recompile;
 pub trait AsmValue {}
 pub struct Asm<'a, Context, T: ?Sized> {
     pub arch: &'a mut T,

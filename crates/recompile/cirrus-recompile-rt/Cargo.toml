@@ -1,0 +1,17 @@
+[package]
+name = "cirrus-recompile-rt"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[lib]
+# A cdylib so the Rust-codegen backend's rustc-compiled artifact can link
+# against a real shared object; rlib so cirrus-llvm/cirrus-asm can resolve
+# these same symbols' addresses in-process for a JIT.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+
+[dev-dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
