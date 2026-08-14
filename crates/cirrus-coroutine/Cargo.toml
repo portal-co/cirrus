@@ -1,0 +1,16 @@
+[package]
+name = "cirrus-coroutine"
+edition = "2024"
+version.workspace = true
+description = "Allocation-free, stackful Pusher coroutines for cirrus"
+build = "build.rs"
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+spin = { version = "0.10.1", default-features = false, features = ["mutex", "spin_mutex", "portable-atomic"] }
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "arm"))'.dependencies]
+# RV32IM and the selected Armv8-M target lack the atomic CAS required by
+# spin::Mutex. The final firmware must provide the implementation; Embassy
+# already supplies one through the critical-section ecosystem.
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }

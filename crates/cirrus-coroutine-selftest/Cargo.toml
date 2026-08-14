@@ -1,0 +1,21 @@
+[package]
+name = "cirrus-coroutine-selftest"
+edition = "2024"
+version.workspace = true
+description = "Bare-metal QEMU self-test for cirrus-coroutine"
+autobins = false
+build = "build.rs"
+
+[features]
+bare-metal = []
+
+[[bin]]
+name = "cirrus-coroutine-selftest"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["bare-metal"]
+
+[dependencies]
+cirrus-coroutine = { path = "../cirrus-coroutine" }
+critical-section = { version = "1", default-features = false }
