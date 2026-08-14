@@ -19,7 +19,8 @@ calls and returns, and caller-provided stacks with sufficient capacity. The
 [crate documentation](crates/cirrus-ert/src/lib.rs) describes the supported
 instructions, buffers, ECALLs, and public entry points.
 
-Instruction images are supplied through `RawMemory`, an unsafe raw guest-memory
-mapping rather than a slice. A bounded mapping is appropriate for a host buffer;
-an unbounded mapping can address a bare-metal RV32 image at its native addresses
-without claiming that address zero is the start of a valid 4 GiB slice.
+Instruction images are supplied through `RawMemory`. `RawMemory::from(&slice)`
+safely creates a bounded mapping for a host buffer; its lifetime keeps the
+buffer borrowed. `unsafe RawMemory::new(...)` is reserved for an unbounded
+bare-metal mapping at native RV32 addresses, without claiming that address zero
+is the start of a valid 4 GiB slice.

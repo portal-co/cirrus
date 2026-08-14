@@ -27,9 +27,8 @@ fn program(instructions: impl IntoIterator<Item = Inst>) -> Vec<u8> {
         .collect()
 }
 
-fn bounded_memory(mem: &[u8]) -> RawMemory {
-    // SAFETY: the returned mapping is used only while `mem` remains borrowed.
-    unsafe { RawMemory::new(mem.as_ptr(), Some(mem.len())) }
+fn bounded_memory(mem: &[u8]) -> RawMemory<'_> {
+    RawMemory::from(mem)
 }
 
 fn run(
@@ -67,6 +66,15 @@ fn assert_success(result: Result<(), ErtError<Infallible>>) {
 fn unbounded_raw_memory_accepts_an_address_zero_base() {
     // SAFETY: this test only constructs the mapping; it never reads through it.
     let _ = unsafe { RawMemory::new(core::ptr::null(), None) };
+}
+
+#[test]
+fn a_slice_converts_to_a_bounded_raw_memory_mapping() {
+    let bytes = [1, 2, 3, 4];
+    let memory = RawMemory::from(&bytes[..]);
+
+    assert_eq!(memory.read::<4>(0), Some(bytes));
+    assert_eq!(memory.read::<1>(4), None);
 }
 
 #[test]

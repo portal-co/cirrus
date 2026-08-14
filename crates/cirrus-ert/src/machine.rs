@@ -18,7 +18,7 @@ pub(crate) const ABI_REGS: [Reg; 8] = [
 pub(crate) struct Machine<'a, W, E> {
     pub(crate) t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
     pub(crate) hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
-    pub(crate) mem: RawMemory,
+    pub(crate) mem: RawMemory<'a>,
     pub(crate) rstack: &'a mut [u32],
     pub(crate) vstack: &'a mut [W],
     pub(crate) pc: u32,
@@ -66,7 +66,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     pub(crate) fn new(
         t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
         hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
-        mem: RawMemory,
+        mem: RawMemory<'a>,
         rstack: &'a mut [u32],
         vstack: &'a mut [W],
         pc: u32,
