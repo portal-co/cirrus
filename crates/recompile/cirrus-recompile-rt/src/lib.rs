@@ -21,14 +21,24 @@
 //! garbler's table sink and digest seed, an evaluator's table stream, ...),
 //! while the buffer is a plain array of `Backend::Wrapped` values, one slot
 //! per [`Op`](cirrus_recompile_core::Op). [`plaintext`] instantiates this
-//! for the native `bool` backend (`Context = ()`); see `cirrus-recompile-rt`
-//! consumers with the `gc` feature enabled for the garbled-circuit and
-//! evaluator backends.
+//! for the native `bool` backend (`Context = ()`).
+//!
+//! `define_pinned_backend!` is `#[macro_export]`ed so *any* crate can define
+//! its own backend the same way `plaintext` is defined here -- see
+//! `cirrus-recompile-tests` for a worked example wrapping
+//! `cirrus-garbled-circuit`'s `GC`/`Evaluator`. Call it as
+//! `cirrus_recompile_rt::define_pinned_backend!(...)`; it references
+//! `cirrus-core` through `$crate::cirrus_core`, this crate's own re-export
+//! (see below), so it resolves correctly regardless of what the invoking
+//! crate's own `cirrus-core` dependency (if any) happens to be named.
+
+/// Re-exported so [`define_pinned_backend!`] can name `cirrus-core`'s traits
+/// via `$crate::cirrus_core::...` from any invoking crate, hygienically --
+/// it never needs the invoker to depend on `cirrus-core` under that exact
+/// name (or at all).
+pub use cirrus_core;
 
 use cirrus_recompile_core::{Op, Program};
-
-#[cfg(feature = "gc")]
-pub mod gc;
 
 /// Define one backend's pinned functions: `create`, `bitand`, `bitor`,
 /// `bitxor`, `mux`, generic only over the lifetimes named in `[$lt,*]` --
@@ -37,6 +47,14 @@ pub mod gc;
 /// participate in that, so a backend being "generic modulo lifetimes" is
 /// exactly the shape this macro accepts). `$tag` names this backend's
 /// exported symbols (`cirrus_rt_bitand_$tag`, etc.).
+///
+/// Usable from any crate: `cirrus_recompile_rt::define_pinned_backend!(pub
+/// mod my_backend for ['a] MyBackend<'a> as "my_backend");`. `$backend` only
+/// needs to implement `cirrus-core`'s `ContextWithBitAnd`/`ContextWithBitOr`/
+/// `ContextWithBitXor`/`ContextWithCreate`/`ContextWithMux`, all over `bool`
+/// -- see `plaintext`, defined with this same macro just below, for the
+/// simplest possible instance.
+#[macro_export]
 macro_rules! define_pinned_backend {
     ($vis:vis mod $modname:ident for [$($lt:lifetime),*] $backend:ty as $tag:literal) => {
         #[doc = concat!("Pinned functions for the \"", $tag, "\" backend.")]
@@ -48,7 +66,7 @@ macro_rules! define_pinned_backend {
             pub type Backend<$($lt),*> = $backend;
             /// This backend's scratch-buffer element type.
             pub type Wrapped<$($lt),*> =
-                <Backend<$($lt),*> as cirrus_core::ContextWithValue<bool>>::Wrapped;
+                <Backend<$($lt),*> as $crate::cirrus_core::ContextWithValue<bool>>::Wrapped;
 
             /// Materialize a known Boolean constant into `buf[out]`.
             ///
@@ -64,7 +82,7 @@ macro_rules! define_pinned_backend {
                 out: u32,
             ) {
                 unsafe {
-                    let result = cirrus_core::ContextWithCreate::create(&mut *backend, val != 0)
+                    let result = $crate::cirrus_core::ContextWithCreate::create(&mut *backend, val != 0)
                         .unwrap_or_else(|_| panic!(concat!("cirrus_rt_create_", $tag, " failed")));
                     buf.add(out as usize).write(result);
                 }
@@ -87,7 +105,7 @@ macro_rules! define_pinned_backend {
                 unsafe {
                     let av = buf.add(a as usize).read();
                     let bv = buf.add(b as usize).read();
-                    let result = cirrus_core::ContextWithBitAnd::bitand(&mut *backend, av, bv)
+                    let result = $crate::cirrus_core::ContextWithBitAnd::bitand(&mut *backend, av, bv)
                         .unwrap_or_else(|_| panic!(concat!("cirrus_rt_bitand_", $tag, " failed")));
                     buf.add(out as usize).write(result);
                 }
@@ -110,7 +128,7 @@ macro_rules! define_pinned_backend {
                 unsafe {
                     let av = buf.add(a as usize).read();
                     let bv = buf.add(b as usize).read();
-                    let result = cirrus_core::ContextWithBitOr::bitor(&mut *backend, av, bv)
+                    let result = $crate::cirrus_core::ContextWithBitOr::bitor(&mut *backend, av, bv)
                         .unwrap_or_else(|_| panic!(concat!("cirrus_rt_bitor_", $tag, " failed")));
                     buf.add(out as usize).write(result);
                 }
@@ -133,7 +151,7 @@ macro_rules! define_pinned_backend {
                 unsafe {
                     let av = buf.add(a as usize).read();
                     let bv = buf.add(b as usize).read();
-                    let result = cirrus_core::ContextWithBitXor::bitxor(&mut *backend, av, bv)
+                    let result = $crate::cirrus_core::ContextWithBitXor::bitxor(&mut *backend, av, bv)
                         .unwrap_or_else(|_| panic!(concat!("cirrus_rt_bitxor_", $tag, " failed")));
                     buf.add(out as usize).write(result);
                 }
@@ -159,7 +177,7 @@ macro_rules! define_pinned_backend {
                     let cv = buf.add(cond as usize).read();
                     let tv = buf.add(then as usize).read();
                     let ev = buf.add(r#else as usize).read();
-                    let result = cirrus_core::ContextWithMux::mux(&mut *backend, cv, tv, ev)
+                    let result = $crate::cirrus_core::ContextWithMux::mux(&mut *backend, cv, tv, ev)
                         .unwrap_or_else(|_| panic!(concat!("cirrus_rt_mux_", $tag, " failed")));
                     buf.add(out as usize).write(result);
                 }
@@ -167,8 +185,6 @@ macro_rules! define_pinned_backend {
         }
     };
 }
-#[cfg_attr(not(feature = "gc"), allow(unused_imports))]
-pub(crate) use define_pinned_backend;
 
 define_pinned_backend!(pub mod plaintext for [] () as "plaintext");
 

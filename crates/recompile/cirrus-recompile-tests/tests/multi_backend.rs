@@ -1,14 +1,18 @@
 //! Multi-backend demonstration: the *same* recorded [`Program`], compiled
-//! and run against three different `cirrus-recompile-rt` backends --
-//! plaintext, a garbled-circuit garbler, and its evaluator -- all through
-//! real, `rustc`-compiled generated Rust source (the same
+//! and run against three different pinned-function backends -- plaintext, a
+//! garbled-circuit garbler, and its evaluator -- all through real,
+//! `rustc`-compiled generated Rust source (the same
 //! `generate_source`/`compile` pipeline every other test uses). This is the
 //! "allow usage of any backend (plaintext, garbled circuit, etc.)" contract
 //! made concrete: [`BackendTarget`] only names a Rust module path plus a
 //! lifetime list, so the emitted call sites are identical no matter which
 //! backend module ends up linked against them -- only which addresses
 //! `cirrus-asm`/`cirrus-llvm` map, or which module `cirrus-rust-codegen`
-//! generates a path to, changes between runs.
+//! generates a path to, changes between runs. The `gc`/`eval` backends
+//! below are defined in *this* crate's `src/lib.rs`, not in
+//! `cirrus-recompile-rt` -- proof that
+//! `cirrus_recompile_rt::define_pinned_backend!` is usable from any crate,
+//! not just the one that defines it.
 //!
 //! The garble/evaluate half additionally exercises "garbled circuits in
 //! generated code": the tables a real generated-and-compiled artifact
@@ -22,7 +26,7 @@
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux, Pusher};
 use cirrus_garbled_circuit::{GarblingRecord, Label, GC};
 use cirrus_recompile_core::Program;
-use cirrus_recompile_rt::gc::{EvalBackend, GcBackend, LABEL_BYTES, LabelDigest};
+use cirrus_recompile_tests::{EvalBackend, GcBackend, LABEL_BYTES, LabelDigest};
 use cirrus_rust_codegen::{BackendTarget, CompiledProgram};
 
 struct VecPusher<T>(Vec<T>);
@@ -62,14 +66,16 @@ fn rust_backend_runs_the_same_program_against_plaintext_and_garbled_circuit_back
     );
 
     let gc_target = BackendTarget {
-        module_path: "cirrus_recompile_rt::gc::backend".to_string(),
+        module_path: "cirrus_recompile_tests::gc_backend".to_string(),
         lifetimes: vec!["'a".to_string(), "'b".to_string()],
+        extra_crates: vec!["cirrus_recompile_tests".to_string()],
     };
     let gc_compiled = CompiledProgram::compile(&program, "cirrus_recompile_tests_multi_backend_gc", &gc_target);
 
     let eval_target = BackendTarget {
-        module_path: "cirrus_recompile_rt::gc::eval_backend".to_string(),
+        module_path: "cirrus_recompile_tests::eval_backend".to_string(),
         lifetimes: vec!["'a".to_string()],
+        extra_crates: vec!["cirrus_recompile_tests".to_string()],
     };
     let eval_compiled = CompiledProgram::compile(&program, "cirrus_recompile_tests_multi_backend_eval", &eval_target);
 

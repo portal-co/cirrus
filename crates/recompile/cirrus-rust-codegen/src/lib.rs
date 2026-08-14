@@ -3,14 +3,17 @@
 //! [`generate_source`] renders a `cirrus_recompile_core::Program` as literal
 //! Rust source: one `extern "C"` function that, given a pointer to the
 //! target [`BackendTarget`] and a pointer to a `program.ops.len()`-element
-//! scratch buffer, performs the recorded trace by calling
-//! `cirrus-recompile-rt`'s pinned functions in order -- the exact same
-//! functions the LLVM and assembly backends call by name, for whichever
-//! backend (`plaintext`, `gc`, `eval`, ...) the caller targets.
-//! [`CompiledProgram::compile`] then does the "server precompiles once" half
-//! of the story for real: it shells out to `rustc` to build that source into
-//! a loadable `cdylib` linked against the already-built `cirrus-recompile-rt`
-//! rlib, so the result is a genuine compiled artifact, not an interpreter.
+//! scratch buffer, performs the recorded trace by calling a backend's pinned
+//! functions in order -- the exact same functions the LLVM and assembly
+//! backends call by name, for whichever backend (`cirrus-recompile-rt`'s own
+//! `plaintext`, or one any other crate defines with its
+//! `define_pinned_backend!`) the caller targets. [`CompiledProgram::compile`]
+//! then does the "server precompiles once" half of the story for real: it
+//! shells out to `rustc` to build that source into a loadable `cdylib`
+//! linked against the already-built `cirrus-recompile-rt` rlib (plus
+//! whichever `BackendTarget::extra_crates` a non-`cirrus-recompile-rt`
+//! backend names), so the result is a genuine compiled artifact, not an
+//! interpreter.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,23 +21,30 @@ use std::process::Command;
 
 use cirrus_recompile_core::{Op, Program};
 
-/// Which `cirrus-recompile-rt` backend module a compiled artifact targets.
+/// Which pinned-function backend module a compiled artifact targets.
 ///
 /// `module_path` is the Rust path to that backend's pinned-function module
-/// (e.g. `"cirrus_recompile_rt::plaintext"` or
-/// `"cirrus_recompile_rt::gc::backend"`), which must expose `Backend<..>`/
-/// `Wrapped<..>` type aliases and `create`/`bitand`/`bitor`/`bitxor`/`mux`
-/// functions with the shape `define_pinned_backend!` generates.
-/// `lifetimes` names that backend's free lifetime parameters (e.g. `["'a",
-/// "'b"]` for the `gc` backend, `[]` for `plaintext`) -- every backend is
-/// generic *only* over lifetimes (see `define_pinned_backend!`'s docs), so
-/// this is enough to reconstruct its exact type at the call site.
+/// (e.g. `"cirrus_recompile_rt::plaintext"` or, for a backend a downstream
+/// crate defines itself, `"cirrus_recompile_tests::gc_backend"`), which must
+/// expose `Backend<..>`/`Wrapped<..>` type aliases and
+/// `create`/`bitand`/`bitor`/`bitxor`/`mux` functions with the shape
+/// `cirrus_recompile_rt::define_pinned_backend!` generates. `lifetimes`
+/// names that backend's free lifetime parameters (e.g. `["'a", "'b"]` for a
+/// garbler backend, `[]` for `plaintext`) -- every backend is generic *only*
+/// over lifetimes (see `define_pinned_backend!`'s docs), so this is enough
+/// to reconstruct its exact type at the call site.
 pub struct BackendTarget {
     /// Rust path to the backend's pinned-function module.
     pub module_path: String,
     /// The backend's free lifetime parameters, without a leading `'`
     /// stripped -- e.g. `["'a", "'b"]`.
     pub lifetimes: Vec<String>,
+    /// Extra crates (by Rust crate name, e.g. `"cirrus_recompile_tests"`)
+    /// `module_path` needs `--extern`-linked, beyond `cirrus-recompile-rt`
+    /// (always linked). A backend defined outside `cirrus-recompile-rt`
+    /// itself -- see that crate's `define_pinned_backend!` docs -- names its
+    /// own crate here.
+    pub extra_crates: Vec<String>,
 }
 
 impl BackendTarget {
@@ -43,6 +53,7 @@ impl BackendTarget {
         Self {
             module_path: "cirrus_recompile_rt::plaintext".to_string(),
             lifetimes: Vec::new(),
+            extra_crates: Vec::new(),
         }
     }
 
@@ -105,11 +116,13 @@ fn workspace_target_dir() -> PathBuf {
         .join("target")
 }
 
-/// Find the most recently built `cirrus-recompile-rt` rlib, so the generated
-/// source can link against it directly instead of resolving symbols across a
+/// Find the most recently built rlib for the crate named `crate_name` (a
+/// Rust crate name, e.g. `"cirrus_recompile_rt"`), so the generated source
+/// can link against it directly instead of resolving symbols across a
 /// separate dynamic library at load time.
-fn find_recompile_rt_rlib() -> PathBuf {
+fn find_rlib(crate_name: &str) -> PathBuf {
     let target = workspace_target_dir();
+    let prefix = format!("lib{crate_name}");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for profile in ["debug", "release"] {
         let deps = target.join(profile).join("deps");
@@ -121,7 +134,7 @@ fn find_recompile_rt_rlib() -> PathBuf {
             let is_match = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("libcirrus_recompile_rt") && n.ends_with(".rlib"));
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".rlib"));
             if !is_match {
                 continue;
             }
@@ -135,7 +148,7 @@ fn find_recompile_rt_rlib() -> PathBuf {
     }
     best.map(|(_, path)| path).unwrap_or_else(|| {
         panic!(
-            "cirrus-recompile-rt rlib not found under {} -- run `cargo build -p cirrus-recompile-rt [--features gc]` first",
+            "{crate_name} rlib not found under {} -- run `cargo build -p {crate_name}` first",
             target.display()
         )
     })
@@ -160,7 +173,7 @@ impl CompiledProgram {
         let src_path = dir.join(format!("{fn_name}.rs"));
         std::fs::write(&src_path, &source).expect("write generated Rust backend source");
 
-        let rlib = find_recompile_rt_rlib();
+        let rlib = find_rlib("cirrus_recompile_rt");
         let out_path = dir.join(format!(
             "{}{fn_name}.{}",
             std::env::consts::DLL_PREFIX,
@@ -168,20 +181,26 @@ impl CompiledProgram {
         ));
 
         let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-        let status = Command::new(rustc)
-            .arg("--edition")
+        let mut cmd = Command::new(rustc);
+        cmd.arg("--edition")
             .arg("2024")
             .arg("--crate-type")
             .arg("cdylib")
             .arg("-O")
-            // `cirrus-recompile-rt` itself depends on `cirrus-recompile-core`
-            // (and, for gc/eval targets, `cirrus-garbled-circuit`/`digest`/
-            // `sha2`); point rustc at the same `deps` directory so it can
-            // resolve those transitive rlibs by name.
+            // `cirrus-recompile-rt` (and any `extra_crates`) may themselves
+            // depend on further rlibs (e.g. `cirrus-recompile-core`, or a
+            // third-party crate a backend defined elsewhere needs); point
+            // rustc at the shared `deps` directory so it can resolve those
+            // transitive rlibs by name too.
             .arg("-L")
             .arg(rlib.parent().expect("rlib path has a parent directory"))
             .arg("--extern")
-            .arg(format!("cirrus_recompile_rt={}", rlib.display()))
+            .arg(format!("cirrus_recompile_rt={}", rlib.display()));
+        for extra in &backend.extra_crates {
+            let extra_rlib = find_rlib(extra);
+            cmd.arg("--extern").arg(format!("{extra}={}", extra_rlib.display()));
+        }
+        let status = cmd
             .arg(&src_path)
             .arg("-o")
             .arg(&out_path)

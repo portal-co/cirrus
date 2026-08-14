@@ -8,17 +8,23 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-[dev-dependencies]
+[dependencies]
+# Needed by src/lib.rs itself: the GcBackend/EvalBackend pinned backends,
+# defined here as a worked example of `cirrus-recompile-rt`'s
+# `define_pinned_backend!` macro being usable from any crate, not just
+# `cirrus-recompile-rt` itself.
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
-cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
-cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
-cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt", features = ["gc"] }
-cirrus-rust-codegen = { version = "0.1.0", path = "../cirrus-rust-codegen" }
-cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
-cirrus-asm = { version = "0.1.0", path = "../../cirrus-asm" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../cirrus-recompile-rt" }
 cirrus-garbled-circuit = { version = "0.1.0", path = "../../garbled-circuit/cirrus-garbled-circuit" }
 digest = "0.11.3"
 sha2 = { version = "0.11.0", default-features = false }
+
+[dev-dependencies]
+cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+cirrus-rust-codegen = { version = "0.1.0", path = "../cirrus-rust-codegen" }
+cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
+cirrus-asm = { version = "0.1.0", path = "../../cirrus-asm" }
 rv-asm.workspace = true
 libc = "0.2"
 inkwell = { workspace = true, features = ["llvm22-1"] }
