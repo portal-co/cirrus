@@ -2,22 +2,23 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //! A bounded, stackful adapter from synchronous [`cirrus_core::Pusher`]s to
-//! an async pull interface.
+//! synchronous and async pull interfaces.
 //!
 //! [`Coroutine`] owns a fixed-size ring and a second, fixed-size stack for a
 //! synchronous producer. A full [`Pusher`] transfers to its paired [`Puller`]
 //! through a private transfer waker. When the puller later finds the ring
-//! empty, it transfers directly back to the producer. The outer async runtime
-//! never schedules this handoff: [`Puller::next`] completes in the poll that
-//! starts or resumes the producer.
+//! empty, it transfers directly back to the producer. [`Puller`] exposes that
+//! mechanism synchronously; [`AsyncPuller`] adds task-waker notification for
+//! async executors through its pinned [`AsyncPullerWrapper`].
 //!
 //! # Safety model
 //!
 //! This is a single-producer/single-puller, single-thread coroutine. It is
 //! deliberately `!Send` and `!Sync`, must remain pinned after [`Puller`] is
-//! created, and is not suitable for interrupt handlers. The producer must not
-//! return or unwind. Dropping a started coroutine panics; production users
-//! should use `panic = "abort"`.
+//! created, and is not suitable for interrupt handlers. The producer and
+//! [`AsyncPullerWrapper`] must not move threads or unwind across a transfer.
+//! Dropping a started coroutine panics; production users should use
+//! `panic = "abort"`.
 //!
 //! The producer stack is measured in 16-byte [`STACK_SLOT_BYTES`] slots. Its
 //! size must cover the producer's normal Rust stack frames as well as any
@@ -25,10 +26,23 @@
 //!
 //! # Embassy
 //!
-//! No executor adapter is required. An Embassy task can simply await a pull:
-//! `let value = puller.next().await;`. The future resolves from the same poll
-//! after the internal symmetric handoff, so it does not register the task's
-//! ordinary [`core::task::Waker`].
+//! Obtain a [`AsyncPuller`] from a pinned [`Puller`], then create and pin one
+//! [`AsyncPullerWrapper`] on the task's thread. Its `next` future uses the
+//! executor's ordinary [`core::task::Waker`], allowing an Embassy task to use
+//! `wrapper.as_mut().next().await` without an Embassy dependency:
+//!
+//! ```ignore
+//! let puller = coroutine.as_mut().puller();
+//! let mut puller = core::pin::pin!(puller);
+//! let handle = puller.as_mut().async_puller(); // Send + Sync
+//! let wrapper = handle.wrapper(puller.as_mut());
+//! let mut wrapper = core::pin::pin!(wrapper); // stays on this task/thread
+//! let value = wrapper.as_mut().next().await;
+//! ```
+//!
+//! A full push wakes the task and returns `Pending`; its scheduled re-poll
+//! observes the buffered value. The synchronous [`Puller::take_or_refill`]
+//! path does not register an ordinary task waker.
 
 #[cfg(test)]
 extern crate std;
@@ -42,10 +56,12 @@ compile_error!(
 
 use core::{
     cell::{Cell, UnsafeCell},
-    marker::PhantomData,
+    future::Future,
+    marker::{PhantomData, PhantomPinned},
     mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
+    task::{Context, Poll, Waker},
 };
 
 use spin::Mutex;
@@ -79,15 +95,48 @@ pub struct Pusher<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> {
     not_send_or_sync: PhantomData<*mut ()>,
 }
 
-/// The async half of a [`Coroutine`].
+/// The synchronous pull half of a [`Coroutine`].
 ///
-/// Only one puller can be created. [`Puller::next`] never returns `Pending`;
-/// an empty ring directly resumes the synchronous producer until it fills the
-/// ring and transfers back.
+/// Only one puller can be created. [`Puller::take_or_refill`] directly resumes
+/// the synchronous producer when the ring is empty, until it fills the ring
+/// and transfers back.
 pub struct Puller<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> {
     core: NonNull<Core<T, CAPACITY, STACK_SLOTS>>,
     marker: PhantomData<&'a mut Core<T, CAPACITY, STACK_SLOTS>>,
     not_send_or_sync: PhantomData<*mut ()>,
+}
+
+/// A `Send` and `Sync` handle for the async adapter of a [`Puller`].
+///
+/// This handle only owns task-waker registration; it never accesses values or
+/// machine contexts. The actual transfer remains confined to an
+/// [`AsyncPullerWrapper`], constructed from the original pinned puller on its
+/// owning thread.
+pub struct AsyncPuller<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> {
+    core_id: *const (),
+    state: NonNull<AsyncState>,
+    marker: PhantomData<&'a AsyncState>,
+    value: PhantomData<fn() -> T>,
+}
+
+/// The thread-pinned async adapter that performs intra-thread transfers.
+///
+/// Obtain this from [`AsyncPuller::wrapper`] and pin it for the lifetime of
+/// the task that polls its [`AsyncPullerWrapper::next`] futures. It is
+/// deliberately `!Send` and `!Sync`.
+pub struct AsyncPullerWrapper<'p, 'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> {
+    core: NonNull<Core<T, CAPACITY, STACK_SLOTS>>,
+    state: NonNull<AsyncState>,
+    puller: PhantomData<Pin<&'p mut Puller<'a, T, CAPACITY, STACK_SLOTS>>>,
+    not_send_or_sync: PhantomData<*mut ()>,
+    _pinned: PhantomPinned,
+}
+
+/// The proper async future returned by [`AsyncPullerWrapper::next`].
+pub struct AsyncNext<'w, 'p, 'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> {
+    wrapper: Pin<&'w mut AsyncPullerWrapper<'p, 'a, T, CAPACITY, STACK_SLOTS>>,
+    not_send_or_sync: PhantomData<*mut ()>,
+    _pinned: PhantomPinned,
 }
 
 #[repr(C, align(16))]
@@ -95,12 +144,34 @@ struct StackSlot([u8; STACK_SLOT_BYTES]);
 
 struct Core<T, const CAPACITY: usize, const STACK_SLOTS: usize> {
     ring: Mutex<Ring<T, CAPACITY>>,
+    async_state: AsyncState,
     producer_context: UnsafeCell<context::Context>,
     consumer_context: UnsafeCell<context::Context>,
     entry: UnsafeCell<Option<Entry>>,
     started: Cell<bool>,
     claimed: Cell<bool>,
+    async_wrapper_claimed: Cell<bool>,
     stack: [MaybeUninit<StackSlot>; STACK_SLOTS],
+}
+
+struct AsyncState {
+    task_waker: Mutex<Option<Waker>>,
+}
+
+impl AsyncState {
+    const fn new() -> Self {
+        Self {
+            task_waker: Mutex::new(None),
+        }
+    }
+
+    fn register(&self, waker: &Waker) {
+        *self.task_waker.lock() = Some(waker.clone());
+    }
+
+    fn take_waker(&self) -> Option<Waker> {
+        self.task_waker.lock().take()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -184,11 +255,13 @@ impl<T, const CAPACITY: usize, const STACK_SLOTS: usize> Core<T, CAPACITY, STACK
     const fn new() -> Self {
         Self {
             ring: Mutex::new(Ring::new()),
+            async_state: AsyncState::new(),
             producer_context: UnsafeCell::new(context::Context::EMPTY),
             consumer_context: UnsafeCell::new(context::Context::EMPTY),
             entry: UnsafeCell::new(None),
             started: Cell::new(false),
             claimed: Cell::new(false),
+            async_wrapper_claimed: Cell::new(false),
             stack: [const { MaybeUninit::uninit() }; STACK_SLOTS],
         }
     }
@@ -197,6 +270,25 @@ impl<T, const CAPACITY: usize, const STACK_SLOTS: usize> Core<T, CAPACITY, STACK
         // SAFETY: one-past-the-end is valid to form and is the aligned top of
         // the owned producer stack.
         unsafe { self.stack.as_ptr().add(STACK_SLOTS).cast::<u8>() as *mut u8 }
+    }
+
+    fn start_if_needed(&self) {
+        if !self.started.replace(true) {
+            // SAFETY: `puller` initializes entry exactly once before exposing
+            // either the direct puller or its async adapter.
+            let entry =
+                unsafe { (*self.entry.get()).expect("a puller always has a producer entry") };
+            // SAFETY: the producer context is initialized only for its first
+            // activation, before any transfer can restore it.
+            unsafe {
+                context::initialize(
+                    &mut *self.producer_context.get(),
+                    self.stack_top(),
+                    entry.call as *const () as usize,
+                    entry.data as usize,
+                );
+            }
+        }
     }
 }
 
@@ -305,12 +397,27 @@ impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> cirrus_core::Pusher
 }
 
 impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Puller<'a, T, CAPACITY, STACK_SLOTS> {
-    /// Pull the next FIFO value, starting or refilling the producer as needed.
-    pub async fn next(&mut self) -> T {
-        self.take_or_refill()
+    /// Return a `Send`/`Sync` handle for this puller's async adapter.
+    ///
+    /// Call [`AsyncPuller::wrapper`] with this same pinned puller to create
+    /// the thread-pinned adapter that owns the actual stack transfer.
+    pub fn async_puller(self: Pin<&mut Self>) -> AsyncPuller<'a, T, CAPACITY, STACK_SLOTS> {
+        // SAFETY: this merely reads the stable core pointer. Pinning is
+        // required because the handle can later create a context-switching
+        // wrapper from this puller.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: a Puller always points at its live owning Coroutine.
+        let core = unsafe { this.core.as_ref() };
+        AsyncPuller {
+            core_id: this.core.as_ptr().cast(),
+            state: NonNull::from(&core.async_state),
+            marker: PhantomData,
+            value: PhantomData,
+        }
     }
 
-    fn take_or_refill(&mut self) -> T {
+    /// Pull the next FIFO value, starting or refilling the producer as needed.
+    pub fn take_or_refill(&mut self) -> T {
         // SAFETY: Puller is the unique public handle to this core and its
         // lifetime is tied to the pinned coroutine that owns the storage.
         let core = unsafe { self.core.as_ref() };
@@ -318,20 +425,7 @@ impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Puller<'a, T, CAPAC
             return value;
         }
 
-        if !core.started.replace(true) {
-            // SAFETY: `puller` initializes entry exactly once before exposing
-            // this handle; this is the first activation of producer_context.
-            let entry =
-                unsafe { (*core.entry.get()).expect("a puller always has a producer entry") };
-            unsafe {
-                context::initialize(
-                    &mut *core.producer_context.get(),
-                    core.stack_top(),
-                    entry.call as *const () as usize,
-                    entry.data as usize,
-                );
-            }
-        }
+        core.start_if_needed();
 
         // `transfer` returns only after a full Pusher invokes its transfer
         // waker, restoring this saved pull continuation.
@@ -346,17 +440,151 @@ impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Puller<'a, T, CAPAC
     }
 }
 
+impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Copy
+    for AsyncPuller<'a, T, CAPACITY, STACK_SLOTS>
+{
+}
+
+impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Clone
+    for AsyncPuller<'a, T, CAPACITY, STACK_SLOTS>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// AsyncPuller only manipulates its isolated AsyncState, which is protected by
+// a spin mutex. It never dereferences Core or accesses T; wrapper creation
+// additionally requires the original thread-local Puller.
+unsafe impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Send
+    for AsyncPuller<'a, T, CAPACITY, STACK_SLOTS>
+{
+}
+
+unsafe impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Sync
+    for AsyncPuller<'a, T, CAPACITY, STACK_SLOTS>
+{
+}
+
+impl<'a, T, const CAPACITY: usize, const STACK_SLOTS: usize>
+    AsyncPuller<'a, T, CAPACITY, STACK_SLOTS>
+{
+    /// Bind this handle to its original pinned puller on the owning thread.
+    ///
+    /// Only one wrapper can exist at a time. The wrapper, rather than this
+    /// handle, is `!Send` and `!Sync` because it can save a live return
+    /// context during an intra-thread transfer.
+    pub fn wrapper<'p>(
+        &self,
+        puller: Pin<&'p mut Puller<'a, T, CAPACITY, STACK_SLOTS>>,
+    ) -> AsyncPullerWrapper<'p, 'a, T, CAPACITY, STACK_SLOTS> {
+        // SAFETY: the wrapper borrows the pinned puller for 'p, preventing a
+        // concurrent direct pull, and reads only its stable core pointer.
+        let puller = unsafe { puller.get_unchecked_mut() };
+        assert_eq!(
+            puller.core.as_ptr().cast::<()>().cast_const(),
+            self.core_id,
+            "an async handle must be wrapped by its originating puller"
+        );
+        // SAFETY: the pointer belongs to the same live core checked above.
+        let core = unsafe { puller.core.as_ref() };
+        assert!(
+            !core.async_wrapper_claimed.replace(true),
+            "an async puller has exactly one active wrapper"
+        );
+
+        AsyncPullerWrapper {
+            core: puller.core,
+            state: self.state,
+            puller: PhantomData,
+            not_send_or_sync: PhantomData,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+impl<'p, 'a, T, const CAPACITY: usize, const STACK_SLOTS: usize>
+    AsyncPullerWrapper<'p, 'a, T, CAPACITY, STACK_SLOTS>
+{
+    /// Create a future that awaits the next FIFO value.
+    pub fn next(self: Pin<&mut Self>) -> AsyncNext<'_, 'p, 'a, T, CAPACITY, STACK_SLOTS> {
+        AsyncNext {
+            wrapper: self,
+            not_send_or_sync: PhantomData,
+            _pinned: PhantomPinned,
+        }
+    }
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        // SAFETY: this wrapper is created only from the unique Puller and is
+        // pinned for every poll that could save its return context.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: the unique wrapper's borrow prevents direct concurrent use
+        // of Puller, and its core outlives the wrapper.
+        let core = unsafe { this.core.as_ref() };
+
+        if let Some(value) = core.ring.lock().pop() {
+            return Poll::Ready(value);
+        }
+
+        // Register before resuming the producer. A full push takes and wakes
+        // this Waker before restoring the wrapper's saved continuation.
+        // SAFETY: state belongs to the same live Core as `core`.
+        unsafe { this.state.as_ref() }.register(cx.waker());
+        core.start_if_needed();
+
+        // A full Pusher wakes the task then restores this continuation. The
+        // wrapper deliberately returns Pending instead of consuming the value
+        // in this poll; the executor's next poll observes the buffered value.
+        unsafe {
+            context::transfer(core.consumer_context.get(), core.producer_context.get());
+        }
+        Poll::Pending
+    }
+}
+
+impl<'p, 'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Drop
+    for AsyncPullerWrapper<'p, 'a, T, CAPACITY, STACK_SLOTS>
+{
+    fn drop(&mut self) {
+        // SAFETY: the wrapper's borrow proves that this core is still live.
+        let core = unsafe { self.core.as_ref() };
+        core.async_wrapper_claimed.set(false);
+    }
+}
+
+impl<'w, 'p, 'a, T, const CAPACITY: usize, const STACK_SLOTS: usize> Future
+    for AsyncNext<'w, 'p, 'a, T, CAPACITY, STACK_SLOTS>
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: AsyncNext is !Unpin and delegates its pinned wrapper to the
+        // only code path that saves/restores the consumer continuation.
+        let this = unsafe { self.get_unchecked_mut() };
+        this.wrapper.as_mut().poll_next(cx)
+    }
+}
+
 struct TransferWaker<T, const CAPACITY: usize, const STACK_SLOTS: usize> {
     core: NonNull<Core<T, CAPACITY, STACK_SLOTS>>,
 }
 
 impl<T, const CAPACITY: usize, const STACK_SLOTS: usize> TransferWaker<T, CAPACITY, STACK_SLOTS> {
-    /// Resume the saved pull continuation. This is intentionally distinct from
-    /// `core::task::Waker`: it performs a non-scheduling symmetric transfer.
+    /// Notify an async task when registered, then resume the saved pull
+    /// continuation through a non-scheduling symmetric transfer.
     unsafe fn wake(self) {
         // SAFETY: Pusher runs only after Puller has saved consumer_context, and
         // `switch` restores that context before this function can return.
         let core = unsafe { self.core.as_ref() };
+        if core.async_wrapper_claimed.get() {
+            if let Some(waker) = core.async_state.take_waker() {
+                // `take_waker` releases its mutex before calling arbitrary
+                // task wake logic, which may immediately schedule another
+                // poll.
+                waker.wake();
+            }
+        }
         unsafe {
             context::transfer(core.producer_context.get(), core.consumer_context.get());
         }
@@ -791,32 +1019,12 @@ mod tests {
         future::Future,
         mem::ManuallyDrop,
         pin::Pin,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        task::{Context, Poll, Waker},
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn raw_waker() -> RawWaker {
-        fn clone(_: *const ()) -> RawWaker {
-            raw_waker()
-        }
-        fn wake(_: *const ()) {}
-        fn wake_by_ref(_: *const ()) {}
-        fn drop(_: *const ()) {}
-        RawWaker::new(
-            core::ptr::null(),
-            &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
-        )
-    }
-
-    fn block_on_ready<F: Future>(future: F) -> F::Output {
-        let waker = unsafe { Waker::from_raw(raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = core::pin::pin!(future);
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("Puller::next must complete in its first poll"),
-        }
-    }
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn numbers(pusher: &mut Pusher<'_, u32, 2, 64>) {
         let mut next = 0;
@@ -835,7 +1043,7 @@ mod tests {
         let mut puller = pinned.puller();
 
         for expected in 0..32 {
-            assert_eq!(block_on_ready(puller.next()), expected);
+            assert_eq!(puller.take_or_refill(), expected);
         }
     }
 
@@ -865,8 +1073,8 @@ mod tests {
         let pinned = unsafe { Pin::new_unchecked(&mut *coroutine) };
         let mut puller = pinned.puller();
 
-        let first = block_on_ready(puller.next());
-        let second = block_on_ready(puller.next());
+        let first = puller.take_or_refill();
+        let second = puller.take_or_refill();
         assert_eq!((first.0, second.0), (0, 1));
         drop(first);
         drop(second);
@@ -889,7 +1097,64 @@ mod tests {
         let mut puller = pinned.puller();
 
         for expected in 0..32 {
-            assert_eq!(block_on_ready(puller.next()), expected);
+            assert_eq!(puller.take_or_refill(), expected);
+        }
+    }
+
+    struct CountWaker(AtomicUsize);
+
+    impl std::task::Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn poll_once<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+        let mut context = Context::from_waker(waker);
+        future.as_mut().poll(&mut context)
+    }
+
+    fn requires_send_and_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn async_wrapper_notifies_then_returns_buffered_values() {
+        let mut coroutine = ManuallyDrop::new(Coroutine::new(numbers));
+        // SAFETY: ManuallyDrop prevents the intentional started-coroutine drop
+        // panic at the end of this test; the stack remains valid throughout.
+        let pinned = unsafe { Pin::new_unchecked(&mut *coroutine) };
+        let puller = pinned.puller();
+        let mut puller = core::pin::pin!(puller);
+        let handle = puller.as_mut().async_puller();
+        requires_send_and_sync::<AsyncPuller<'static, u32, 2, 64>>();
+        let wrapper = handle.wrapper(puller.as_mut());
+        let mut wrapper = core::pin::pin!(wrapper);
+        let count = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+
+        {
+            let future = wrapper.as_mut().next();
+            let mut future = core::pin::pin!(future);
+            assert!(matches!(poll_once(future.as_mut(), &waker), Poll::Pending));
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(poll_once(future.as_mut(), &waker), Poll::Ready(0)));
+        }
+
+        {
+            let future = wrapper.as_mut().next();
+            let mut future = core::pin::pin!(future);
+            assert!(matches!(poll_once(future.as_mut(), &waker), Poll::Ready(1)));
+        }
+
+        {
+            let future = wrapper.as_mut().next();
+            let mut future = core::pin::pin!(future);
+            assert!(matches!(poll_once(future.as_mut(), &waker), Poll::Pending));
+            assert_eq!(count.0.load(Ordering::SeqCst), 2);
+            assert!(matches!(poll_once(future.as_mut(), &waker), Poll::Ready(2)));
         }
     }
 
@@ -916,10 +1181,7 @@ mod tests {
         let mut scale = 1.5f64;
 
         for _ in 0..32 {
-            assert_eq!(
-                block_on_ready(puller.next()).to_bits(),
-                (value * scale).to_bits()
-            );
+            assert_eq!(puller.take_or_refill().to_bits(), (value * scale).to_bits());
             value += 0.125;
             scale += 0.03125;
         }

@@ -1,14 +1,9 @@
 #![no_std]
 #![no_main]
 
-use core::{
-    future::Future,
-    panic::PanicInfo,
-    pin::Pin,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-};
+use core::panic::PanicInfo;
 
-use cirrus_coroutine::{Coroutine, Puller, Pusher};
+use cirrus_coroutine::{Coroutine, Pusher};
 
 struct QemuCriticalSection;
 
@@ -90,33 +85,6 @@ extern "C" fn rust_main() -> ! {
     run_integer();
 }
 
-fn raw_waker() -> RawWaker {
-    fn clone(_: *const ()) -> RawWaker {
-        raw_waker()
-    }
-    fn wake(_: *const ()) {}
-    fn wake_by_ref(_: *const ()) {}
-    fn drop(_: *const ()) {}
-
-    RawWaker::new(
-        core::ptr::null(),
-        &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
-    )
-}
-
-fn next<T, const CAPACITY: usize, const STACK_SLOTS: usize>(
-    puller: &mut Puller<'_, T, CAPACITY, STACK_SLOTS>,
-) -> T {
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut context = Context::from_waker(&waker);
-    let future = puller.next();
-    let mut future = core::pin::pin!(future);
-    match Future::poll(Pin::as_mut(&mut future), &mut context) {
-        Poll::Ready(value) => value,
-        Poll::Pending => finish(0xfffd),
-    }
-}
-
 #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 fn integer_producer(pusher: &mut Pusher<'_, u64, 2, 128>) {
     // Retain enough live scalar state across each push to exercise ordinary
@@ -145,7 +113,7 @@ fn run_integer() -> ! {
     let mut puller = coroutine.as_mut().puller();
 
     for expected in 0..64 {
-        if next(&mut puller) != expected {
+        if puller.take_or_refill() != expected {
             finish(0x1000 + expected as u32);
         }
     }
@@ -181,7 +149,7 @@ fn run_floating() -> ! {
     let mut c = 2.75f64;
     let mut d = 4.5f64;
     for index in 0..64 {
-        let actual = next(&mut puller);
+        let actual = puller.take_or_refill();
         let expected = a + b + c + d;
         if actual.to_bits() != expected.to_bits() {
             finish(0x2000 + index);
