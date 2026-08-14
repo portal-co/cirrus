@@ -20,15 +20,19 @@ cargo test -p cirrus-garbled-circuit-row-reduced --test thumb_sha256
 
 ## Deterministic table traffic
 
-The test locks the workload at 164,288 non-free gates and uses 16-byte labels.
+The test locks the workload at 124,160 non-free gates and uses 16-byte labels.
+(The ERT interpreters constant-fold arithmetic/bitwise ops whose operands are
+both already known, materializing the result from the `zero`/`one` wires
+instead of emitting gates; this dropped the count from an earlier
+164,288-gate baseline.)
 
 | Format | Rows per gate | Bytes per gate | Total table bytes | Change from four rows |
 | --- | ---: | ---: | ---: | ---: |
-| Stable four-row baseline | 4 | 64 | 10,514,432 (10.03 MiB) | — |
-| First-row-fixed experiment | 3 | 48 | 7,885,824 (7.52 MiB) | -2,628,608 bytes (-25%) |
+| Stable four-row baseline | 4 | 64 | 7,946,240 (7.58 MiB) | — |
+| First-row-fixed experiment | 3 | 48 | 5,959,680 (5.68 MiB) | -1,986,560 bytes (-25%) |
 
 The test intentionally records all three-row tables in a host `Vec` so that a
-fresh evaluator can replay them. That 7.52 MiB allocation is **not** a target
+fresh evaluator can replay them. That 5.68 MiB allocation is **not** a target
 RAM requirement. A deployment must stream each 48-byte record to its server
 sink, with only an integrator-defined transport frame and backpressure buffer.
 
@@ -38,7 +42,7 @@ selected output labels for decoding. Retaining both labels for these input
 wires takes 16 KiB before any protocol-specific preprocessing material.
 
 At one million reuses, the one-time three-row table stream amortizes to about
-7.9 bytes per evaluation, excluding persistence, framing, input labels, and
+6.0 bytes per evaluation, excluding persistence, framing, input labels, and
 protocol messages. This makes reusable garbling materially attractive only if
 the server persists the table stream and the device can retain or regenerate
 the required input/output-label material.
@@ -85,4 +89,4 @@ The next practical measurements are:
 3. Keep the four-row baseline and this row-reduced format interoperable only
    through their own evaluator tests. A TinyLabels implementation belongs in a
    separate crate: it targets selected input-label compression, not this
-   7.52 MiB table stream.
+   5.68 MiB table stream.

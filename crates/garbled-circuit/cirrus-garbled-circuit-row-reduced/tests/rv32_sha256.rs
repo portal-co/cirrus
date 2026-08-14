@@ -8,19 +8,19 @@ use std::{
     vec::Vec,
 };
 
-use cirrus_armv8m_ert::{RawMemory, ert_func};
 use cirrus_core::Pusher;
+use cirrus_ert::{RawMemory, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 use cirrus_garbled_circuit_row_reduced::{Evaluator, GC, GarblingRecord, Label};
 use digest::{OutputSizeUser, array::Array};
 use sha2::Sha256;
 
-const BASE: u32 = 0x2000_0000;
+const BASE: u32 = 0x8000_0000;
 const INPUT: [u32; 16] = [0x6162_6380, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24];
-// The Thumb workload touches 1,408 labels; 2,048 leaves a stable 640-label
-// caller margin while keeping the host replay representative of an embedded
-// symbolic-stack budget.
-const STACK_SLOTS: usize = 2_048;
+// The RV32IM workload touches 1,248 labels; 4,096 leaves a stable margin
+// while keeping the host replay representative of an embedded symbolic-stack
+// budget.
+const STACK_SLOTS: usize = 4_096;
 
 struct Records<const N: usize>(Vec<[[u8; N]; 3]>);
 
@@ -76,8 +76,8 @@ fn ensure_target(target: &str) {
 }
 
 fn build_self_test() -> PathBuf {
-    const PACKAGE: &str = "cirrus-armv8m-ert-selftest";
-    const TARGET: &str = "thumbv8m.main-none-eabi";
+    const PACKAGE: &str = "cirrus-ert-selftest";
+    const TARGET: &str = "riscv32im-unknown-none-elf";
     ensure_target(TARGET);
     let root = workspace_root();
     let target_dir = root
@@ -275,11 +275,11 @@ fn bool_no_hash(_: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
 }
 
 #[test]
-fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
+fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let image = build_self_test();
-    let elf = fs::read(image).expect("built ARM ELF is readable");
+    let elf = fs::read(image).expect("built RV32 ELF is readable");
     let mapping = mapped_image(&elf, &[".text.ert_workload", ".rodata.ert_workload"]);
-    let entry = symbol_address(&elf, "__ert_workload_entry") | 1;
+    let entry = symbol_address(&elf, "__ert_workload_entry");
     let memory = mapped_memory(&mapping);
     let expected = sha256_compress(
         INPUT[0], INPUT[1], INPUT[2], INPUT[3], INPUT[4], INPUT[5], INPUT[6], INPUT[7], INPUT[8],
@@ -292,9 +292,9 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let garbling_zero = Label::new(zero);
     let garbling_one = garbling_zero.not();
 
-    let mut bool_registers = [[false; 32]; 16];
-    let mut bool_constants = [None; 16];
-    let mut bool_rstack = [u32::MAX; 512];
+    let mut bool_registers = [[false; 32]; 32];
+    let mut bool_constants = [None; 32];
+    let mut bool_rstack = [0; 512];
     let mut bool_vstack = vec![false; STACK_SLOTS];
     let mut bool_context = ();
     let mut bool_hash = bool_no_hash;
@@ -313,7 +313,7 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     );
     assert!(
         bool_result.is_ok(),
-        "the host-mapped Thumb image executes natively"
+        "the host-mapped RV32 image executes natively"
     );
     let bool_result = match bool_result {
         Ok(result) => result,
@@ -321,9 +321,9 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     };
     assert_eq!(bool_result[1], (bool_word(expected), None));
 
-    let mut garbled_registers = [[garbling_zero; 32]; 16];
-    let mut garbled_constants = [None; 16];
-    let mut garbled_rstack = [u32::MAX; 512];
+    let mut garbled_registers = [[garbling_zero; 32]; 32];
+    let mut garbled_constants = [None; 32];
+    let mut garbled_rstack = [0; 512];
     let stack_sentinel = Label::new([0xa5; 16]);
     let mut garbled_vstack = vec![stack_sentinel; STACK_SLOTS];
     let mut records = Records::new();
@@ -347,7 +347,7 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let garbling_elapsed = started.elapsed();
     assert!(
         garbled.is_ok(),
-        "the locked Thumb workload garbles successfully"
+        "the locked RV32 workload garbles successfully"
     );
     let garbled = match garbled {
         Ok(result) => result,
@@ -355,7 +355,7 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     };
     drop(garbler);
     let tables = records.0.len();
-    assert_eq!(tables, 124_160, "the locked workload's AND count is stable");
+    assert_eq!(tables, 358_752, "the locked workload's AND count is stable");
     let touched_stack_slots = garbled_vstack
         .iter()
         .position(|label| *label != stack_sentinel)
@@ -363,16 +363,16 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
         .unwrap_or(0);
     let return_stack_slots = garbled_rstack
         .iter()
-        .rposition(|slot| *slot != u32::MAX)
+        .rposition(|slot| *slot != 0)
         .map(|last_touched| last_touched + 1)
         .unwrap_or(0);
     assert_eq!(core::mem::size_of::<Label<16>>(), 16);
-    assert_eq!(touched_stack_slots, 1_408);
+    assert_eq!(touched_stack_slots, 1_248);
     assert_eq!(return_stack_slots, 2);
 
-    let mut evaluated_registers = [[zero; 32]; 16];
-    let mut evaluated_constants = [None; 16];
-    let mut evaluated_rstack = [u32::MAX; 512];
+    let mut evaluated_registers = [[zero; 32]; 32];
+    let mut evaluated_constants = [None; 32];
+    let mut evaluated_rstack = [0; 512];
     let mut evaluated_vstack = vec![[0xa5; 16]; STACK_SLOTS];
     let mut evaluator =
         Evaluator::<Sha256, _, 16>::new(records.0.into_iter().map(GarblingRecord::Table));
@@ -420,8 +420,8 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     }
 
     let table_bytes = tables * 3 * 16;
-    assert_eq!(table_bytes, 5_959_680);
+    assert_eq!(table_bytes, 17_220_096);
     eprintln!(
-        "Thumb SHA-256 three-row GC: tables={tables}, table_bytes={table_bytes}, touched_stack_slots={touched_stack_slots}, return_stack_slots={return_stack_slots}, garbling={garbling_elapsed:?}, evaluation={evaluation_elapsed:?}"
+        "RV32 SHA-256 three-row GC: tables={tables}, table_bytes={table_bytes}, touched_stack_slots={touched_stack_slots}, return_stack_slots={return_stack_slots}, garbling={garbling_elapsed:?}, evaluation={evaluation_elapsed:?}"
     );
 }

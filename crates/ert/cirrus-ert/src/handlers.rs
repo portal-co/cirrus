@@ -162,6 +162,11 @@ fn add_immediate<W: Clone, E: core::error::Error>(
         machine.offs[dest.0 as usize] = Some(offset.wrapping_add(imm.as_i32()));
     }
 
+    if let Some(value) = machine.reg_consts[src1.0 as usize] {
+        machine.write_constant(dest, value.wrapping_add_signed(imm.as_i32()));
+        return next(machine);
+    }
+
     let word = array::from_fn(|i| {
         if (imm.as_i32() as u32 >> i) & 1 == 1 {
             machine.one.clone()
@@ -176,10 +181,7 @@ fn add_immediate<W: Clone, E: core::error::Error>(
         machine.zero.clone(),
     )
     .map_err(ErtError::Emitted)?;
-    machine.reg_consts[dest.0 as usize] = match machine.reg_consts[src1.0 as usize] {
-        Some(value) => Some(value.wrapping_add_signed(imm.as_i32())),
-        None => None,
-    };
+    machine.reg_consts[dest.0 as usize] = None;
     next(machine)
 }
 
@@ -207,6 +209,14 @@ fn add<W: Clone, E: core::error::Error>(
         }
     }
 
+    if let (Some(a), Some(b)) = (
+        machine.reg_consts[src1.0 as usize],
+        machine.reg_consts[src2.0 as usize],
+    ) {
+        machine.write_constant(dest, a.wrapping_add(b));
+        return next(machine);
+    }
+
     machine.regs[dest.0 as usize] = add_bits(
         machine.t,
         &machine.regs[src1.0 as usize],
@@ -214,13 +224,7 @@ fn add<W: Clone, E: core::error::Error>(
         machine.zero.clone(),
     )
     .map_err(ErtError::Emitted)?;
-    machine.reg_consts[dest.0 as usize] = match (
-        machine.reg_consts[src1.0 as usize],
-        machine.reg_consts[src2.0 as usize],
-    ) {
-        (Some(a), Some(b)) => Some(a.wrapping_add(b)),
-        _ => None,
-    };
+    machine.reg_consts[dest.0 as usize] = None;
     next(machine)
 }
 
@@ -248,6 +252,21 @@ fn subtract<W: Clone, E: core::error::Error>(
         }
     }
 
+    let concrete = match (machine.offs[src1.0 as usize], machine.offs[src2.0 as usize]) {
+        (Some(a), Some(b)) => Some(a.wrapping_sub(b) as u32),
+        _ => match (
+            machine.reg_consts[src1.0 as usize],
+            machine.reg_consts[src2.0 as usize],
+        ) {
+            (Some(a), Some(b)) => Some(a.wrapping_sub(b)),
+            _ => None,
+        },
+    };
+    if let Some(value) = concrete {
+        machine.write_constant(dest, value);
+        return next(machine);
+    }
+
     let mut left = machine.regs[src1.0 as usize].clone();
     for bit in &mut left {
         *bit = machine
@@ -262,17 +281,7 @@ fn subtract<W: Clone, E: core::error::Error>(
         machine.one.clone(),
     )
     .map_err(ErtError::Emitted)?;
-    machine.reg_consts[dest.0 as usize] =
-        match (machine.offs[src1.0 as usize], machine.offs[src2.0 as usize]) {
-            (Some(a), Some(b)) => Some(a.wrapping_sub(b) as u32),
-            _ => match (
-                machine.reg_consts[src1.0 as usize],
-                machine.reg_consts[src2.0 as usize],
-            ) {
-                (Some(a), Some(b)) => Some(a.wrapping_sub(b)),
-                _ => None,
-            },
-        };
+    machine.reg_consts[dest.0 as usize] = None;
     next(machine)
 }
 
@@ -284,17 +293,21 @@ fn bitwise<W: Clone, E: core::error::Error>(
     operation: BitOp,
 ) -> Result<Flow, ErtError<E>> {
     machine.offs[dest.0 as usize] = None;
-    machine.reg_consts[dest.0 as usize] = match (
+    if let (Some(a), Some(b)) = (
         machine.reg_consts[src1.0 as usize],
         machine.reg_consts[src2.0 as usize],
     ) {
-        (Some(a), Some(b)) => Some(match operation {
-            BitOp::And => a & b,
-            BitOp::Or => a | b,
-            BitOp::Xor => a ^ b,
-        }),
-        _ => None,
-    };
+        machine.write_constant(
+            dest,
+            match operation {
+                BitOp::And => a & b,
+                BitOp::Or => a | b,
+                BitOp::Xor => a ^ b,
+            },
+        );
+        return next(machine);
+    }
+    machine.reg_consts[dest.0 as usize] = None;
     for bit in 0..32 {
         machine.regs[dest.0 as usize][bit] = match operation {
             BitOp::And => machine.t.bitand(
@@ -338,7 +351,8 @@ fn bitwise_immediate<W: Clone, E: core::error::Error>(
             }
         } else {
             match operation {
-                BitOp::And | BitOp::Or => machine.one.clone(),
+                BitOp::And => machine.regs[src1.0 as usize][bit].clone(),
+                BitOp::Or => machine.one.clone(),
                 BitOp::Xor => machine
                     .t
                     .bitxor(

@@ -301,6 +301,7 @@ fn arithmetic_immediates_and_shifts_preserve_concrete_tracking() {
     assert_eq!(constants[Reg::T0.0 as usize], Some(0x8000_0006));
     assert_eq!(constants[Reg::T3.0 as usize], Some(6));
     assert_eq!(constants[Reg::T4.0 as usize], Some(3));
+    assert_eq!(value(&regs[Reg::T4.0 as usize]), 3);
     assert_eq!(constants[Reg::T5.0 as usize], Some(5));
     assert_eq!(constants[Reg::T2.0 as usize], Some(10));
     assert_eq!(constants[Reg::T1.0 as usize], Some(0x4000_0001));

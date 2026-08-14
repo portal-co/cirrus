@@ -623,8 +623,6 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             } => {
                 let (left_word, left_value) = self.operand(left)?;
                 let (right_word, right_value) = self.operand(right)?;
-                let word = bitwise_word(self.t, &left_word, &right_word, kind)
-                    .map_err(ErtError::Emitted)?;
                 let value = match (left_value, right_value) {
                     (Some(left), Some(right)) => Some(match kind {
                         BitOp::And => left & right,
@@ -632,6 +630,11 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         BitOp::Xor => left ^ right,
                     }),
                     _ => None,
+                };
+                let word = if let Some(value) = value {
+                    self.word_from_constant(value)
+                } else {
+                    bitwise_word(self.t, &left_word, &right_word, kind).map_err(ErtError::Emitted)?
                 };
                 self.write(dest, word, value);
                 if set_flags {
@@ -647,13 +650,17 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             } => {
                 let (left_word, left_value) = self.operand(left)?;
                 let (right_word, right_value) = self.operand(right)?;
-                let inverted = invert_word(self.t, &right_word, self.one.clone())
-                    .map_err(ErtError::Emitted)?;
-                let word = bitwise_word(self.t, &left_word, &inverted, BitOp::And)
-                    .map_err(ErtError::Emitted)?;
                 let value = left_value
                     .zip(right_value)
                     .map(|(left, right)| left & !right);
+                let word = if let Some(value) = value {
+                    self.word_from_constant(value)
+                } else {
+                    let inverted = invert_word(self.t, &right_word, self.one.clone())
+                        .map_err(ErtError::Emitted)?;
+                    bitwise_word(self.t, &left_word, &inverted, BitOp::And)
+                        .map_err(ErtError::Emitted)?
+                };
                 self.write(dest, word, value);
                 if set_flags {
                     self.set_nz(value);
@@ -931,12 +938,6 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 (right_word, inverted, right_value, left_value, true)
             }
         };
-        let carry = if subtraction && matches!(kind, Arithmetic::Sub | Arithmetic::ReverseSub) {
-            self.one.clone()
-        } else {
-            carry
-        };
-        let word = add_bits(self.t, &left_word, &right_word, carry).map_err(ErtError::Emitted)?;
         let value = match kind {
             Arithmetic::Add => left_value
                 .zip(right_value)
@@ -959,6 +960,17 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             Arithmetic::ReverseSub => left_value
                 .zip(right_value)
                 .map(|(left, right)| right.wrapping_sub(left)),
+        };
+        let word = if let Some(value) = value {
+            self.word_from_constant(value)
+        } else {
+            let carry = if subtraction && matches!(kind, Arithmetic::Sub | Arithmetic::ReverseSub)
+            {
+                self.one.clone()
+            } else {
+                carry
+            };
+            add_bits(self.t, &left_word, &right_word, carry).map_err(ErtError::Emitted)?
         };
         if dest == SP {
             let new_sp = match (kind, left, right) {
@@ -1024,39 +1036,52 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         let right_word = self.regs[right as usize].clone();
         let left_value = self.constants[left as usize];
         let right_value = self.constants[right as usize];
-        let mut word = multiply_word(
-            self.t,
-            &left_word,
-            &right_word,
-            left_value,
-            right_value,
-            Product::Low,
-            &self.zero,
-            &self.one,
-        )
-        .map_err(ErtError::Emitted)?;
-        let mut value = left_value
+        let product_value = left_value
             .zip(right_value)
             .map(|(left, right)| left.wrapping_mul(right));
-        if let Some(add) = add {
-            let add_word = self.regs[add as usize].clone();
-            let add_value = self.constants[add as usize];
-            if subtract {
-                let inverted =
-                    invert_word(self.t, &word, self.one.clone()).map_err(ErtError::Emitted)?;
-                word = add_bits(self.t, &add_word, &inverted, self.one.clone())
-                    .map_err(ErtError::Emitted)?;
-                value = add_value
-                    .zip(value)
-                    .map(|(add, product)| add.wrapping_sub(product));
-            } else {
-                word = add_bits(self.t, &word, &add_word, self.zero.clone())
-                    .map_err(ErtError::Emitted)?;
-                value = value
-                    .zip(add_value)
-                    .map(|(product, add)| product.wrapping_add(add));
+        let (add_word, add_value) = match add {
+            Some(add) => (
+                Some(self.regs[add as usize].clone()),
+                self.constants[add as usize],
+            ),
+            None => (None, None),
+        };
+        let value = match add {
+            Some(_) if subtract => add_value
+                .zip(product_value)
+                .map(|(add, product)| add.wrapping_sub(product)),
+            Some(_) => product_value
+                .zip(add_value)
+                .map(|(product, add)| product.wrapping_add(add)),
+            None => product_value,
+        };
+        let word = if let Some(value) = value {
+            self.word_from_constant(value)
+        } else {
+            let mut word = multiply_word(
+                self.t,
+                &left_word,
+                &right_word,
+                left_value,
+                right_value,
+                Product::Low,
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?;
+            if let Some(add_word) = add_word {
+                word = if subtract {
+                    let inverted =
+                        invert_word(self.t, &word, self.one.clone()).map_err(ErtError::Emitted)?;
+                    add_bits(self.t, &add_word, &inverted, self.one.clone())
+                        .map_err(ErtError::Emitted)?
+                } else {
+                    add_bits(self.t, &word, &add_word, self.zero.clone())
+                        .map_err(ErtError::Emitted)?
+                };
             }
-        }
+            word
+        };
         self.write(dest, word, value);
         self.next(len)
     }
