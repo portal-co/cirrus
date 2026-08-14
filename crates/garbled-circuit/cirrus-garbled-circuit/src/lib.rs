@@ -1208,7 +1208,7 @@ mod tests {
         const BASE: u32 = 0x8000_0000;
         const STACK_SLOTS: usize = 65_536;
         let elf = fs::read(image).expect("built RV32 ELF is readable");
-        let mapping = mapped_image(&elf, BASE, &[".text", ".rodata"]);
+        let mapping = mapped_image(&elf, BASE, &[".text.ert_workload", ".rodata.ert_workload"]);
         let entry = symbol_address(&elf, "__ert_workload_entry");
         let memory = mapped_memory(&mapping, BASE);
         let zero = Label::new([0; N]);
