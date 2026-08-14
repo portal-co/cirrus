@@ -35,7 +35,7 @@
 #[cfg(test)]
 extern crate std;
 
-use core::{array, convert::Infallible};
+use core::{array, convert::Infallible, fmt, marker::PhantomData};
 
 use cirrus_core::{
     Bit, ContextWithAdd, ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithMul,
@@ -52,6 +52,153 @@ pub struct GC<'a, 'b, D: Digest, const N: usize> {
     /// The global free-XOR offset; its low bit must be set by the caller.
     pub delta: Array<u8, D::OutputSize>,
 }
+
+/// One record in the baseline garbling stream.
+///
+/// The baseline presently emits only four-row tables. Future backends may have
+/// different record types, including hints, but retain the same pull-based
+/// evaluator shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GarblingRecord<const N: usize> {
+    /// A four-row AND table in the order emitted by [`GC`].
+    Table([[u8; N]; 4]),
+}
+
+/// An error while replaying a garbling stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvaluationError {
+    /// An AND operation required a table after the record iterator ended.
+    Exhausted,
+}
+
+impl fmt::Display for EvaluationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exhausted => formatter.write_str("garbling record iterator is exhausted"),
+        }
+    }
+}
+
+impl core::error::Error for EvaluationError {}
+
+/// A pull-based evaluator for the four-row baseline garbling format.
+///
+/// The evaluator consumes exactly one [`GarblingRecord::Table`] for every AND
+/// operation and none for XOR. It is a host-side completeness adapter, not a
+/// network protocol, authentication mechanism, or durable table buffer.
+/// `N` is the nonzero byte width of a wire label. The matching [`GC`] run
+/// propagates zero labels; the evaluator starts from the selected input labels.
+pub struct Evaluator<I, const N: usize> {
+    records: I,
+    marker: PhantomData<[u8; N]>,
+}
+
+impl<I, const N: usize> Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    /// Construct an evaluator that pulls ordered records from `records`.
+    pub fn new(records: I) -> Self {
+        Self {
+            records,
+            marker: PhantomData,
+        }
+    }
+
+    fn next_table(&mut self) -> Result<[[u8; N]; 4], EvaluationError> {
+        match self.records.next() {
+            Some(GarblingRecord::Table(table)) => Ok(table),
+            None => Err(EvaluationError::Exhausted),
+        }
+    }
+}
+
+impl<I, const N: usize> HasError for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    type Error = EvaluationError;
+}
+
+impl<I, const N: usize> ContextWithValue<bool> for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    type Wrapped = [u8; N];
+}
+
+impl<I, const N: usize> ContextWithBitXor<bool> for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    fn bitxor(
+        &mut self,
+        left: <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<<Self as ContextWithValue<bool>>::Wrapped, Self::Error> {
+        Ok(array::from_fn(|index| left[index] ^ right[index]))
+    }
+
+    fn bitxor_assign(
+        &mut self,
+        left: &mut <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<(), Self::Error> {
+        for (left, right) in left.iter_mut().zip(right) {
+            *left ^= right;
+        }
+        Ok(())
+    }
+}
+
+impl<I, const N: usize> ContextWithBitAnd<bool> for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    fn bitand(
+        &mut self,
+        left: <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<<Self as ContextWithValue<bool>>::Wrapped, Self::Error> {
+        let table = self.next_table()?;
+        let row = usize::from(left[0] & 1 == 0) | (usize::from(right[0] & 1 == 0) << 1);
+        Ok(table[row])
+    }
+
+    fn bitand_assign(
+        &mut self,
+        left: &mut <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<(), Self::Error> {
+        *left = self.bitand(*left, right)?;
+        Ok(())
+    }
+}
+
+impl<I, const N: usize> ContextWithBitOr<bool> for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    fn bitor(
+        &mut self,
+        left: <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<<Self as ContextWithValue<bool>>::Wrapped, Self::Error> {
+        let either = self.bitxor(left, right)?;
+        let both = self.bitand(left, right)?;
+        self.bitxor(either, both)
+    }
+
+    fn bitor_assign(
+        &mut self,
+        left: &mut <Self as ContextWithValue<bool>>::Wrapped,
+        right: <Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<(), Self::Error> {
+        *left = self.bitor(*left, right)?;
+        Ok(())
+    }
+}
+
 impl<D: Digest, const N: usize> HasError for GC<'_, '_, D, N> {
     type Error = Infallible;
 }
@@ -221,7 +368,7 @@ mod tests {
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
-    use super::GC;
+    use super::{EvaluationError, Evaluator, GC, GarblingRecord};
 
     #[derive(Default)]
     struct RecordedTables<const N: usize> {
@@ -387,6 +534,10 @@ mod tests {
         Ok([0; 32])
     }
 
+    fn evaluator_no_hash<const N: usize>(_: &[[[u8; N]; 32]]) -> Result<[u8; 32], EvaluationError> {
+        Ok([0; 32])
+    }
+
     fn encoded_label(zero_label: [u8; 16], value: bool) -> [u8; 16] {
         array::from_fn(|byte| zero_label[byte] ^ if value && byte == 0 { 1 } else { 0 })
     }
@@ -438,6 +589,123 @@ mod tests {
                 assert_eq!(actual, encoded_label(result, left & right));
             }
         }
+    }
+
+    #[test]
+    fn evaluator_replays_and_labels_from_an_iterator() {
+        let mut tables = RecordedTables::default();
+        let mut gc = context(&mut tables);
+        let zero_label = gc.bitand([0; 16], [0; 16]).expect("garbling cannot fail");
+        drop(gc);
+
+        let table = tables.tables[0];
+        let mut evaluator = Evaluator::new([table; 4].into_iter().map(GarblingRecord::Table));
+        for left in [false, true] {
+            for right in [false, true] {
+                assert_eq!(
+                    evaluator
+                        .bitand(encoded_label([0; 16], left), encoded_label([0; 16], right))
+                        .expect("the matching table is available"),
+                    encoded_label(zero_label, left & right),
+                );
+            }
+        }
+        assert_eq!(
+            evaluator.bitand([0; 16], [0; 16]),
+            Err(EvaluationError::Exhausted)
+        );
+    }
+
+    #[test]
+    fn evaluator_replays_an_ert_add_from_the_complete_table_iterator() {
+        let instructions = program([
+            Inst::Add {
+                dest: Reg::T0,
+                src1: Reg::A1,
+                src2: Reg::A2,
+            },
+            Inst::Ecall,
+        ]);
+        let zero = [0; 16];
+        let one = array::from_fn(|byte| (byte == 0) as u8);
+        let left_value: u32 = 0x1020_3040;
+        let right_value: u32 = 0x0102_0304;
+        let garbling_left = [zero; 32];
+        let left = array::from_fn(|bit| encoded_label(zero, (left_value >> bit) & 1 != 0));
+        let right_zero = [2; 16];
+        let garbling_right = [right_zero; 32];
+        let right = array::from_fn(|bit| encoded_label(right_zero, (right_value >> bit) & 1 != 0));
+        let mut garbled_registers = [[zero; 32]; 32];
+        garbled_registers[Reg::A0.0 as usize] = [one; 32];
+        garbled_registers[Reg::A1.0 as usize] = garbling_left;
+        garbled_registers[Reg::A2.0 as usize] = garbling_right;
+        let mut garbled_constants = [None; 32];
+        garbled_constants[Reg::A0.0 as usize] = Some(u32::MAX);
+        let mut garbled_rstack = [0; 8];
+        let mut garbled_vstack = [zero; 64];
+        let mut tables = RecordedTables::default();
+        let mut gc = context(&mut tables);
+        let mut hash = no_hash;
+
+        let garbled = ert_emit(
+            &mut gc,
+            &mut hash,
+            RawMemory::from(instructions.as_slice()),
+            &mut garbled_rstack,
+            &mut garbled_vstack,
+            0,
+            &mut garbled_registers,
+            &mut garbled_constants,
+            zero,
+            one,
+        );
+        assert!(
+            garbled.is_ok(),
+            "garbling the supported add program succeeds"
+        );
+        drop(gc);
+
+        let garbled_result = garbled_registers[Reg::T0.0 as usize];
+        let mut evaluator = Evaluator::new(tables.tables.into_iter().map(GarblingRecord::Table));
+        let mut evaluated_registers = [[zero; 32]; 32];
+        evaluated_registers[Reg::A0.0 as usize] = [one; 32];
+        evaluated_registers[Reg::A1.0 as usize] = left;
+        evaluated_registers[Reg::A2.0 as usize] = right;
+        let mut evaluated_constants = [None; 32];
+        evaluated_constants[Reg::A0.0 as usize] = Some(u32::MAX);
+        let mut evaluated_rstack = [0; 8];
+        let mut evaluated_vstack = [zero; 64];
+        let mut evaluator_hash = evaluator_no_hash;
+
+        let evaluated = ert_emit(
+            &mut evaluator,
+            &mut evaluator_hash,
+            RawMemory::from(instructions.as_slice()),
+            &mut evaluated_rstack,
+            &mut evaluated_vstack,
+            0,
+            &mut evaluated_registers,
+            &mut evaluated_constants,
+            zero,
+            one,
+        );
+        assert!(
+            evaluated.is_ok(),
+            "evaluation consumes every add table in order"
+        );
+
+        let result = left_value.wrapping_add(right_value);
+        for bit in 0..32 {
+            assert_eq!(
+                evaluated_registers[Reg::T0.0 as usize][bit],
+                encoded_label(garbled_result[bit], (result >> bit) & 1 != 0),
+                "result bit {bit}",
+            );
+        }
+        assert_eq!(
+            evaluator.bitand(zero, zero),
+            Err(EvaluationError::Exhausted)
+        );
     }
 
     #[test]

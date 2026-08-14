@@ -1,0 +1,14 @@
+[package]
+name = "cirrus-garbled-circuit-row-reduced"
+edition = "2024"
+version.workspace = true
+description = "First-row-fixed streaming garbled-circuit construction for cirrus"
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+digest = "0.11.3"
+
+[dev-dependencies]
+cirrus-ert = { path = "../../ert/cirrus-ert" }
+rv-asm.workspace = true
+sha2 = { version = "0.11.0", default-features = false }
