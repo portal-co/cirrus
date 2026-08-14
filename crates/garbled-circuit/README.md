@@ -11,6 +11,15 @@ a replacement garbling scheme.
 `cirrus-garbled-circuit-row-reduced` is the first experimental backend. It
 derives and omits the first AND-table row, then streams the other three. It is
 a completeness and cost baseline, not an authenticated-garbling protocol.
+Its locked Thumb SHA-256 replay and memory/traffic result are recorded in
+[`THUMB_SHA256_MEASUREMENT.md`](THUMB_SHA256_MEASUREMENT.md).
+
+`cirrus-garbled-circuit-tinylabels` is a separate, allocation-free
+offline/online input-label batching module. Its current local selector is a
+reference adapter that defines the buffer-level interface and validates
+free-XOR pairs; it is not a Ring-LWE implementation or a security protocol.
+The future ePrint 2024/2048 construction will live behind that module's seam
+without changing either table format.
 
 All implementations use the Boolean-context seam consumed by the ERT facades.
 Their tests must exercise the same primitive truth tables and locked RV32/Thumb
@@ -18,3 +27,9 @@ SHA-256 workloads. Each garbler also needs a paired host evaluator that pulls
 its ordered table/hint records through an `Iterator`; this is a completeness
 check, not a transport or authentication protocol. Transport and coroutine
 scheduling remain an integrator responsibility.
+
+Garbler contexts use their crate's `Label` handle, which records a wire by its
+logical-zero label. Construct constants and symbolic inputs from that handle;
+the paired evaluator instead receives the raw selected labels. This preserves
+free-XOR polarity through symbolic inversion and constants without exposing a
+per-gate protocol in the ERT API.

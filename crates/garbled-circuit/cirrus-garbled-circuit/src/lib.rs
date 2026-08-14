@@ -43,6 +43,34 @@ use cirrus_core::{
 };
 use digest::{Digest, array::Array};
 
+/// A garbler-side logical-zero wire label.
+///
+/// Garbling tracks a wire through the raw label for logical zero, not the
+/// selected label currently held by an evaluator. Consequently, [`Label::not`]
+/// retains that zero-label handle: the paired evaluator represents the
+/// complement by XORing its selected label with the free-XOR offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Label<const N: usize> {
+    zero_label: [u8; N],
+}
+
+impl<const N: usize> Label<N> {
+    /// Create a wire from its raw logical-zero label.
+    pub const fn new(zero_label: [u8; N]) -> Self {
+        Self { zero_label }
+    }
+
+    /// Return the logical complement of this wire's zero-label handle.
+    pub const fn not(self) -> Self {
+        self
+    }
+
+    /// Return the raw label for logical zero.
+    pub const fn zero_label(self) -> [u8; N] {
+        self.zero_label
+    }
+}
+
 /// A four-row garbling context that emits each non-free gate to a streaming sink.
 pub struct GC<'a, 'b, D: Digest, const N: usize> {
     /// The ordered streaming destination for four-row AND tables.
@@ -203,10 +231,10 @@ impl<D: Digest, const N: usize> HasError for GC<'_, '_, D, N> {
     type Error = Infallible;
 }
 impl<D: Digest, const N: usize> ContextWithValue<Bit> for GC<'_, '_, D, N> {
-    type Wrapped = [u8; N];
+    type Wrapped = Label<N>;
 }
 impl<D: Digest, const N: usize> ContextWithValue<bool> for GC<'_, '_, D, N> {
-    type Wrapped = [u8; N];
+    type Wrapped = Label<N>;
 }
 impl<D: Digest, const N: usize> ContextWithBitXor<bool> for GC<'_, '_, D, N> {
     fn bitxor(
@@ -214,7 +242,9 @@ impl<D: Digest, const N: usize> ContextWithBitXor<bool> for GC<'_, '_, D, N> {
         a: <Self as ContextWithValue<bool>>::Wrapped,
         b: <Self as ContextWithValue<bool>>::Wrapped,
     ) -> Result<<Self as ContextWithValue<bool>>::Wrapped, Self::Error> {
-        Ok(array::from_fn(|i| a[i] ^ b[i]))
+        Ok(Label::new(array::from_fn(|i| {
+            a.zero_label[i] ^ b.zero_label[i]
+        })))
     }
 
     fn bitxor_assign(
@@ -222,9 +252,7 @@ impl<D: Digest, const N: usize> ContextWithBitXor<bool> for GC<'_, '_, D, N> {
         a: &mut <Self as ContextWithValue<bool>>::Wrapped,
         b: <Self as ContextWithValue<bool>>::Wrapped,
     ) -> Result<(), Self::Error> {
-        for (a, b) in a.iter_mut().zip(b) {
-            *a ^= b;
-        }
+        *a = self.bitxor(*a, b)?;
         Ok(())
     }
 }
@@ -275,7 +303,7 @@ impl<D: Digest, const N: usize> ContextWithAdd<Bit> for GC<'_, '_, D, N> {
         <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         <Self as cirrus_core::HasError>::Error,
     > {
-        Ok(array::from_fn(|i| a[i] ^ b[i]))
+        self.bitxor(a, b)
     }
 
     fn add_assign(
@@ -283,9 +311,7 @@ impl<D: Digest, const N: usize> ContextWithAdd<Bit> for GC<'_, '_, D, N> {
         a: &mut <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         b: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
     ) -> Result<(), <Self as cirrus_core::HasError>::Error> {
-        for (a, b) in a.iter_mut().zip(b) {
-            *a ^= b
-        }
+        *a = self.bitxor(*a, b)?;
         Ok(())
     }
 }
@@ -298,7 +324,7 @@ impl<D: Digest, const N: usize> ContextWithSub<Bit> for GC<'_, '_, D, N> {
         <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         <Self as cirrus_core::HasError>::Error,
     > {
-        Ok(array::from_fn(|i| a[i] ^ b[i]))
+        self.bitxor(a, b)
     }
 
     fn sub_assign(
@@ -306,9 +332,7 @@ impl<D: Digest, const N: usize> ContextWithSub<Bit> for GC<'_, '_, D, N> {
         a: &mut <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         b: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
     ) -> Result<(), <Self as cirrus_core::HasError>::Error> {
-        for (a, b) in a.iter_mut().zip(b) {
-            *a ^= b
-        }
+        *a = self.bitxor(*a, b)?;
         Ok(())
     }
 }
@@ -325,8 +349,8 @@ impl<D: Digest, const N: usize> ContextWithMul<Bit> for GC<'_, '_, D, N> {
         let new = self.seed.clone();
         let new: [u8; N] = array::from_fn(|i| new[i]);
         self.queue.push(array::from_fn(|i| {
-            let a = ((i & 1) == 1) ^ (a[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
-            let b = ((i & 2) == 2) ^ (b[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
+            let a = ((i & 1) == 1) ^ (a.zero_label[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
+            let b = ((i & 2) == 2) ^ (b.zero_label[0] & 0x01 == 1) ^ (self.delta[0] & 0x01 == 1);
             let r = a & b;
             let mut x = new.clone();
             if r {
@@ -336,7 +360,7 @@ impl<D: Digest, const N: usize> ContextWithMul<Bit> for GC<'_, '_, D, N> {
             }
             return x;
         }));
-        return Ok(new);
+        Ok(Label::new(new))
     }
 
     fn mul_assign(
@@ -344,7 +368,7 @@ impl<D: Digest, const N: usize> ContextWithMul<Bit> for GC<'_, '_, D, N> {
         a: &mut <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
         b: <Self as cirrus_core::ContextWithValue<Bit>>::Wrapped,
     ) -> Result<(), <Self as cirrus_core::HasError>::Error> {
-        *a = self.mul(a.clone(), b)?;
+        *a = self.mul(*a, b)?;
         Ok(())
     }
 }
@@ -368,7 +392,7 @@ mod tests {
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
-    use super::{EvaluationError, Evaluator, GC, GarblingRecord};
+    use super::{EvaluationError, Evaluator, GC, GarblingRecord, Label};
 
     #[derive(Default)]
     struct RecordedTables<const N: usize> {
@@ -454,40 +478,52 @@ mod tests {
     }
 
     impl<const N: usize> ContextWithValue<bool> for MeasuredGc<'_, '_, N> {
-        type Wrapped = [u8; N];
+        type Wrapped = Label<N>;
     }
 
     impl<const N: usize> ContextWithBitAnd<bool> for MeasuredGc<'_, '_, N> {
-        fn bitand(&mut self, left: [u8; N], right: [u8; N]) -> Result<[u8; N], Self::Error> {
+        fn bitand(&mut self, left: Label<N>, right: Label<N>) -> Result<Label<N>, Self::Error> {
             self.counts.bitand += 1;
             self.gc.bitand(left, right)
         }
 
-        fn bitand_assign(&mut self, left: &mut [u8; N], right: [u8; N]) -> Result<(), Self::Error> {
+        fn bitand_assign(
+            &mut self,
+            left: &mut Label<N>,
+            right: Label<N>,
+        ) -> Result<(), Self::Error> {
             *left = self.bitand(*left, right)?;
             Ok(())
         }
     }
 
     impl<const N: usize> ContextWithBitOr<bool> for MeasuredGc<'_, '_, N> {
-        fn bitor(&mut self, left: [u8; N], right: [u8; N]) -> Result<[u8; N], Self::Error> {
+        fn bitor(&mut self, left: Label<N>, right: Label<N>) -> Result<Label<N>, Self::Error> {
             self.counts.bitor += 1;
             self.gc.bitor(left, right)
         }
 
-        fn bitor_assign(&mut self, left: &mut [u8; N], right: [u8; N]) -> Result<(), Self::Error> {
+        fn bitor_assign(
+            &mut self,
+            left: &mut Label<N>,
+            right: Label<N>,
+        ) -> Result<(), Self::Error> {
             *left = self.bitor(*left, right)?;
             Ok(())
         }
     }
 
     impl<const N: usize> ContextWithBitXor<bool> for MeasuredGc<'_, '_, N> {
-        fn bitxor(&mut self, left: [u8; N], right: [u8; N]) -> Result<[u8; N], Self::Error> {
+        fn bitxor(&mut self, left: Label<N>, right: Label<N>) -> Result<Label<N>, Self::Error> {
             self.counts.bitxor += 1;
             self.gc.bitxor(left, right)
         }
 
-        fn bitxor_assign(&mut self, left: &mut [u8; N], right: [u8; N]) -> Result<(), Self::Error> {
+        fn bitxor_assign(
+            &mut self,
+            left: &mut Label<N>,
+            right: Label<N>,
+        ) -> Result<(), Self::Error> {
             *left = self.bitxor(*left, right)?;
             Ok(())
         }
@@ -530,7 +566,7 @@ mod tests {
             .collect()
     }
 
-    fn no_hash<const N: usize>(_: &[[[u8; N]; 32]]) -> Result<[u8; 32], Infallible> {
+    fn no_hash<const N: usize>(_: &[[Label<N>; 32]]) -> Result<[u8; 32], Infallible> {
         Ok([0; 32])
     }
 
@@ -540,6 +576,10 @@ mod tests {
 
     fn encoded_label(zero_label: [u8; 16], value: bool) -> [u8; 16] {
         array::from_fn(|byte| zero_label[byte] ^ if value && byte == 0 { 1 } else { 0 })
+    }
+
+    fn garbler_label<const N: usize>(zero_label: [u8; N]) -> Label<N> {
+        Label::new(zero_label)
     }
 
     fn evaluate_and(table: &[[u8; 16]; 4], left: [u8; 16], right: [u8; 16]) -> [u8; 16] {
@@ -553,10 +593,10 @@ mod tests {
         let mut gc = context(&mut tables);
 
         let result = gc
-            .bitxor([0x0f; 16], [0xf0; 16])
+            .bitxor(garbler_label([0x0f; 16]), garbler_label([0xf0; 16]))
             .expect("garbling cannot fail");
 
-        assert_eq!(result, [0xff; 16]);
+        assert_eq!(result.zero_label(), [0xff; 16]);
         assert!(tables.tables.is_empty());
     }
 
@@ -565,20 +605,22 @@ mod tests {
         let mut tables = RecordedTables::default();
         let mut gc = context(&mut tables);
 
-        let result = gc.bitand([0; 16], [0; 16]).expect("garbling cannot fail");
+        let result = gc
+            .bitand(garbler_label([0; 16]), garbler_label([0; 16]))
+            .expect("garbling cannot fail");
 
         assert_eq!(
-            result,
+            result.zero_label(),
             [
                 0x66, 0x68, 0x7a, 0xad, 0xf8, 0x62, 0xbd, 0x77, 0x6c, 0x8f, 0xc1, 0x8b, 0x8e, 0x9f,
                 0x8e, 0x20,
             ]
         );
         assert_eq!(tables.tables.len(), 1);
-        assert_eq!(tables.tables[0][0][0], result[0] ^ 1);
-        assert_eq!(tables.tables[0][1], result);
-        assert_eq!(tables.tables[0][2], result);
-        assert_eq!(tables.tables[0][3], result);
+        assert_eq!(tables.tables[0][0][0], result.zero_label()[0] ^ 1);
+        assert_eq!(tables.tables[0][1], result.zero_label());
+        assert_eq!(tables.tables[0][2], result.zero_label());
+        assert_eq!(tables.tables[0][3], result.zero_label());
         for left in [false, true] {
             for right in [false, true] {
                 let actual = evaluate_and(
@@ -586,7 +628,7 @@ mod tests {
                     encoded_label([0; 16], left),
                     encoded_label([0; 16], right),
                 );
-                assert_eq!(actual, encoded_label(result, left & right));
+                assert_eq!(actual, encoded_label(result.zero_label(), left & right));
             }
         }
     }
@@ -595,7 +637,9 @@ mod tests {
     fn evaluator_replays_and_labels_from_an_iterator() {
         let mut tables = RecordedTables::default();
         let mut gc = context(&mut tables);
-        let zero_label = gc.bitand([0; 16], [0; 16]).expect("garbling cannot fail");
+        let zero_label = gc
+            .bitand(garbler_label([0; 16]), garbler_label([0; 16]))
+            .expect("garbling cannot fail");
         drop(gc);
 
         let table = tables.tables[0];
@@ -606,7 +650,7 @@ mod tests {
                     evaluator
                         .bitand(encoded_label([0; 16], left), encoded_label([0; 16], right))
                         .expect("the matching table is available"),
-                    encoded_label(zero_label, left & right),
+                    encoded_label(zero_label.zero_label(), left & right),
                 );
             }
         }
@@ -614,6 +658,34 @@ mod tests {
             evaluator.bitand([0; 16], [0; 16]),
             Err(EvaluationError::Exhausted)
         );
+    }
+
+    #[test]
+    fn evaluator_replays_an_and_after_a_symbolic_inversion() {
+        let mut tables = RecordedTables::default();
+        let mut gc = context(&mut tables);
+        let left_zero = garbler_label([0; 16]);
+        let right_zero = garbler_label([2; 16]);
+        let result_zero = gc
+            .bitand(left_zero.not(), right_zero)
+            .expect("garbling cannot fail");
+        drop(gc);
+        let table = tables.tables[0];
+        let delta = array::from_fn(|byte| (byte == 0) as u8);
+
+        for (left, right) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut evaluator = Evaluator::new([table].into_iter().map(GarblingRecord::Table));
+            let inverted_left = evaluator
+                .bitxor(encoded_label(left_zero.zero_label(), left), delta)
+                .expect("XOR is free");
+            assert_eq!(
+                evaluator
+                    .bitand(inverted_left, encoded_label(right_zero.zero_label(), right))
+                    .expect("one table is available"),
+                encoded_label(result_zero.zero_label(), !left & right),
+                "left={left}, right={right}",
+            );
+        }
     }
 
     #[test]
@@ -628,21 +700,23 @@ mod tests {
         ]);
         let zero = [0; 16];
         let one = array::from_fn(|byte| (byte == 0) as u8);
+        let garbling_zero = garbler_label(zero);
+        let garbling_one = garbling_zero.not();
         let left_value: u32 = 0x1020_3040;
         let right_value: u32 = 0x0102_0304;
-        let garbling_left = [zero; 32];
+        let garbling_left = [garbling_zero; 32];
         let left = array::from_fn(|bit| encoded_label(zero, (left_value >> bit) & 1 != 0));
         let right_zero = [2; 16];
-        let garbling_right = [right_zero; 32];
+        let garbling_right = [garbler_label(right_zero); 32];
         let right = array::from_fn(|bit| encoded_label(right_zero, (right_value >> bit) & 1 != 0));
-        let mut garbled_registers = [[zero; 32]; 32];
-        garbled_registers[Reg::A0.0 as usize] = [one; 32];
+        let mut garbled_registers = [[garbling_zero; 32]; 32];
+        garbled_registers[Reg::A0.0 as usize] = [garbling_one; 32];
         garbled_registers[Reg::A1.0 as usize] = garbling_left;
         garbled_registers[Reg::A2.0 as usize] = garbling_right;
         let mut garbled_constants = [None; 32];
         garbled_constants[Reg::A0.0 as usize] = Some(u32::MAX);
         let mut garbled_rstack = [0; 8];
-        let mut garbled_vstack = [zero; 64];
+        let mut garbled_vstack = [garbling_zero; 64];
         let mut tables = RecordedTables::default();
         let mut gc = context(&mut tables);
         let mut hash = no_hash;
@@ -656,8 +730,8 @@ mod tests {
             0,
             &mut garbled_registers,
             &mut garbled_constants,
-            zero,
-            one,
+            garbling_zero,
+            garbling_one,
         );
         assert!(
             garbled.is_ok(),
@@ -698,7 +772,7 @@ mod tests {
         for bit in 0..32 {
             assert_eq!(
                 evaluated_registers[Reg::T0.0 as usize][bit],
-                encoded_label(garbled_result[bit], (result >> bit) & 1 != 0),
+                encoded_label(garbled_result[bit].zero_label(), (result >> bit) & 1 != 0),
                 "result bit {bit}",
             );
         }
@@ -713,10 +787,12 @@ mod tests {
         let mut tables = RecordedTables::default();
         let mut gc = context(&mut tables);
 
-        let result = gc.bitor([0; 16], [0xff; 16]).expect("garbling cannot fail");
+        let result = gc
+            .bitor(garbler_label([0; 16]), garbler_label([0xff; 16]))
+            .expect("garbling cannot fail");
 
         assert_eq!(
-            result,
+            result.zero_label(),
             [
                 0x99, 0x97, 0x85, 0x52, 0x07, 0x9d, 0x42, 0x88, 0x93, 0x70, 0x3e, 0x74, 0x71, 0x60,
                 0x71, 0xdf,
@@ -730,7 +806,7 @@ mod tests {
                 let either: [u8; 16] = array::from_fn(|byte| left_label[byte] ^ right_label[byte]);
                 let both = evaluate_and(&tables.tables[0], left_label, right_label);
                 let actual: [u8; 16] = array::from_fn(|byte| either[byte] ^ both[byte]);
-                assert_eq!(actual, encoded_label(result, left | right));
+                assert_eq!(actual, encoded_label(result.zero_label(), left | right));
             }
         }
     }
@@ -740,8 +816,10 @@ mod tests {
         let mut tables = BoundedPusher::new(1);
         let mut gc = bounded_context(&mut tables);
 
-        gc.bitand([0; 16], [0; 16]).expect("garbling cannot fail");
-        gc.bitand([0; 16], [0; 16]).expect("garbling cannot fail");
+        gc.bitand(garbler_label([0; 16]), garbler_label([0; 16]))
+            .expect("garbling cannot fail");
+        gc.bitand(garbler_label([0; 16]), garbler_label([0; 16]))
+            .expect("garbling cannot fail");
         drop(gc);
 
         assert_eq!(tables.tables.len(), 1);
@@ -759,15 +837,16 @@ mod tests {
             Inst::Ecall,
         ]);
         let zero = [0; 16];
-        let one = array::from_fn(|byte| (byte == 0) as u8);
-        let mut registers = [[zero; 32]; 32];
-        registers[Reg::A1.0 as usize] = [[0x22; 16]; 32];
-        registers[Reg::A2.0 as usize] = [[0x44; 16]; 32];
-        registers[Reg::A0.0 as usize] = [one; 32];
+        let garbling_zero = garbler_label(zero);
+        let garbling_one = garbling_zero.not();
+        let mut registers = [[garbling_zero; 32]; 32];
+        registers[Reg::A1.0 as usize] = [garbler_label([0x22; 16]); 32];
+        registers[Reg::A2.0 as usize] = [garbler_label([0x44; 16]); 32];
+        registers[Reg::A0.0 as usize] = [garbling_one; 32];
         let mut constants = [None; 32];
         constants[Reg::A0.0 as usize] = Some(u32::MAX);
         let mut rstack = [0; 8];
-        let mut vstack = [zero; 64];
+        let mut vstack = [garbling_zero; 64];
         let mut tables = RecordedTables::default();
         let mut gc = MeasuredGc::new(context(&mut tables));
         let mut hash = no_hash;
@@ -781,8 +860,8 @@ mod tests {
             0,
             &mut registers,
             &mut constants,
-            zero,
-            one,
+            garbling_zero,
+            garbling_one,
         );
 
         let counts = gc.counts;
@@ -807,22 +886,23 @@ mod tests {
             Inst::Ecall,
         ]);
         let zero = [0; 16];
-        let one = array::from_fn(|byte| (byte == 0) as u8);
-        let mut registers = [[zero; 32]; 32];
-        registers[Reg::A1.0 as usize] = [[0x22; 16]; 32];
+        let garbling_zero = garbler_label(zero);
+        let garbling_one = garbling_zero.not();
+        let mut registers = [[garbling_zero; 32]; 32];
+        registers[Reg::A1.0 as usize] = [garbler_label([0x22; 16]); 32];
         registers[Reg::A2.0 as usize] = array::from_fn(|bit| {
             if right_constant.unwrap_or(0) & (1 << bit) == 0 {
-                zero
+                garbling_zero
             } else {
-                one
+                garbling_one
             }
         });
-        registers[Reg::A0.0 as usize] = [one; 32];
+        registers[Reg::A0.0 as usize] = [garbling_one; 32];
         let mut constants = [None; 32];
         constants[Reg::A0.0 as usize] = Some(u32::MAX);
         constants[Reg::A2.0 as usize] = right_constant;
         let mut rstack = [0; 8];
-        let mut vstack = [zero; 64];
+        let mut vstack = [garbling_zero; 64];
         let mut sink = CountingPusher::default();
         let mut gc = MeasuredGc::new(measuring_context(&mut sink));
         let mut hash = no_hash::<16>;
@@ -836,8 +916,8 @@ mod tests {
             0,
             &mut registers,
             &mut constants,
-            zero,
-            one,
+            garbling_zero,
+            garbling_one,
         );
         let counts = gc.counts;
         drop(gc);
@@ -1059,23 +1139,23 @@ mod tests {
         unsafe { RawMemory::new(mapping.as_ptr().wrapping_sub(base as usize), None) }
     }
 
-    fn symbolic_args<const N: usize>() -> [([[u8; N]; 32], Option<u32>); 16] {
+    fn symbolic_args<const N: usize>() -> [([Label<N>; 32], Option<u32>); 16] {
         array::from_fn(|word| {
             (
                 array::from_fn(|bit| {
                     let wire = (word * 32 + bit + 2) as u16;
-                    array::from_fn(|byte| match byte {
+                    Label::new(array::from_fn(|byte| match byte {
                         0 => wire as u8,
                         1 => (wire >> 8) as u8,
                         _ => 0,
-                    })
+                    }))
                 }),
                 None,
             )
         })
     }
 
-    fn touched_stack<const N: usize>(stack: &[[u8; N]], sentinel: [u8; N]) -> usize {
+    fn touched_stack<const N: usize>(stack: &[Label<N>], sentinel: Label<N>) -> usize {
         stack
             .iter()
             .position(|label| *label != sentinel)
@@ -1119,9 +1199,9 @@ mod tests {
         let mapping = mapped_image(&elf, BASE, &[".text", ".rodata"]);
         let entry = symbol_address(&elf, "__ert_workload_entry");
         let memory = mapped_memory(&mapping, BASE);
-        let zero = [0; N];
-        let one = array::from_fn(|byte| (byte == 0) as u8);
-        let sentinel = [0xa5; N];
+        let zero = Label::new([0; N]);
+        let one = zero.not();
+        let sentinel = Label::new([0xa5; N]);
         let mut registers = [[zero; 32]; 32];
         let mut constants = [None; 32];
         let mut rstack = [u32::MAX; 256];
@@ -1168,9 +1248,9 @@ mod tests {
         let mapping = mapped_image(&elf, BASE, &[".text.ert_workload", ".rodata.ert_workload"]);
         let entry = symbol_address(&elf, "__ert_workload_entry") | 1;
         let memory = mapped_memory(&mapping, BASE);
-        let zero = [0; N];
-        let one = array::from_fn(|byte| (byte == 0) as u8);
-        let sentinel = [0xa5; N];
+        let zero = Label::new([0; N]);
+        let one = zero.not();
+        let sentinel = Label::new([0xa5; N]);
         let mut registers = [[zero; 32]; 16];
         let mut constants = [None; 16];
         let mut rstack = [u32::MAX; 512];

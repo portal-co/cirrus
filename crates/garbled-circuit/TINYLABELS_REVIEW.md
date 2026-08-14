@@ -1,7 +1,12 @@
 # TinyLabels (ePrint 2024/2048) review log
 
-Status: the paper/backend decision record is complete. No TinyLabels,
-row-reduced, or other experimental garbling implementation has been added yet.
+Status: the paper/backend decision record is complete. The stable four-row
+evaluator and the separate first-row-fixed experimental backend now have
+public-ERT completeness tests, including the locked Thumb SHA-256 replay.
+`MachineHandler` and the actual TinyLabels/Ring-LWE encoder remain to be
+implemented. A separate allocation-free reference label-batching module now
+defines the offline/online selected-label interface without making a
+cryptographic claim.
 
 Source reviewed: *TinyLabels: How to Compress Garbled Circuit Input Labels,
 Efficiently*, Marian Dietz, Hanjun Li, and Huijia Lin, ePrint 2024/2048
@@ -13,8 +18,10 @@ Efficiently*, Marian Dietz, Hanjun Li, and Huijia Lin, ePrint 2024/2048
 The decisions needed to begin the paper-relevant backend work are resolved:
 the current target has approximately one million reuses, 256 KiB RAM, 2 MiB
 flash, 128-bit security, a microcontroller garbler, and a server evaluator.
-They are sufficient to begin the baseline evaluator and first-row-fixed
-reduction work, and to scope a separate TinyLabels feasibility study.
+They were sufficient to complete the baseline evaluator and first-row-fixed
+reduction work, and to scope a separate TinyLabels feasibility study. The
+[Thumb measurement](THUMB_SHA256_MEASUREMENT.md) is the current feasibility
+record for that completed work.
 
 The end-to-end deployment protocol and symbolic host-call semantics remain
 design work. They are deliberately not treated as settled requirements for
@@ -159,20 +166,21 @@ Its synchronous `Pusher` is the transport seam and remains integrator-owned.
 1. Introduce and test the private `MachineHandler` seam with a legacy concrete
    callback adapter and a symbolic-hash test adapter. Preserve the present
    public execution helpers while adding an opt-in handler-aware entry point.
-2. Add paired host evaluators for the existing baseline and each subsequent
-   garbler. Test them by pulling an ordered `Iterator` of tables and hints,
-   first for primitive gates and then for the locked Thumb workload. Keep this
-   as a completeness check rather than a transport or authentication protocol.
-3. Design and validate a first-row-fixed row-reduced backend as its own crate,
-   for example `cirrus-garbled-circuit-row-reduced`. It needs its own table
-   format, garbler/evaluator algorithm, primitive truth-table vectors, and
-   streaming protocol version. It must not silently reinterpret the baseline's
-   four rows as a three-row scheme.
-4. Only after that interface is explicit, prototype TinyLabels in a separate
-   crate such as `cirrus-garbled-circuit-tinylabels`. It must not depend on
-   baseline wire-format internals, although both crates can use the Boolean
-   context seam and the same ERT workload measurements. Its design must respect
-   the 256 KiB RAM, 2 MiB flash, and approximately one-million-use targets.
+2. The baseline evaluator and the first-row-fixed evaluator now pull ordered
+   records. The row-reduced crate covers primitive truth tables, affine
+   inversion, and the locked Thumb workload through the public ERT seam; keep
+   this as a completeness check rather than a transport or authentication
+   protocol.
+3. The first-row-fixed backend is now its own crate with a distinct
+   three-row record format and versioned row derivation. It does not
+   reinterpret baseline four-row records.
+4. `cirrus-garbled-circuit-tinylabels` now validates offline free-XOR input
+   label pairs and writes selected online labels into a caller buffer without
+   allocation. That local adapter is deliberately not private or secure
+   transfer: the Ring-LWE encoder must replace it while retaining the same
+   selected-label result and without depending on baseline table-format
+   internals. Its design must respect the 256 KiB RAM, 2 MiB flash, and
+   approximately one-million-use targets.
 5. Compare each backend on the exact Thumb SHA-256 workload first, with a
    streaming sink, bounded transport buffer, an evaluator/interoperability
    test, and separately measured device RAM, flash, time, energy, table bytes,

@@ -1,0 +1,7 @@
+[package]
+name = "cirrus-garbled-circuit-tinylabels"
+edition = "2024"
+version.workspace = true
+description = "TinyLabels-directed input-label batching for cirrus"
+
+[dependencies]
