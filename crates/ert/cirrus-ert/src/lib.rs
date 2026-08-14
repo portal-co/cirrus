@@ -43,8 +43,13 @@
 
 use core::{array, error::Error};
 
+#[cfg(feature = "prepared-recording")]
+use core::convert::Infallible;
+
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
+#[cfg(feature = "prepared-recording")]
+use cirrus_recompile_core::{Idx, PreparedRecorder};
 use rv_asm::{DecodeError, Reg};
 
 mod handlers;
@@ -220,6 +225,16 @@ impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
 
 impl<H: Handler<bool>> RvHandler<bool> for RvDefaultHandler<H> {}
 
+/// The RV32 handler shape used by [`ert_func_prepared`] and
+/// [`ert_emit_prepared`].
+///
+/// After execution, consume `handler.inner.context` with
+/// [`PreparedRecorder::finish`] to obtain the prepared artifact.  The hash
+/// closure retains the ordinary ERT backend tunnel and receives the concrete
+/// recorder directly.
+#[cfg(feature = "prepared-recording")]
+pub type PreparedRvHandler<F> = RvDefaultHandler<DefaultHandler<PreparedRecorder, F>>;
+
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// The `zero` and `one` parameters are retained for compatibility with existing
@@ -270,6 +285,33 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     Ok(read_abi_results(regs, reg_consts, vstack, stack_pointer))
 }
 
+/// Execute RV32 through an opt-in [`PreparedRecorder`].
+///
+/// This preserves [`ert_func`]'s machine ABI, concrete metadata, and result
+/// layout. It is deliberately separate from `ert_func`, so normal and direct
+/// execution do not instantiate prepared-recording state.
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert_func_prepared<F, const N: usize, const M: usize>(
+    t: &mut PreparedRvHandler<F>,
+    mem: RawMemory<'_>,
+    rstack: &mut [u32],
+    vstack: &mut [Idx],
+    pc: u32,
+    regs: &mut [[Idx; 32]; 32],
+    reg_consts: &mut [Option<u32>; 32],
+    zero: Idx,
+    one: Idx,
+    args: [([Idx; 32], Option<u32>); N],
+) -> Result<[([Idx; 32], Option<u32>); M], ErtError<Infallible>>
+where
+    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+{
+    ert_func(
+        t, mem, rstack, vstack, pc, regs, reg_consts, zero, one, args,
+    )
+}
+
 /// Execute a symbolic RV32 instruction image until the supported exit `ECALL`.
 ///
 /// The interpreter resets `x0` and initializes `sp` to the byte length of
@@ -301,6 +343,29 @@ pub fn ert_emit<W: Clone, E: Error>(
         stack_pointer,
     )
     .run()
+}
+
+/// Execute RV32 until `ECALL` through an opt-in [`PreparedRecorder`].
+///
+/// Consume `t.inner.context` afterwards and call [`PreparedRecorder::finish`]
+/// with the caller's declared input/output slots.
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert_emit_prepared<F>(
+    t: &mut PreparedRvHandler<F>,
+    mem: RawMemory<'_>,
+    rstack: &mut [u32],
+    vstack: &mut [Idx],
+    pc: u32,
+    regs: &mut [[Idx; 32]; 32],
+    reg_consts: &mut [Option<u32>; 32],
+    zero: Idx,
+    one: Idx,
+) -> Result<(), ErtError<Infallible>>
+where
+    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+{
+    ert_emit(t, mem, rstack, vstack, pc, regs, reg_consts, zero, one)
 }
 
 fn abi_stack_pointer<W>(vstack: &[W], values: usize) -> Option<u32> {

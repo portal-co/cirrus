@@ -58,11 +58,16 @@
 
 use core::{array, error::Error, ops::Range};
 
+#[cfg(feature = "prepared-recording")]
+use core::convert::Infallible;
+
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
 use cirrus_ert_core::{
     BitOp, Product, Shift, add_bits, bitwise_word, concrete_product, constant_word, fixed_shift,
     invert_word, partial_and_not_word, partial_bitwise_word, select_word,
 };
+#[cfg(feature = "prepared-recording")]
+use cirrus_recompile_core::{Idx, PreparedRecorder};
 
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 
@@ -300,6 +305,16 @@ impl<H: Handler<bool>, G: FnMut(&mut H, SecurityState) -> bool, A: FnMut(&mut H,
     }
 }
 
+/// The Thumb handler shape used by [`ert_func_prepared`] and
+/// [`ert_emit_prepared`].
+///
+/// Its policy closures receive the ordinary [`DefaultHandler`] wrapper, so
+/// they retain the same concrete backend tunnel as non-prepared Thumb ERT.
+/// After execution, consume `handler.inner.context` with
+/// [`PreparedRecorder::finish`].
+#[cfg(feature = "prepared-recording")]
+pub type PreparedArmHandler<F, G, A> = ArmDefaultHandler<DefaultHandler<PreparedRecorder, F>, G, A>;
+
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// `zero` and `one` are retained to match the RISC-V compatibility helper.
@@ -354,6 +369,35 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     Ok(read_abi_results(regs, reg_consts, vstack, stack_pointer))
 }
 
+/// Execute Thumb code through an opt-in [`PreparedRecorder`].
+///
+/// The function retains the regular [`ert_func`] ABI and result layout. It
+/// is a separate monomorphization, leaving raw and direct execution free of
+/// preparation state.
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert_func_prepared<F, G, A, const N: usize, const M: usize>(
+    t: &mut PreparedArmHandler<F, G, A>,
+    mem: RawMemory<'_>,
+    rstack: &mut [u32],
+    vstack: &mut [Idx],
+    pc: u32,
+    regs: &mut [[Idx; 32]; 16],
+    reg_consts: &mut [Option<u32>; 16],
+    zero: Idx,
+    one: Idx,
+    args: [([Idx; 32], Option<u32>); N],
+) -> Result<[([Idx; 32], Option<u32>); M], ErtError<Infallible>>
+where
+    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    G: FnMut(&mut DefaultHandler<PreparedRecorder, F>, SecurityState) -> bool,
+    A: FnMut(&mut DefaultHandler<PreparedRecorder, F>, u32) -> SecurityAttribute,
+{
+    ert_func(
+        t, mem, rstack, vstack, pc, regs, reg_consts, zero, one, args,
+    )
+}
+
 /// Execute Thumb instructions until the supported exit `SVC #0`.
 ///
 /// `pc` is an odd Thumb entry pointer. The interpreter initializes `sp` to the
@@ -388,6 +432,29 @@ pub fn ert_emit<W: Clone, E: Error>(
         stack_pointer,
     )
     .run()
+}
+
+/// Execute Thumb code until `SVC #0` through an opt-in
+/// [`PreparedRecorder`].
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert_emit_prepared<F, G, A>(
+    t: &mut PreparedArmHandler<F, G, A>,
+    mem: RawMemory<'_>,
+    rstack: &mut [u32],
+    vstack: &mut [Idx],
+    pc: u32,
+    regs: &mut [[Idx; 32]; 16],
+    reg_consts: &mut [Option<u32>; 16],
+    zero: Idx,
+    one: Idx,
+) -> Result<(), ErtError<Infallible>>
+where
+    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    G: FnMut(&mut DefaultHandler<PreparedRecorder, F>, SecurityState) -> bool,
+    A: FnMut(&mut DefaultHandler<PreparedRecorder, F>, u32) -> SecurityAttribute,
+{
+    ert_emit(t, mem, rstack, vstack, pc, regs, reg_consts, zero, one)
 }
 
 fn abi_stack_pointer<W>(vstack: &[W], values: usize) -> Option<u32> {

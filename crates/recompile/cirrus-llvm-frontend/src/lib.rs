@@ -21,8 +21,12 @@ use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
     ContextWithValue, HasError,
 };
-use cirrus_ert_core::{add_bits_with, BitOp as WordBitOp};
-use cirrus_recompile_core::{Idx, Program, Recorder};
+use cirrus_ert_core::{BitOp as WordBitOp, add_bits_with};
+use cirrus_recompile_core::{
+    CountdownPreparation, Idx, NoPreparation, OptimizationOptions, PreparedProgram, Program,
+    Recorder,
+};
+use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::context::Context;
 use inkwell::memory_buffer::MemoryBuffer;
@@ -33,7 +37,6 @@ use inkwell::values::{
     AnyValue, AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode,
     InstructionValue, Operand, PhiValue, ValueKind,
 };
-use inkwell::IntPredicate;
 
 /// Boolean operation context used by the in-memory LLVM runner.
 ///
@@ -493,6 +496,44 @@ pub fn lower(
     lower_module(&module, request)
 }
 
+/// Parse and lower LLVM input directly to a reoptimizable prepared artifact.
+///
+/// This is opt-in: [`lower`] remains the portable raw-program path and does
+/// not instantiate preparation work.  Canonical source loops are therefore
+/// free to be represented by the shared table-loop optimizer, while a
+/// frontend can retain more specific loop structure through
+/// [`PreparedProgram::new`] in a future source adapter.
+pub fn lower_prepared(
+    context: &Context,
+    input: ModuleInput<'_>,
+    request: &LowerRequest<'_, Recorder>,
+) -> Result<PreparedProgram, FrontendError> {
+    lower_prepared_with_options(context, input, request, &OptimizationOptions::default())
+}
+
+/// Like [`lower_prepared`], with explicit preparation options.
+pub fn lower_prepared_with_options(
+    context: &Context,
+    input: ModuleInput<'_>,
+    request: &LowerRequest<'_, Recorder>,
+    options: &OptimizationOptions,
+) -> Result<PreparedProgram, FrontendError> {
+    let module = match input {
+        ModuleInput::Assembly(source) => context
+            .create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
+                source.as_bytes(),
+                "cirrus.ll",
+            ))
+            .map_err(|error| FrontendError::parse(error.to_string()))?,
+        ModuleInput::Bitcode(bytes) => Module::parse_bitcode_from_buffer(
+            &MemoryBuffer::create_from_memory_range_copy(bytes, "cirrus.bc"),
+            context,
+        )
+        .map_err(|error| FrontendError::parse(error.to_string()))?,
+    };
+    lower_module_prepared_with_options(&module, request, options)
+}
+
 /// Lower an already parsed LLVM module.
 pub fn lower_module<'module, 'ctx>(
     module: &'module Module<'ctx>,
@@ -500,7 +541,31 @@ pub fn lower_module<'module, 'ctx>(
 ) -> Result<Program, FrontendError> {
     let mut recorder = Recorder::new();
     let execution = execute_module(module, request, &mut recorder)?;
-    Ok(recorder.finish(execution.inputs, execution.outputs))
+    Ok(recorder.finish_with::<NoPreparation>(
+        execution.inputs,
+        execution.outputs,
+        &OptimizationOptions::default(),
+    ))
+}
+
+/// Lower an already parsed module to a prepared artifact using default
+/// optimization options.
+pub fn lower_module_prepared<'module, 'ctx>(
+    module: &'module Module<'ctx>,
+    request: &LowerRequest<'_, Recorder>,
+) -> Result<PreparedProgram, FrontendError> {
+    lower_module_prepared_with_options(module, request, &OptimizationOptions::default())
+}
+
+/// Like [`lower_module_prepared`], with explicit preparation options.
+pub fn lower_module_prepared_with_options<'module, 'ctx>(
+    module: &'module Module<'ctx>,
+    request: &LowerRequest<'_, Recorder>,
+    options: &OptimizationOptions,
+) -> Result<PreparedProgram, FrontendError> {
+    let mut recorder = Recorder::new();
+    let execution = execute_module(module, request, &mut recorder)?;
+    Ok(recorder.finish_with::<CountdownPreparation>(execution.inputs, execution.outputs, options))
 }
 
 /// Execute an already parsed, in-memory LLVM module through any Boolean
@@ -933,8 +998,11 @@ impl<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend>
             }
             InstructionOpcode::Select => {
                 let operands = operands(self)?;
-                let [Value::Integer(condition), Value::Integer(then_value), Value::Integer(else_value)] =
-                    operands.as_slice()
+                let [
+                    Value::Integer(condition),
+                    Value::Integer(then_value),
+                    Value::Integer(else_value),
+                ] = operands.as_slice()
                 else {
                     return Err(FrontendError::unsupported(
                         "select supports only integer values",
@@ -1744,7 +1812,7 @@ impl<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend>
             _ => {
                 return Err(FrontendError::unsupported(
                     "aggregate global initializer type",
-                ))
+                ));
             }
         }
         Ok(())
@@ -2841,6 +2909,41 @@ mod tests {
         assert_eq!(
             interpret(&program, &[]),
             [true, true, false, false, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn opt_in_prepared_lowering_keeps_raw_slots_and_reabstracts_countdown_work() {
+        let context = Context::create();
+        let arguments = [
+            ArgumentBinding::Scalar(ScalarBinding::Symbolic),
+            ArgumentBinding::Scalar(ScalarBinding::Symbolic),
+        ];
+        let exports = [Export::Return];
+        let request = request(&arguments, &exports);
+        let source = "define i8 @kernel(i8 %x, i8 %y) {\n\
+            entry: br label %loop\n\
+            loop:\n\
+              %counter = phi i8 [ 4, %entry ], [ %next, %loop ]\n\
+              %value = add i8 %x, %y\n\
+              %next = add i8 %counter, -1\n\
+              %done = icmp eq i8 %next, 0\n\
+              br i1 %done, label %exit, label %loop\n\
+            exit:\n\
+              ret i8 %value\n\
+          }";
+        let raw = lower(&context, ModuleInput::Assembly(source), &request).unwrap();
+        let prepared = lower_prepared(&context, ModuleInput::Assembly(source), &request).unwrap();
+
+        assert_eq!(raw.len(), prepared.slots);
+        assert_eq!(raw.inputs, prepared.inputs);
+        assert_eq!(raw.outputs, prepared.outputs);
+        assert!(prepared.has_loops());
+        let mut input = bits(0xa5, 8);
+        input.extend(bits(0x17, 8));
+        assert_eq!(
+            interpret(&raw, &input),
+            cirrus_recompile_core::interpret_prepared(&prepared, &input)
         );
     }
 

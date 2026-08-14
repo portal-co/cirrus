@@ -10,9 +10,12 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use cirrus_asm::recompile::{PinnedAddresses, compile_aarch64};
+use cirrus_asm::recompile::{PinnedAddresses, compile_aarch64, compile_prepared_aarch64};
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux};
-use cirrus_recompile_core::Recorder;
+use cirrus_recompile_core::{
+    Idx, LoopInvocation, PreparedLoop, PreparedOp, PreparedProgram, PreparedSlot, Recorder,
+    Statement, StatementRange, interpret_prepared,
+};
 
 /// A W^X-compliant executable-memory allocation: written while
 /// `PROT_READ|PROT_WRITE`, then made `PROT_READ|PROT_EXEC` and never
@@ -104,5 +107,60 @@ fn compiled_aarch64_matches_reference_interpreter() {
         let actual: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()]).collect();
 
         assert_eq!(actual, expected, "mismatch for inputs ({x}, {y})");
+    }
+}
+
+#[test]
+fn compiled_aarch64_executes_nested_table_scopes() {
+    let prepared = PreparedProgram::new(
+        6,
+        vec![Idx(0), Idx(1)],
+        vec![Idx(2), Idx(3), Idx(4), Idx(5)],
+        StatementRange::new(0, 1),
+        vec![
+            Statement::Loop(PreparedLoop {
+                body: StatementRange::new(1, 3),
+                invocations: vec![LoopInvocation { first_row: 0, iterations: 2 }],
+                fields_per_iteration: 1,
+                table: vec![2, 3],
+            }),
+            Statement::Op(PreparedOp::BitXor {
+                a: PreparedSlot::Static(Idx(0)),
+                b: PreparedSlot::Static(Idx(1)),
+                out: PreparedSlot::Table { depth: 0, field: 0 },
+            }),
+            Statement::Loop(PreparedLoop {
+                body: StatementRange::new(3, 4),
+                invocations: vec![
+                    LoopInvocation { first_row: 0, iterations: 1 },
+                    LoopInvocation { first_row: 1, iterations: 1 },
+                ],
+                fields_per_iteration: 1,
+                table: vec![4, 5],
+            }),
+            Statement::Op(PreparedOp::BitAnd {
+                a: PreparedSlot::Table { depth: 1, field: 0 },
+                b: PreparedSlot::Static(Idx(1)),
+                out: PreparedSlot::Table { depth: 0, field: 0 },
+            }),
+        ],
+    )
+    .unwrap();
+    let pinned = PinnedAddresses {
+        create: cirrus_recompile_rt::plaintext::create as *const () as usize,
+        bitand: cirrus_recompile_rt::plaintext::bitand as *const () as usize,
+        bitor: cirrus_recompile_rt::plaintext::bitor as *const () as usize,
+        bitxor: cirrus_recompile_rt::plaintext::bitxor as *const () as usize,
+        mux: cirrus_recompile_rt::plaintext::mux as *const () as usize,
+    };
+    let exec = ExecMem::new(&compile_prepared_aarch64(&prepared, &pinned));
+
+    for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
+        let mut buf = vec![false; prepared.slots];
+        buf[0] = x;
+        buf[1] = y;
+        unsafe { exec.call(&mut () as *mut (), buf.as_mut_ptr()) };
+        let actual: Vec<bool> = prepared.outputs.iter().map(|idx| buf[idx.get()]).collect();
+        assert_eq!(actual, interpret_prepared(&prepared, &[x, y]));
     }
 }

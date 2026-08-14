@@ -4,7 +4,13 @@ edition = "2024"
 version.workspace = true
 description.workspace = true
 
+[features]
+# Keeps allocator-requiring prepared artifact support out of bare-metal ERT
+# users unless they opt in.
+prepared-recording = ["dep:cirrus-recompile-core"]
+
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core", optional = true }
 rv-asm.workspace = true

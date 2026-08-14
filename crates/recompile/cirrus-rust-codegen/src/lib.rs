@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cirrus_recompile_core::{
-    LoopOp, LoopSlot, OptimizationOptions, PreparedProgram, PreparedStep, Program, ScheduledOp,
+    OptimizationOptions, PreparedOp, PreparedProgram, PreparedSlot, Program, Statement,
+    StatementRange,
 };
 
 /// Which pinned-function backend module a compiled artifact targets.
@@ -105,123 +106,185 @@ pub fn generate_prepared_source(
         "pub unsafe extern \"C\" fn {fn_name}{generics}(backend: *mut {module}::Backend{generics}, buf: *mut {module}::Wrapped{generics}) {{"
     );
     let _ = writeln!(out, "    unsafe {{");
-    for (loop_index, step) in program.steps.iter().enumerate() {
-        match step {
-            PreparedStep::Flat(ops) => {
-                for &scheduled in ops {
-                    if program.inputs.iter().any(|idx| *idx == scheduled.out) {
-                        continue;
-                    }
-                    let _ = writeln!(out, "        {}", call_line(module, scheduled));
-                }
-            }
-            PreparedStep::Loop(loop_step) => {
-                let table = format!("cirrus_table_{loop_index}");
-                let values = loop_step
-                    .table
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(out, "        let {table}: &[u32] = &[{values}];");
-                let _ = writeln!(
-                    out,
-                    "        for cirrus_iteration in 0..{}usize {{",
-                    loop_step.iterations
-                );
-                let _ = writeln!(
-                    out,
-                    "            let cirrus_row = cirrus_iteration * {}usize;",
-                    loop_step.fields_per_iteration
-                );
-                for &op in &loop_step.ops {
-                    let _ = writeln!(out, "            {}", loop_call_line(module, op, &table));
-                }
-                let _ = writeln!(out, "        }}");
-            }
-        }
-    }
+    program
+        .validate()
+        .expect("prepared program must satisfy structural invariants");
+    let mut loop_names = 0usize;
+    emit_range(
+        &mut out,
+        program,
+        program.entry,
+        module,
+        8,
+        &[],
+        "0usize",
+        &mut loop_names,
+    );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "}}");
     out
 }
 
-fn call_line(module: &str, scheduled: ScheduledOp) -> String {
-    match scheduled.op {
-        cirrus_recompile_core::Op::Create(value) => {
-            format!(
-                "{module}::create(backend, buf, {}, {});",
-                value as u8, scheduled.out.0
-            )
+struct ActiveTable {
+    table: String,
+    row: String,
+    fields_per_iteration: u32,
+}
+
+fn emit_range(
+    out: &mut String,
+    program: &PreparedProgram,
+    range: StatementRange,
+    module: &str,
+    indent: usize,
+    active: &[ActiveTable],
+    invocation: &str,
+    loop_names: &mut usize,
+) {
+    for statement in &program.statements[range.start as usize..range.end as usize] {
+        match statement {
+            Statement::Op(op) => {
+                if writes_input(program, *op) {
+                    continue;
+                }
+                let _ = writeln!(
+                    out,
+                    "{}{}",
+                    " ".repeat(indent),
+                    prepared_call_line(module, *op, active)
+                );
+            }
+            Statement::Loop(loop_step) => {
+                let id = *loop_names;
+                *loop_names += 1;
+                let table = format!("cirrus_table_{id}");
+                let invocations = format!("cirrus_invocations_{id}");
+                let first = format!("cirrus_first_{id}");
+                let count = format!("cirrus_count_{id}");
+                let iteration = format!("cirrus_iteration_{id}");
+                let row = format!("cirrus_row_{id}");
+                let table_values = loop_step
+                    .table
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let invocation_values = loop_step
+                    .invocations
+                    .iter()
+                    .flat_map(|descriptor| [descriptor.first_row, descriptor.iterations])
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let prefix = " ".repeat(indent);
+                let _ = writeln!(out, "{prefix}let {table}: &[u32] = &[{table_values}];");
+                let _ = writeln!(
+                    out,
+                    "{prefix}let {invocations}: &[u32] = &[{invocation_values}];"
+                );
+                let _ = writeln!(
+                    out,
+                    "{prefix}let {first} = {invocations}[({invocation}) * 2usize] as usize;"
+                );
+                let _ = writeln!(
+                    out,
+                    "{prefix}let {count} = {invocations}[({invocation}) * 2usize + 1usize] as usize;"
+                );
+                let _ = writeln!(out, "{prefix}for {iteration} in 0..{count} {{");
+                let _ = writeln!(
+                    out,
+                    "{}let {row} = {first} + {iteration};",
+                    " ".repeat(indent + 4)
+                );
+                let mut nested = active
+                    .iter()
+                    .map(|active| ActiveTable {
+                        table: active.table.clone(),
+                        row: active.row.clone(),
+                        fields_per_iteration: active.fields_per_iteration,
+                    })
+                    .collect::<Vec<_>>();
+                nested.push(ActiveTable {
+                    table: table.clone(),
+                    row: row.clone(),
+                    fields_per_iteration: loop_step.fields_per_iteration,
+                });
+                emit_range(
+                    out,
+                    program,
+                    loop_step.body,
+                    module,
+                    indent + 4,
+                    &nested,
+                    &row,
+                    loop_names,
+                );
+                let _ = writeln!(out, "{prefix}}}");
+            }
         }
-        cirrus_recompile_core::Op::BitAnd(a, b) => {
-            format!(
-                "{module}::bitand(backend, buf, {}, {}, {});",
-                a.0, b.0, scheduled.out.0
-            )
-        }
-        cirrus_recompile_core::Op::BitOr(a, b) => {
-            format!(
-                "{module}::bitor(backend, buf, {}, {}, {});",
-                a.0, b.0, scheduled.out.0
-            )
-        }
-        cirrus_recompile_core::Op::BitXor(a, b) => {
-            format!(
-                "{module}::bitxor(backend, buf, {}, {}, {});",
-                a.0, b.0, scheduled.out.0
-            )
-        }
-        cirrus_recompile_core::Op::Mux { cond, then, r#else } => format!(
-            "{module}::mux(backend, buf, {}, {}, {}, {});",
-            cond.0, then.0, r#else.0, scheduled.out.0
-        ),
     }
 }
 
-fn loop_slot(slot: LoopSlot, table: &str) -> String {
+fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
+    let out = match op {
+        PreparedOp::Create { out, .. }
+        | PreparedOp::BitAnd { out, .. }
+        | PreparedOp::BitOr { out, .. }
+        | PreparedOp::BitXor { out, .. }
+        | PreparedOp::Mux { out, .. } => out,
+    };
+    matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
+}
+
+fn prepared_slot(slot: PreparedSlot, active: &[ActiveTable]) -> String {
     match slot {
-        LoopSlot::Static(slot) => slot.0.to_string(),
-        LoopSlot::Table(field) => format!("{table}[cirrus_row + {field}usize]"),
+        PreparedSlot::Static(slot) => slot.0.to_string(),
+        PreparedSlot::Table { depth, field } => {
+            let active = &active[active.len() - 1 - depth as usize];
+            format!(
+                "{}[{} * {}usize + {}usize]",
+                active.table, active.row, active.fields_per_iteration, field
+            )
+        }
     }
 }
 
-fn loop_call_line(module: &str, op: LoopOp, table: &str) -> String {
+fn prepared_call_line(module: &str, op: PreparedOp, active: &[ActiveTable]) -> String {
     match op {
-        LoopOp::Create { val, out } => format!(
+        PreparedOp::Create { value, out } => format!(
             "{module}::create(backend, buf, {}, {});",
-            val as u8,
-            loop_slot(out, table)
+            value as u8,
+            prepared_slot(out, active)
         ),
-        LoopOp::BitAnd { a, b, out } => format!(
+        PreparedOp::BitAnd { a, b, out } => format!(
             "{module}::bitand(backend, buf, {}, {}, {});",
-            loop_slot(a, table),
-            loop_slot(b, table),
-            loop_slot(out, table)
+            prepared_slot(a, active),
+            prepared_slot(b, active),
+            prepared_slot(out, active)
         ),
-        LoopOp::BitOr { a, b, out } => format!(
+        PreparedOp::BitOr { a, b, out } => format!(
             "{module}::bitor(backend, buf, {}, {}, {});",
-            loop_slot(a, table),
-            loop_slot(b, table),
-            loop_slot(out, table)
+            prepared_slot(a, active),
+            prepared_slot(b, active),
+            prepared_slot(out, active)
         ),
-        LoopOp::BitXor { a, b, out } => format!(
+        PreparedOp::BitXor { a, b, out } => format!(
             "{module}::bitxor(backend, buf, {}, {}, {});",
-            loop_slot(a, table),
-            loop_slot(b, table),
-            loop_slot(out, table)
+            prepared_slot(a, active),
+            prepared_slot(b, active),
+            prepared_slot(out, active)
         ),
-        LoopOp::Mux {
+        PreparedOp::Mux {
             cond,
             then,
             r#else,
             out,
         } => format!(
             "{module}::mux(backend, buf, {}, {}, {}, {});",
-            loop_slot(cond, table),
-            loop_slot(then, table),
-            loop_slot(r#else, table),
-            loop_slot(out, table)
+            prepared_slot(cond, active),
+            prepared_slot(then, active),
+            prepared_slot(r#else, active),
+            prepared_slot(out, active)
         ),
     }
 }

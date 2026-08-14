@@ -12,16 +12,17 @@
 //! `bool` context, a garbled-circuit garbler, or an evaluator depending only
 //! on which addresses the caller wires in with `add_global_mapping`.
 
+use inkwell::AddressSpace;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
 use inkwell::module::{Linkage, Module};
 use inkwell::values::{FunctionValue, GlobalValue, IntValue};
-use inkwell::AddressSpace;
 use inkwell::{IntPredicate, OptimizationLevel};
 
 use cirrus_recompile_core::{
-    LoopOp, LoopSlot, OptimizationOptions, PreparedProgram, PreparedStep, Program, ScheduledOp,
+    OptimizationOptions, PreparedLoop, PreparedOp, PreparedProgram, PreparedSlot, Program,
+    Statement, StatementRange,
 };
 
 /// The address of each pinned runtime function this backend calls, by exact
@@ -263,93 +264,28 @@ fn emit<'ctx>(
         .expect("generated function takes a backend pointer and a buffer pointer")
         .into_pointer_value();
 
-    for (step_index, step) in program.steps.iter().enumerate() {
-        match step {
-            PreparedStep::Flat(ops) => {
-                for &scheduled in ops {
-                    if program.inputs.iter().any(|&input| input == scheduled.out) {
-                        continue;
-                    }
-                    emit_scheduled(
-                        &builder, &pinned, backend, buf, i8_type, i32_type, scheduled,
-                    );
-                }
-            }
-            PreparedStep::Loop(loop_step) => emit_table_loop(
-                context, module, &builder, &pinned, function, backend, buf, i8_type, i32_type,
-                loop_step, step_index,
-            ),
-        }
-    }
+    program
+        .validate()
+        .expect("prepared program must satisfy structural invariants");
+    let mut loop_names = 0usize;
+    emit_range(
+        context,
+        module,
+        builder,
+        &pinned,
+        function,
+        backend,
+        buf,
+        i8_type,
+        i32_type,
+        program,
+        program.entry,
+        &[],
+        i32_type.const_zero(),
+        &mut loop_names,
+    );
     builder.build_return(None).expect("build return");
     pinned
-}
-
-fn emit_scheduled<'ctx>(
-    builder: &Builder<'ctx>,
-    pinned: &PinnedFns<'ctx>,
-    backend: inkwell::values::PointerValue<'ctx>,
-    buf: inkwell::values::PointerValue<'ctx>,
-    i8_type: inkwell::types::IntType<'ctx>,
-    i32_type: inkwell::types::IntType<'ctx>,
-    scheduled: ScheduledOp,
-) {
-    let out = i32_type.const_int(scheduled.out.0 as u64, false);
-    match scheduled.op {
-        cirrus_recompile_core::Op::Create(value) => {
-            let value = i8_type.const_int(value as u64, false);
-            builder
-                .build_call(
-                    pinned.create,
-                    &[backend.into(), buf.into(), value.into(), out.into()],
-                    "",
-                )
-                .expect("build call to cirrus_rt_create");
-        }
-        cirrus_recompile_core::Op::BitAnd(a, b) => emit_binop(
-            builder,
-            pinned.bitand,
-            backend,
-            buf,
-            i32_type.const_int(a.0 as u64, false),
-            i32_type.const_int(b.0 as u64, false),
-            out,
-        ),
-        cirrus_recompile_core::Op::BitOr(a, b) => emit_binop(
-            builder,
-            pinned.bitor,
-            backend,
-            buf,
-            i32_type.const_int(a.0 as u64, false),
-            i32_type.const_int(b.0 as u64, false),
-            out,
-        ),
-        cirrus_recompile_core::Op::BitXor(a, b) => emit_binop(
-            builder,
-            pinned.bitxor,
-            backend,
-            buf,
-            i32_type.const_int(a.0 as u64, false),
-            i32_type.const_int(b.0 as u64, false),
-            out,
-        ),
-        cirrus_recompile_core::Op::Mux { cond, then, r#else } => {
-            builder
-                .build_call(
-                    pinned.mux,
-                    &[
-                        backend.into(),
-                        buf.into(),
-                        i32_type.const_int(cond.0 as u64, false).into(),
-                        i32_type.const_int(then.0 as u64, false).into(),
-                        i32_type.const_int(r#else.0 as u64, false).into(),
-                        out.into(),
-                    ],
-                    "",
-                )
-                .expect("build call to cirrus_rt_mux");
-        }
-    }
 }
 
 fn emit_binop<'ctx>(
@@ -370,8 +306,16 @@ fn emit_binop<'ctx>(
         .expect("build call to pinned binary operation");
 }
 
+#[derive(Clone, Copy)]
+struct ActiveTable<'ctx> {
+    table: GlobalValue<'ctx>,
+    table_type: inkwell::types::ArrayType<'ctx>,
+    row: IntValue<'ctx>,
+    fields_per_iteration: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn emit_table_loop<'ctx>(
+fn emit_range<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
@@ -381,19 +325,108 @@ fn emit_table_loop<'ctx>(
     buf: inkwell::values::PointerValue<'ctx>,
     i8_type: inkwell::types::IntType<'ctx>,
     i32_type: inkwell::types::IntType<'ctx>,
-    loop_step: &cirrus_recompile_core::TableLoop,
-    step_index: usize,
+    program: &PreparedProgram,
+    range: StatementRange,
+    active: &[ActiveTable<'ctx>],
+    invocation: IntValue<'ctx>,
+    loop_names: &mut usize,
 ) {
+    for statement in &program.statements[range.start as usize..range.end as usize] {
+        match statement {
+            Statement::Op(op) => {
+                if writes_input(program, *op) {
+                    continue;
+                }
+                emit_prepared_op(
+                    builder, pinned, backend, buf, i8_type, i32_type, *op, active,
+                );
+            }
+            Statement::Loop(loop_step) => emit_loop(
+                context, module, builder, pinned, function, backend, buf, i8_type, i32_type,
+                program, loop_step, active, invocation, loop_names,
+            ),
+        }
+    }
+}
+
+fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
+    let out = match op {
+        PreparedOp::Create { out, .. }
+        | PreparedOp::BitAnd { out, .. }
+        | PreparedOp::BitOr { out, .. }
+        | PreparedOp::BitXor { out, .. }
+        | PreparedOp::Mux { out, .. } => out,
+    };
+    matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_loop<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+    pinned: &PinnedFns<'ctx>,
+    function: FunctionValue<'ctx>,
+    backend: inkwell::values::PointerValue<'ctx>,
+    buf: inkwell::values::PointerValue<'ctx>,
+    i8_type: inkwell::types::IntType<'ctx>,
+    i32_type: inkwell::types::IntType<'ctx>,
+    program: &PreparedProgram,
+    loop_step: &PreparedLoop,
+    active: &[ActiveTable<'ctx>],
+    invocation: IntValue<'ctx>,
+    loop_names: &mut usize,
+) {
+    let loop_name = *loop_names;
+    *loop_names += 1;
     let values: Vec<IntValue<'ctx>> = loop_step
         .table
         .iter()
         .map(|&value| i32_type.const_int(value as u64, false))
         .collect();
     let table_type = i32_type.array_type(values.len() as u32);
-    let table = module.add_global(table_type, None, &format!("cirrus_table_{step_index}"));
+    let table = module.add_global(table_type, None, &format!("cirrus_table_{loop_name}"));
     table.set_initializer(&i32_type.const_array(&values));
     table.set_constant(true);
     table.set_linkage(Linkage::Private);
+
+    let invocation_values = loop_step
+        .invocations
+        .iter()
+        .flat_map(|descriptor| [descriptor.first_row, descriptor.iterations])
+        .map(|value| i32_type.const_int(value as u64, false))
+        .collect::<Vec<_>>();
+    let invocation_type = i32_type.array_type(invocation_values.len() as u32);
+    let invocations = module.add_global(
+        invocation_type,
+        None,
+        &format!("cirrus_loop_invocations_{loop_name}"),
+    );
+    invocations.set_initializer(&i32_type.const_array(&invocation_values));
+    invocations.set_constant(true);
+    invocations.set_linkage(Linkage::Private);
+    let invocation_offset = builder
+        .build_int_mul(
+            invocation,
+            i32_type.const_int(2, false),
+            "cirrus_invocation_offset",
+        )
+        .expect("compute loop invocation offset");
+    let first_row = load_table_value(
+        builder,
+        i32_type,
+        invocations,
+        invocation_type,
+        invocation_offset,
+    );
+    let count_index = builder
+        .build_int_add(
+            invocation_offset,
+            i32_type.const_int(1, false),
+            "cirrus_invocation_count_index",
+        )
+        .expect("compute loop invocation count index");
+    let count = load_table_value(builder, i32_type, invocations, invocation_type, count_index);
 
     let preheader = builder
         .get_insert_block()
@@ -409,30 +442,51 @@ fn emit_table_loop<'ctx>(
         .build_phi(i32_type, "cirrus_iteration")
         .expect("build loop phi");
     iteration.add_incoming(&[(&i32_type.const_zero(), preheader)]);
-    let active = builder
+    let loop_active = builder
         .build_int_compare(
             IntPredicate::ULT,
             iteration.as_basic_value().into_int_value(),
-            i32_type.const_int(loop_step.iterations as u64, false),
+            count,
             "cirrus_loop_active",
         )
         .expect("compare table-loop iteration");
     builder
-        .build_conditional_branch(active, body, exit)
+        .build_conditional_branch(loop_active, body, exit)
         .expect("branch from table-loop header");
     builder.position_at_end(body);
     let row = builder
         .build_int_mul(
             iteration.as_basic_value().into_int_value(),
-            i32_type.const_int(loop_step.fields_per_iteration as u64, false),
-            "cirrus_row",
+            i32_type.const_int(1, false),
+            "cirrus_row_offset",
         )
-        .expect("compute table-loop row");
-    for &op in &loop_step.ops {
-        emit_loop_op(
-            builder, pinned, backend, buf, i8_type, i32_type, table, table_type, row, op,
-        );
-    }
+        .expect("compute loop iteration row offset");
+    let row = builder
+        .build_int_add(first_row, row, "cirrus_row")
+        .expect("compute loop table row");
+    let mut nested = active.to_vec();
+    nested.push(ActiveTable {
+        table,
+        table_type,
+        row,
+        fields_per_iteration: loop_step.fields_per_iteration,
+    });
+    emit_range(
+        context,
+        module,
+        builder,
+        pinned,
+        function,
+        backend,
+        buf,
+        i8_type,
+        i32_type,
+        program,
+        loop_step.body,
+        &nested,
+        row,
+        loop_names,
+    );
     let next = builder
         .build_int_add(
             iteration.as_basic_value().into_int_value(),
@@ -451,35 +505,33 @@ fn emit_table_loop<'ctx>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_loop_op<'ctx>(
+fn emit_prepared_op<'ctx>(
     builder: &Builder<'ctx>,
     pinned: &PinnedFns<'ctx>,
     backend: inkwell::values::PointerValue<'ctx>,
     buf: inkwell::values::PointerValue<'ctx>,
     i8_type: inkwell::types::IntType<'ctx>,
     i32_type: inkwell::types::IntType<'ctx>,
-    table: GlobalValue<'ctx>,
-    table_type: inkwell::types::ArrayType<'ctx>,
-    row: IntValue<'ctx>,
-    op: LoopOp,
+    op: PreparedOp,
+    active: &[ActiveTable<'ctx>],
 ) {
-    let slot = |slot| resolve_loop_slot(builder, i32_type, table, table_type, row, slot);
+    let slot = |slot| resolve_prepared_slot(builder, i32_type, slot, active);
     match op {
-        LoopOp::Create { val, out } => {
+        PreparedOp::Create { value, out } => {
             builder
                 .build_call(
                     pinned.create,
                     &[
                         backend.into(),
                         buf.into(),
-                        i8_type.const_int(val as u64, false).into(),
+                        i8_type.const_int(value as u64, false).into(),
                         slot(out).into(),
                     ],
                     "",
                 )
                 .expect("build table-loop create");
         }
-        LoopOp::BitAnd { a, b, out } => emit_binop(
+        PreparedOp::BitAnd { a, b, out } => emit_binop(
             builder,
             pinned.bitand,
             backend,
@@ -488,7 +540,7 @@ fn emit_loop_op<'ctx>(
             slot(b),
             slot(out),
         ),
-        LoopOp::BitOr { a, b, out } => emit_binop(
+        PreparedOp::BitOr { a, b, out } => emit_binop(
             builder,
             pinned.bitor,
             backend,
@@ -497,7 +549,7 @@ fn emit_loop_op<'ctx>(
             slot(b),
             slot(out),
         ),
-        LoopOp::BitXor { a, b, out } => emit_binop(
+        PreparedOp::BitXor { a, b, out } => emit_binop(
             builder,
             pinned.bitxor,
             backend,
@@ -506,7 +558,7 @@ fn emit_loop_op<'ctx>(
             slot(b),
             slot(out),
         ),
-        LoopOp::Mux {
+        PreparedOp::Mux {
             cond,
             then,
             r#else,
@@ -530,39 +582,55 @@ fn emit_loop_op<'ctx>(
     }
 }
 
-fn resolve_loop_slot<'ctx>(
+fn resolve_prepared_slot<'ctx>(
     builder: &Builder<'ctx>,
     i32_type: inkwell::types::IntType<'ctx>,
-    table: GlobalValue<'ctx>,
-    table_type: inkwell::types::ArrayType<'ctx>,
-    row: IntValue<'ctx>,
-    slot: LoopSlot,
+    slot: PreparedSlot,
+    active: &[ActiveTable<'ctx>],
 ) -> IntValue<'ctx> {
     match slot {
-        LoopSlot::Static(slot) => i32_type.const_int(slot.0 as u64, false),
-        LoopSlot::Table(field) => {
+        PreparedSlot::Static(slot) => i32_type.const_int(slot.0 as u64, false),
+        PreparedSlot::Table { depth, field } => {
+            let active = active[active.len() - 1 - depth as usize];
+            let index = builder
+                .build_int_mul(
+                    active.row,
+                    i32_type.const_int(active.fields_per_iteration as u64, false),
+                    "cirrus_table_row_offset",
+                )
+                .expect("compute table-loop row offset");
             let index = builder
                 .build_int_add(
-                    row,
+                    index,
                     i32_type.const_int(field as u64, false),
                     "cirrus_table_index",
                 )
                 .expect("compute table-loop field index");
-            let ptr = unsafe {
-                builder.build_in_bounds_gep(
-                    table_type,
-                    table.as_pointer_value(),
-                    &[i32_type.const_zero(), index],
-                    "cirrus_table_slot",
-                )
-            }
-            .expect("address table-loop field");
-            builder
-                .build_load(i32_type, ptr, "cirrus_table_value")
-                .expect("load table-loop field")
-                .into_int_value()
+            load_table_value(builder, i32_type, active.table, active.table_type, index)
         }
     }
+}
+
+fn load_table_value<'ctx>(
+    builder: &Builder<'ctx>,
+    i32_type: inkwell::types::IntType<'ctx>,
+    table: GlobalValue<'ctx>,
+    table_type: inkwell::types::ArrayType<'ctx>,
+    index: IntValue<'ctx>,
+) -> IntValue<'ctx> {
+    let ptr = unsafe {
+        builder.build_in_bounds_gep(
+            table_type,
+            table.as_pointer_value(),
+            &[i32_type.const_zero(), index],
+            "cirrus_table_slot",
+        )
+    }
+    .expect("address table-loop field");
+    builder
+        .build_load(i32_type, ptr, "cirrus_table_value")
+        .expect("load table-loop field")
+        .into_int_value()
 }
 
 #[cfg(test)]

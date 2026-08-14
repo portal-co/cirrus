@@ -38,7 +38,10 @@
 /// name (or at all).
 pub use cirrus_core;
 
-use cirrus_recompile_core::{Op, PreparedProgram, PreparedStep, Program, ScheduledOp};
+use cirrus_recompile_core::{
+    Op, PreparedLoop, PreparedProgram, PreparedSlot, Program, ScheduledOp, Statement,
+    StatementRange,
+};
 
 /// Define one backend's pinned functions: `create`, `bitand`, `bitor`,
 /// `bitxor`, `mux`, generic only over the lifetimes named in `[$lt,*]` --
@@ -281,6 +284,9 @@ where
         + cirrus_core::ContextWithMux<bool>,
     Backend::Wrapped: Copy,
 {
+    program
+        .validate()
+        .expect("prepared program must satisfy structural invariants");
     assert_eq!(
         inputs.len(),
         program.inputs.len(),
@@ -290,27 +296,71 @@ where
     for (&idx, &value) in program.inputs.iter().zip(inputs) {
         buf[idx.get()] = Some(value);
     }
-    for step in &program.steps {
-        match step {
-            PreparedStep::Flat(ops) => {
-                for &op in ops {
-                    execute_scheduled(backend, &mut buf, op);
-                }
-            }
-            PreparedStep::Loop(loop_step) => {
-                for iteration in 0..loop_step.iterations as usize {
-                    for &op in &loop_step.ops {
-                        execute_scheduled(backend, &mut buf, loop_step.scheduled_op(iteration, op));
-                    }
-                }
-            }
-        }
-    }
+    execute_range(
+        backend,
+        program,
+        program.entry,
+        &mut buf,
+        &mut Vec::new(),
+        0,
+    );
     program
         .outputs
         .iter()
         .map(|idx| buf[idx.get()].unwrap())
         .collect()
+}
+
+struct ActiveLoop<'a> {
+    loop_step: &'a PreparedLoop,
+    row: usize,
+}
+
+fn execute_range<'a, Backend>(
+    backend: &mut Backend,
+    program: &'a PreparedProgram,
+    range: StatementRange,
+    buf: &mut [Option<Backend::Wrapped>],
+    active: &mut Vec<ActiveLoop<'a>>,
+    invocation: usize,
+) where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>,
+    Backend::Wrapped: Copy,
+{
+    let start = range.start as usize;
+    let end = range.end as usize;
+    for statement in &program.statements[start..end] {
+        match statement {
+            Statement::Op(op) => {
+                execute_scheduled(backend, buf, op.resolve(|slot| resolve_slot(slot, active)))
+            }
+            Statement::Loop(loop_step) => {
+                let descriptor = loop_step.invocations[invocation];
+                for iteration in 0..descriptor.iterations as usize {
+                    let row = descriptor.first_row as usize + iteration;
+                    active.push(ActiveLoop { loop_step, row });
+                    execute_range(backend, program, loop_step.body, buf, active, row);
+                    active.pop();
+                }
+            }
+        }
+    }
+}
+
+fn resolve_slot(slot: PreparedSlot, active: &[ActiveLoop<'_>]) -> cirrus_recompile_core::Idx {
+    match slot {
+        PreparedSlot::Static(slot) => slot,
+        PreparedSlot::Table { depth, field } => {
+            let active = &active[active.len() - 1 - depth as usize];
+            let offset =
+                active.row * active.loop_step.fields_per_iteration as usize + field as usize;
+            cirrus_recompile_core::Idx(active.loop_step.table[offset])
+        }
+    }
 }
 
 fn execute_scheduled<Backend>(

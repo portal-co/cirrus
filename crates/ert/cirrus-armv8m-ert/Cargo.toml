@@ -4,9 +4,15 @@ edition = "2024"
 version.workspace = true
 description = "Symbolic Armv8-M Thumb-2 interpreter facade"
 
+[features]
+# Prepared artifacts allocate their table pool; keep that capability out of
+# allocator-free bare-metal users unless explicitly requested.
+prepared-recording = ["dep:cirrus-recompile-core"]
+
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core", optional = true }
 
 [dev-dependencies]
 cirrus-ert-sha256-fixture = { version = "0.1.0", path = "../cirrus-ert-sha256-fixture" }
