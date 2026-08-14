@@ -41,6 +41,28 @@ pub struct PinnedAddresses {
     pub mux: usize,
 }
 
+/// An error while adding a Cirrus companion function to an LLVM module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmitError {
+    message: String,
+}
+
+impl EmitError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl core::fmt::Display for EmitError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for EmitError {}
+
 /// A [`Program`] compiled to an LLVM module and JIT-loaded, ready to run.
 ///
 /// Borrows an inkwell [`Context`] the caller owns, following inkwell's usual
@@ -186,7 +208,7 @@ struct PinnedFns<'ctx> {
 fn declare_pinned_functions<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-) -> PinnedFns<'ctx> {
+) -> Result<PinnedFns<'ctx>, EmitError> {
     let void_type = context.void_type();
     let i8_type = context.i8_type();
     let i32_type = context.i32_type();
@@ -228,13 +250,63 @@ fn declare_pinned_functions<'ctx>(
         false,
     );
 
-    PinnedFns {
-        create: module.add_function("cirrus_rt_create", create_type, Some(Linkage::External)),
-        bitand: module.add_function("cirrus_rt_bitand", binop_type, Some(Linkage::External)),
-        bitor: module.add_function("cirrus_rt_bitor", binop_type, Some(Linkage::External)),
-        bitxor: module.add_function("cirrus_rt_bitxor", binop_type, Some(Linkage::External)),
-        mux: module.add_function("cirrus_rt_mux", mux_type, Some(Linkage::External)),
+    Ok(PinnedFns {
+        create: reusable_pinned_function(module, "cirrus_rt_create", create_type)?,
+        bitand: reusable_pinned_function(module, "cirrus_rt_bitand", binop_type)?,
+        bitor: reusable_pinned_function(module, "cirrus_rt_bitor", binop_type)?,
+        bitxor: reusable_pinned_function(module, "cirrus_rt_bitxor", binop_type)?,
+        mux: reusable_pinned_function(module, "cirrus_rt_mux", mux_type)?,
+    })
+}
+
+fn reusable_pinned_function<'ctx>(
+    module: &Module<'ctx>,
+    name: &str,
+    type_: inkwell::types::FunctionType<'ctx>,
+) -> Result<FunctionValue<'ctx>, EmitError> {
+    if let Some(function) = module.get_function(name) {
+        if function.get_type() != type_ {
+            return Err(EmitError::new(format!(
+                "pinned runtime operation `{name}` has an incompatible ABI"
+            )));
+        }
+        return Ok(function);
     }
+    Ok(module.add_function(name, type_, Some(Linkage::External)))
+}
+
+/// Add a prepared Cirrus program as `fn_name` to an existing LLVM module.
+///
+/// The generated function has the portable pinned ABI
+/// `void (ptr backend, ptr scratch_buffer)`.  The module receives (or reuses)
+/// declarations for the five untagged pinned runtime operations.  This is the
+/// in-place emission seam used by the LLVM pass; [`CompiledProgram`] retains
+/// the owning-JIT convenience API above.
+pub fn emit_prepared_into_module<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+    program: &PreparedProgram,
+    fn_name: &str,
+) -> Result<FunctionValue<'ctx>, EmitError> {
+    program
+        .validate()
+        .map_err(|error| EmitError::new(format!("invalid prepared program: {error:?}")))?;
+    let expected = context.void_type().fn_type(
+        &[
+            context.ptr_type(AddressSpace::default()).into(),
+            context.ptr_type(AddressSpace::default()).into(),
+        ],
+        false,
+    );
+    if let Some(function) = module.get_function(fn_name) {
+        if function.count_basic_blocks() != 0 || function.get_type() != expected {
+            return Err(EmitError::new(format!(
+                "LLVM module already defines incompatible Cirrus companion `{fn_name}`"
+            )));
+        }
+    }
+    Ok(emit_inner(context, module, builder, program, fn_name)?.1)
 }
 
 fn emit<'ctx>(
@@ -244,7 +316,19 @@ fn emit<'ctx>(
     program: &PreparedProgram,
     fn_name: &str,
 ) -> PinnedFns<'ctx> {
-    let pinned = declare_pinned_functions(context, module);
+    emit_inner(context, module, builder, program, fn_name)
+        .expect("new JIT module must accept the pinned runtime ABI")
+        .0
+}
+
+fn emit_inner<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+    program: &PreparedProgram,
+    fn_name: &str,
+) -> Result<(PinnedFns<'ctx>, FunctionValue<'ctx>), EmitError> {
+    let pinned = declare_pinned_functions(context, module)?;
 
     let void_type = context.void_type();
     let i8_type = context.i8_type();
@@ -252,7 +336,19 @@ fn emit<'ctx>(
     let ptr_type = context.ptr_type(AddressSpace::default());
 
     let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
-    let function = module.add_function(fn_name, fn_type, None);
+    let function = module
+        .get_function(fn_name)
+        .unwrap_or_else(|| module.add_function(fn_name, fn_type, None));
+    assert_eq!(
+        function.get_type(),
+        fn_type,
+        "companion declaration type must match"
+    );
+    assert_eq!(
+        function.count_basic_blocks(),
+        0,
+        "companion must not already have a body"
+    );
     let entry = context.append_basic_block(function, "entry");
     builder.position_at_end(entry);
     let backend = function
@@ -285,7 +381,7 @@ fn emit<'ctx>(
         &mut loop_names,
     );
     builder.build_return(None).expect("build return");
-    pinned
+    Ok((pinned, function))
 }
 
 fn emit_binop<'ctx>(

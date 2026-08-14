@@ -34,8 +34,8 @@ use inkwell::module::Module;
 use inkwell::targets::TargetData;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
 use inkwell::values::{
-    AnyValue, AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode,
-    InstructionValue, Operand, PhiValue, ValueKind,
+    AnyValue, AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue,
+    InstructionOpcode, InstructionValue, Operand, PhiValue, ValueKind,
 };
 
 /// Boolean operation context used by the in-memory LLVM runner.
@@ -674,28 +674,75 @@ impl<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend>
     }
 
     fn seed_globals(&mut self) -> Result<(), FrontendError> {
-        for global in self.module.get_globals() {
-            let name = cstr(global.get_name());
+        // Mutable globals are an explicit part of the request. Validate and
+        // install those up front so exports can name them even if execution
+        // does not touch them. Immutable globals are deliberately installed
+        // on first use below: a module can carry arbitrary compiler metadata
+        // and other inert constant aggregates alongside the selected kernel.
+        // This also avoids charging the bounded executor for unrelated data.
+        for binding in self.request.globals {
+            let global = self.module.get_global(&binding.name).ok_or_else(|| {
+                FrontendError::request(format!("global @{} does not exist", binding.name))
+            })?;
             if global.is_constant() {
-                let initializer = global.get_initializer().ok_or_else(|| {
-                    FrontendError::unsupported(format!(
-                        "immutable global @{name} has no initializer"
-                    ))
-                })?;
-                let bytes = self.constant_bytes(initializer)?;
-                self.add_region(bytes, false, format!("global @{name}"));
-                self.globals.insert(name, self.regions.len() - 1);
-            } else if let Some(binding) = self
-                .request
-                .globals
-                .iter()
-                .find(|binding| binding.name == name)
-            {
-                let region = self.request_region(&binding.region, format!("global @{name}"))?;
-                self.add_region(region, binding.region.writable, format!("global @{name}"));
-                self.globals.insert(name, self.regions.len() - 1);
+                return Err(FrontendError::request(format!(
+                    "global @{} is immutable and must not have a mutable binding",
+                    binding.name
+                )));
+            }
+            let region =
+                self.request_region(&binding.region, format!("global @{}", binding.name))?;
+            self.add_region(
+                region,
+                binding.region.writable,
+                format!("global @{}", binding.name),
+            );
+            self.globals
+                .insert(binding.name.clone(), self.regions.len() - 1);
+        }
+
+        // An immutable memory export is observable even if the entry never
+        // loads it, so materialize it before execution finishes.
+        let exported_immutable = self
+            .request
+            .exports
+            .iter()
+            .filter_map(|export| match export {
+                Export::GlobalMemory { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for name in exported_immutable {
+            if self.globals.contains_key(name) {
+                continue;
+            }
+            let global = self
+                .module
+                .get_global(name)
+                .ok_or_else(|| FrontendError::request(format!("global @{name} does not exist")))?;
+            if global.is_constant() {
+                self.seed_immutable_global(global)?;
             }
         }
+        Ok(())
+    }
+
+    fn seed_immutable_global(&mut self, global: GlobalValue<'ctx>) -> Result<(), FrontendError> {
+        let name = cstr(global.get_name());
+        if self.globals.contains_key(&name) {
+            return Ok(());
+        }
+        if !global.is_constant() {
+            return Err(FrontendError::request(format!(
+                "mutable global @{name} requires an explicit region binding"
+            )));
+        }
+        let initializer = global.get_initializer().ok_or_else(|| {
+            FrontendError::unsupported(format!("immutable global @{name} has no initializer"))
+        })?;
+        let bytes = self.constant_bytes(initializer)?;
+        self.add_region(bytes, false, format!("global @{name}"));
+        self.globals.insert(name, self.regions.len() - 1);
         Ok(())
     }
 
@@ -1524,6 +1571,11 @@ impl<'module, 'ctx, 'request, 'backend, Backend: ExecutionBackend>
         if let BasicValueEnum::PointerValue(pointer) = value {
             let name = cstr(pointer.get_name());
             if let Some(&region) = self.globals.get(&name) {
+                return Ok(Value::Pointer(Pointer { region, offset: 0 }));
+            }
+            if let Some(global) = self.module.get_global(&name) {
+                self.seed_immutable_global(global)?;
+                let region = self.globals[&name];
                 return Ok(Value::Pointer(Pointer { region, offset: 0 }));
             }
             if pointer.is_undef() || pointer.is_poison() {

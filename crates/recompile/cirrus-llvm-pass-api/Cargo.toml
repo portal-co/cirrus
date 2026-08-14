@@ -1,0 +1,9 @@
+[package]
+name = "cirrus-llvm-pass-api"
+edition = "2024"
+version.workspace = true
+description = "Static source descriptors for the Cirrus LLVM pass"
+
+[lib]
+path = "src/lib.rs"
+

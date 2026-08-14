@@ -1,0 +1,21 @@
+[package]
+name = "cirrus-llvm-pass"
+edition = "2024"
+version.workspace = true
+description = "LLVM 22 pass-plugin integration for Cirrus"
+readme = "README.md"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
+cirrus-llvm-frontend = { version = "0.1.0", path = "../cirrus-llvm-frontend" }
+cirrus-llvm-pass-api = { version = "0.1.0", path = "../cirrus-llvm-pass-api" }
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+inkwell = { workspace = true, features = ["llvm22-1"] }
+
+[build-dependencies]
+cc = "1"
