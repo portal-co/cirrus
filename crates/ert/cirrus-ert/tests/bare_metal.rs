@@ -15,7 +15,8 @@ fn rv32im_sha256_self_test_runs_under_qemu() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|path| path.parent())
-        .expect("cirrus-ert lives in the workspace crates directory")
+        .and_then(|path| path.parent())
+        .expect("cirrus-ert lives below the workspace crates directory")
         .to_owned();
     let target_dir = root.join("target/cirrus-ert-selftest");
     let build = Command::new("cargo")

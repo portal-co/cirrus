@@ -5,7 +5,7 @@ version.workspace = true
 description = "Symbolic Armv8-M Thumb-2 interpreter facade"
 
 [dependencies]
-cirrus-core = { version = "0.1.0", path = "../cirrus-core" }
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
 
 [dev-dependencies]

@@ -19,6 +19,7 @@ fn thumbv8m_sha256_self_test_runs_under_qemu() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
         .unwrap()
         .to_owned();
     let target = root.join("target/cirrus-armv8m-ert-selftest");

@@ -9,9 +9,9 @@ their Boolean-word circuits, symbolic-stack model, concrete-value tracking,
 raw-memory mapping, and host-call convention through the internal
 `cirrus-ert-core` crate.
 
-- [`cirrus-ert`](crates/cirrus-ert/src/lib.rs) is the compatible RV32 RISC-V
+- [`cirrus-ert`](crates/ert/cirrus-ert/src/lib.rs) is the compatible RV32 RISC-V
   facade.
-- [`cirrus-armv8m-ert`](crates/cirrus-armv8m-ert/src/lib.rs) is the non-secure,
+- [`cirrus-armv8m-ert`](crates/ert/cirrus-armv8m-ert/src/lib.rs) is the non-secure,
   Thumb-only Armv8-M Mainline/Cortex-M33 facade. Its ABI wrapper follows
   AAPCS32; it accepts an odd Thumb entry address and sixteen core registers.
 
@@ -44,7 +44,7 @@ It is intended for circuit-oriented execution, not as a general RISC-V
 emulator. Programs must use the documented supported instruction subset,
 aligned non-compressed control flow, concrete branch decisions, conventional
 calls and returns, and caller-provided stacks with sufficient capacity. The
-[crate documentation](crates/cirrus-ert/src/lib.rs) describes the supported
+[crate documentation](crates/ert/cirrus-ert/src/lib.rs) describes the supported
 instructions, buffers, ECALLs, and public entry points.
 
 Instruction images are supplied through `RawMemory`. `RawMemory::from(&slice)`
