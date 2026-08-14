@@ -30,6 +30,31 @@ tests, not Linux VMs. QEMU's AN505 model boots from its remapped flash vector
 at `0x1000_0000`, so the fixture places only its vector/reset stub there while
 keeping the interpreted code and constants at the high RAM address.
 
+## Streaming garbled circuits
+
+[`cirrus-garbled-circuit`](crates/cirrus-garbled-circuit/src/lib.rs) is the
+stable four-row-table baseline backend. It emits every non-free table to a
+caller-supplied `Pusher` in circuit order; it deliberately does not own a
+circuit buffer, network driver, allocator, or async runtime. An embedded
+integrator must stream or durably hand off each table before accepting the
+next—typically through a coroutine/event-loop adapter with a small bounded
+frame buffer. A full table vector is a host-test convenience, never a viable
+microcontroller integration.
+
+The locked SHA-256 workload makes Thumb/`thumbv8m.main-none-eabi` the primary
+microcontroller garbling target: it emits 164,288 four-row tables (10.5 MB) at
+16-byte labels, compared with RV32IM's 429,216 (27.5 MB). Its measured
+symbolic-stack write span is 22.5 KiB, compared with 20.0 KiB for RV32IM;
+table traffic, not retained-table RAM, is the dominant difference. RV32IM
+remains supported as a compatibility and regression target.
+
+All measurements are generated traffic with a streaming sink. Device RAM must
+also include symbolic registers, the active symbolic-stack span, the return
+stack, garbler state, and the integrator's bounded transport buffer. The
+repository keeps alternative garbling implementations isolated from this
+baseline so that their wire formats and security/performance tradeoffs can
+iterate independently.
+
 ## `cirrus-ert`
 
 `cirrus-ert` is a symbolic interpreter for a deliberately well-behaved subset

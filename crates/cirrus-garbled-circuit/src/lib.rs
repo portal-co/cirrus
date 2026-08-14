@@ -1,5 +1,37 @@
 #![no_std]
 
+//! Streaming baseline garbled-circuit construction.
+//!
+//! [`GC`] is the stable, four-row-table baseline for the Boolean context seam
+//! shared by the symbolic interpreters. XOR is free; AND emits one table, and
+//! OR is synthesized from those two operations. It deliberately knows nothing
+//! about transport, allocation, or task scheduling.
+//!
+//! # Streaming contract
+//!
+//! A caller supplies a [`Pusher`] as the table sink. Every non-free gate calls
+//! [`Pusher::push`] synchronously, in circuit order. Production adapters must
+//! consume or durably hand off that table before returning; they must not retain
+//! an unbounded circuit or silently drop a table when a network buffer is full.
+//! The sink is the seam at which an embedded integrator can use a small frame
+//! buffer and its own coroutine or event loop to transmit tables while the
+//! circuit is garbled.
+//!
+//! The synchronous interface intentionally does not prescribe an async runtime
+//! or a buffering policy. A blocking network write, a bounded driver queue, and
+//! a cooperative producer are all valid adapters, provided that backpressure is
+//! resolved before the next table is accepted.
+//!
+//! # Embedded ERT use
+//!
+//! `GC` implements the native-`bool` Boolean context traits used by
+//! `cirrus-ert` and `cirrus-armv8m-ert`. The locked SHA-256 self-tests provide
+//! the current traffic baseline: at 16-byte labels, RV32 emits 429,216 tables
+//! (27.5 MB) and Thumb emits 164,288 tables (10.5 MB). These are generated
+//! bytes, not required RAM when the sink streams. Integrators must still budget
+//! wire registers, the symbolic stack, the return stack, and their bounded
+//! transport buffer.
+
 #[cfg(test)]
 extern crate std;
 
@@ -11,9 +43,13 @@ use cirrus_core::{
 };
 use digest::{Digest, array::Array};
 
+/// A four-row garbling context that emits each non-free gate to a streaming sink.
 pub struct GC<'a, 'b, D: Digest, const N: usize> {
+    /// The ordered streaming destination for four-row AND tables.
     pub queue: &'a mut (dyn Pusher<[[u8; N]; 4]> + 'b),
+    /// The evolving digest state used to form each new output-wire label.
     pub seed: Array<u8, D::OutputSize>,
+    /// The global free-XOR offset; its low bit must be set by the caller.
     pub delta: Array<u8, D::OutputSize>,
 }
 impl<D: Digest, const N: usize> HasError for GC<'_, '_, D, N> {

@@ -10,6 +10,10 @@
 //! the small host-call ABI; symbolic data is emitted through
 //! [`ContextWithArmv8mOps`]. The data-flow circuits, stack model, raw-memory
 //! handling, selectors, shifts, and multipliers are shared with `cirrus-ert`.
+//! For constrained streaming-garbled deployments, this Thumb facade is the
+//! primary measurement target: the locked SHA-256 workload currently emits
+//! substantially fewer non-free gates than its RV32IM counterpart. RV32IM
+//! remains a supported compatibility target rather than a deprecated facade.
 //!
 //! This facade is for one Thumb-only Armv8-M Mainline/Cortex-M33 thread in the
 //! non-secure state. It does not emulate exceptions, TrustZone transitions,
