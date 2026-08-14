@@ -1,7 +1,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
-//! Offline/online input-label batching for a future TinyLabels backend.
+//! Offline/online input-label batching and experimental TinyLabels Ring-LWE.
 //!
 //! This crate owns the input-label seam, rather than either stable garbling
 //! table format. An offline [`LabelBatch`] validates the global free-XOR
@@ -12,25 +12,38 @@
 //! [`LabelBatch::select`] is intentionally a local reference adapter. It is
 //! useful for correctness tests and for defining the allocation-free embedded
 //! interface, but it is **not** a TinyLabels/Ring-LWE protocol and makes no
-//! privacy or integrity claim. A later Ring-LWE implementation will produce
-//! the same selected-label buffer without exposing the choice bits to the
-//! evaluator. Keeping that implementation in this crate preserves the stable
+//! privacy or integrity claim. [`ring_lwe`] now implements the paper's staged
+//! Ring-LWE field-element batch-select construction, but it deliberately does
+//! not turn raw labels into field elements: that canonical mapping, the
+//! required CSPRNG and noise sampler, and a framed transport need independent
+//! protocol review. Keeping both seams in this crate preserves the stable
 //! four-row and first-row-fixed table formats.
 //!
 //! The [`PAPER_PROFILE`] constants record the reported 128-bit-security
 //! benchmark shape from ePrint 2024/2048. They are compatibility targets, not
-//! enough to instantiate cryptography: modulus representation, noise,
-//! encoding, key generation, and transcript formats still require validated
-//! construction parameters.
+//! enough to make a deployment-security claim: label encoding, noise sampling,
+//! parameter review, and transcript formats still require validation.
+
+extern crate alloc;
+
+/// Experimental Ring-LWE batch selection following TinyLabels Construction 3.
+///
+/// This module is intentionally separate from the local [`LabelBatch`] adapter.
+/// It implements the construction's arithmetic and staged `setup`, `enc1`,
+/// `enc2`, `keygen`, and `dec` flow, but deliberately leaves the caller in
+/// charge of a reviewed CSPRNG, the paper's discrete-noise distribution, and a
+/// canonical mapping between garbling labels and field elements. See
+/// [`ring_lwe::BatchSelect`] for the security and interoperability boundaries.
+pub mod ring_lwe;
 
 /// The claimed security target for the current deployment profile.
 pub const SECURITY_BITS: usize = 128;
 
 /// A reported TinyLabels parameter/profile shape from the paper.
 ///
-/// The values are descriptive only. They must not be treated as a validated
-/// cryptographic parameter set until the Ring-LWE construction and its
-/// encoding have interoperable known-answer tests.
+/// The values are descriptive only. They must not be treated as a deployment
+/// parameter set until label encoding, noise sampling, and transcript handling
+/// have interoperable tests and an independent security review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaperProfile {
     /// The target security level in bits.

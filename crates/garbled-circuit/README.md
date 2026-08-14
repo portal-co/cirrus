@@ -14,12 +14,15 @@ a completeness and cost baseline, not an authenticated-garbling protocol.
 Its locked Thumb SHA-256 replay and memory/traffic result are recorded in
 [`THUMB_SHA256_MEASUREMENT.md`](THUMB_SHA256_MEASUREMENT.md).
 
-`cirrus-garbled-circuit-tinylabels` is a separate, allocation-free
-offline/online input-label batching module. Its current local selector is a
-reference adapter that defines the buffer-level interface and validates
-free-XOR pairs; it is not a Ring-LWE implementation or a security protocol.
-The future ePrint 2024/2048 construction will live behind that module's seam
-without changing either table format.
+`cirrus-garbled-circuit-tinylabels` keeps the allocation-free local label
+selector and a separate experimental implementation of the ePrint 2024/2048
+Ring-LWE batch-select arithmetic. The latter has typed `setup`/`enc1`/`enc2`/
+`keygen`/`dec` stages, a caller-supplied CSPRNG and noise-sampler seam, and
+small-profile correctness tests. It is not a security protocol: canonical
+label encoding, framed streaming messages, a reviewed discrete Gaussian, and
+independent parameter/security validation remain necessary. Its cited
+construction and an audit of the authors' reference are recorded in
+[`cirrus-garbled-circuit-tinylabels/RESEARCH.md`](cirrus-garbled-circuit-tinylabels/RESEARCH.md).
 
 All implementations use the Boolean-context seam consumed by the ERT facades.
 Their tests must exercise the same primitive truth tables and locked RV32/Thumb

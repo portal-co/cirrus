@@ -3,10 +3,11 @@
 Status: the paper/backend decision record is complete. The stable four-row
 evaluator and the separate first-row-fixed experimental backend now have
 public-ERT completeness tests, including the locked Thumb SHA-256 replay.
-`MachineHandler` and the actual TinyLabels/Ring-LWE encoder remain to be
-implemented. A separate allocation-free reference label-batching module now
-defines the offline/online selected-label interface without making a
-cryptographic claim.
+`MachineHandler` and the label-to-field encoding remain to be implemented. A
+separate allocation-free reference label-batching module defines the
+offline/online selected-label interface, while its sibling Ring-LWE module now
+implements the cited construction's field-element arithmetic without making a
+deployment-security claim.
 
 Source reviewed: *TinyLabels: How to Compress Garbled Circuit Input Labels,
 Efficiently*, Marian Dietz, Hanjun Li, and Huijia Lin, ePrint 2024/2048
@@ -174,13 +175,16 @@ Its synchronous `Pusher` is the transport seam and remains integrator-owned.
 3. The first-row-fixed backend is now its own crate with a distinct
    three-row record format and versioned row derivation. It does not
    reinterpret baseline four-row records.
-4. `cirrus-garbled-circuit-tinylabels` now validates offline free-XOR input
-   label pairs and writes selected online labels into a caller buffer without
-   allocation. That local adapter is deliberately not private or secure
-   transfer: the Ring-LWE encoder must replace it while retaining the same
-   selected-label result and without depending on baseline table-format
-   internals. Its design must respect the 256 KiB RAM, 2 MiB flash, and
-   approximately one-million-use targets.
+4. `cirrus-garbled-circuit-tinylabels` validates offline free-XOR input label
+   pairs and writes selected online labels into a caller buffer without
+   allocation. Its `ring_lwe` module also implements Construction 3's typed
+   `setup`/`enc1`/`enc2`/`keygen`/`dec` field-element stages, exact reference
+   modulus/gadget parameters, RNS/NTT arithmetic, and a zero-noise semantic
+   test profile. It deliberately requires caller-supplied CSPRNG and noise
+   implementations and exposes polynomial iteration only as a framing seam;
+   it is not yet a secure transfer, a canonical label encoding, or a
+   microcontroller-fit backend. Its design must still respect the 256 KiB RAM,
+   2 MiB flash, and approximately one-million-use targets.
 5. Compare each backend on the exact Thumb SHA-256 workload first, with a
    streaming sink, bounded transport buffer, an evaluator/interoperability
    test, and separately measured device RAM, flash, time, energy, table bytes,
