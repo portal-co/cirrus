@@ -12,6 +12,9 @@ use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
 
+#[cfg(test)]
+mod tests;
+
 /// The Boolean operations needed by the shared symbolic-word machinery.
 pub trait ContextWithErtOps<Val>:
     ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<Val>
@@ -32,6 +35,7 @@ impl<Val, T: ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<
 pub struct RawMemory<'a> {
     base: *const u8,
     len: Option<usize>,
+    detect: Option<(u32, u32)>,
     marker: PhantomData<&'a [u8]>,
 }
 
@@ -41,8 +45,18 @@ impl<'a> RawMemory<'a> {
         Self {
             base: memory.as_ptr(),
             len: Some(memory.len()),
+            detect: None,
             marker: PhantomData,
         }
+    }
+
+    /// Overlay a 4-byte little-endian word read at `address` with `value`, in
+    /// place of the underlying backing bytes. This lets guest code that reads
+    /// its real (e.g. zero-initialized) value when run natively detect
+    /// whether it is running under this interpreter instead.
+    pub fn with_ert_detect(mut self, address: u32, value: u32) -> Self {
+        self.detect = Some((address, value));
+        self
     }
 
     /// Read a fixed number of bytes, rejecting an overflowing or out-of-range
@@ -51,6 +65,14 @@ impl<'a> RawMemory<'a> {
     pub fn read<const N: usize>(&self, address: u32) -> Option<[u8; N]> {
         debug_assert!(N > 0);
         address.checked_add(N.checked_sub(1)? as u32)?;
+        if N == 4 {
+            if let Some((detect_address, value)) = self.detect {
+                if address == detect_address {
+                    let bytes = value.to_le_bytes();
+                    return Some(array::from_fn(|i| bytes[i]));
+                }
+            }
+        }
         if let Some(len) = self.len {
             let start = address as usize;
             if start.checked_add(N)? > len {
@@ -87,6 +109,7 @@ impl RawMemory<'static> {
         Self {
             base,
             len,
+            detect: None,
             marker: PhantomData,
         }
     }

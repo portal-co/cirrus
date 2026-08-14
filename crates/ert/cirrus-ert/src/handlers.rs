@@ -3,7 +3,7 @@ use core::array;
 use rv_asm::{Imm, Inst, Reg};
 
 use crate::machine::{Machine, add_bits};
-use crate::{ErtError, machine::LoadAddress};
+use crate::{EcallOutcome, ErtError, machine::LoadAddress};
 
 pub(crate) enum Flow {
     Next(u32),
@@ -122,7 +122,11 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
             branch(machine, offset, src1, src2, Branch::LessThanSigned)
         }
 
-        Inst::Ecall => ecall(machine),
+        Inst::Ecall => match machine.t.ecall(machine.regs, machine.reg_consts, &machine.zero, &machine.one)? {
+            EcallOutcome::Continue => next(machine),
+            EcallOutcome::Exit if machine.sp == machine.stack_top => Ok(Flow::Exit),
+            EcallOutcome::Exit => Err(ErtError::Unexpected),
+        },
         _ => Err(ErtError::Unexpected),
     }
 }
@@ -781,38 +785,4 @@ fn branch<W: Clone, E: core::error::Error>(
     } else {
         machine.pc + 4
     }))
-}
-
-fn ecall<W: Clone, E: core::error::Error>(
-    machine: &mut Machine<'_, W, E>,
-) -> Result<Flow, ErtError<E>> {
-    match machine.reg_consts[Reg::A0.0 as usize] {
-        Some(0) => {
-            let hash = (machine.hash)(&machine.regs[Reg::A1.0 as usize..][..(256 / 32)])
-                .map_err(ErtError::Emitted)?;
-            for ((register, constant), chunk) in machine.regs[Reg::A1.0 as usize..][..(256 / 32)]
-                .iter_mut()
-                .zip(machine.reg_consts[Reg::A1.0 as usize..][..(256 / 32)].iter_mut())
-                .zip(hash.chunks_exact(256 / 32))
-            {
-                let value = u32::from_le_bytes(array::from_fn(|i| chunk[i]));
-                *constant = Some(value);
-                for bit in 0..32 {
-                    register[bit] = if (value >> bit) & 1 == 0 {
-                        machine.zero.clone()
-                    } else {
-                        machine.one.clone()
-                    };
-                }
-            }
-            next(machine)
-        }
-        Some(0xffff_ffff) => {
-            if machine.sp != machine.stack_top {
-                return Err(ErtError::Unexpected);
-            }
-            Ok(Flow::Exit)
-        }
-        _ => Err(ErtError::Unexpected),
-    }
 }

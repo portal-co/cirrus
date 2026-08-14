@@ -48,6 +48,17 @@ unsafe extern "C" {
 pub fn exit<T>() -> T {
     crate::exit_with!()
 }
+/// Zero natively; the interpreter can overlay this address with a nonzero
+/// value via `RawMemory::with_ert_detect` so guest code can tell whether it
+/// is running under the Cirrus ERT.
+#[unsafe(no_mangle)]
+pub static __CIRRUS_ERT_DETECT_FLAG: u32 = 0;
+/// True when running under the interpreter, false natively.
+#[inline(always)]
+pub fn is_ert() -> bool {
+    // SAFETY: reading a valid, always-initialized static's own address.
+    unsafe { core::ptr::read_volatile(&raw const __CIRRUS_ERT_DETECT_FLAG) != 0 }
+}
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 #[macro_export]
 /// Exit the program, with extra register arguments

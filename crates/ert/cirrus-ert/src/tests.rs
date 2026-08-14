@@ -8,7 +8,7 @@ use cirrus_core::{
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{ErtError, RawMemory, ert_emit, ert_func, simple_add};
+use crate::{DefaultHandler, ErtError, RawMemory, ert_emit, ert_func, simple_add};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1u32 << bit) != 0)
@@ -40,9 +40,12 @@ fn run(
 ) -> Result<(), ErtError<Infallible>> {
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     ert_emit(
-        &mut context,
-        &mut hash,
+        &mut handler,
         bounded_memory(mem),
         rstack,
         vstack,
@@ -182,9 +185,12 @@ fn run_counting(
     let mem = program(instructions);
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     assert_success(ert_emit(
-        &mut context,
-        &mut hash,
+        &mut handler,
         bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
@@ -983,10 +989,13 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
         observed.copy_from_slice(words);
         Ok::<_, Infallible>(array::from_fn(|byte| byte as u8))
     };
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
 
     assert_success(ert_emit(
-        &mut context,
-        &mut hash,
+        &mut handler,
         bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
@@ -999,8 +1008,57 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
 
     assert_eq!(value(&observed[0]), 1);
     assert_eq!(value(&observed[7]), 8);
-    assert_eq!(constants[Reg::A1.0 as usize], Some(0x0302_0100));
-    assert_eq!(constants[Reg::S2.0 as usize], Some(8));
+    for i in 0..8 {
+        let expected = u32::from_le_bytes(array::from_fn(|byte| (i * 4 + byte) as u8));
+        assert_eq!(constants[Reg::A1.0 as usize + i], Some(expected));
+    }
+}
+
+#[test]
+fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
+    let mem = program([
+        Inst::Addi {
+            imm: Imm::new_i32(0x100),
+            dest: Reg::T0,
+            src1: Reg::ZERO,
+        },
+        Inst::Lw {
+            offset: Imm::ZERO,
+            dest: Reg::T1,
+            base: Reg::T0,
+        },
+        Inst::Addi {
+            imm: Imm::new_i32(-1),
+            dest: Reg::A0,
+            src1: Reg::ZERO,
+        },
+        Inst::Ecall,
+    ]);
+    let memory = RawMemory::from(mem.as_slice()).with_ert_detect(0x100, 0xdead_beef);
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    let mut context = ();
+    let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
+
+    assert_success(ert_emit(
+        &mut handler,
+        memory,
+        &mut rstack,
+        &mut vstack,
+        0,
+        &mut regs,
+        &mut constants,
+        false,
+        true,
+    ));
+
+    assert_eq!(constants[Reg::T1.0 as usize], Some(0xdead_beef));
 }
 
 #[test]
@@ -1016,10 +1074,13 @@ fn ert_func_moves_register_and_stack_abi_values() {
     });
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
 
     let results = match ert_func::<_, _, 10, 10>(
-        &mut context,
-        &mut hash,
+        &mut handler,
         bounded_memory(&mem),
         &mut rstack,
         &mut vstack,
@@ -1055,11 +1116,14 @@ fn ert_func_rejects_a_symbolic_stack_too_small_for_abi_words() {
     });
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
 
     assert!(matches!(
         ert_func::<_, _, 9, 0>(
-            &mut context,
-            &mut hash,
+            &mut handler,
             bounded_memory(&mem),
             &mut rstack,
             &mut vstack,

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cirrus_armv8m_ert::{ErtError, RawMemory, ert_func};
+use cirrus_armv8m_ert::{DefaultHandler, ErtError, RawMemory, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 const TARGET: &str = "thumbv8m.main-none-eabi";
@@ -99,8 +99,10 @@ fn run_host_image(image: &PathBuf) {
     let mut vstack = [false; 131_072];
     let args = input.map(|value| (array::from_fn(|bit| value & (1 << bit) != 0), None));
     let result = ert_func::<_, _, 16, 2>(
-        &mut (),
-        &mut |_| Ok::<_, Infallible>([0; 32]),
+        &mut DefaultHandler {
+            context: &mut (),
+            hash: &mut |_| Ok::<_, Infallible>([0; 32]),
+        },
         memory,
         &mut rstack,
         &mut vstack,

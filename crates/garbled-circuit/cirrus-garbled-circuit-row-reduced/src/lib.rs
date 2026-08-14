@@ -374,7 +374,7 @@ mod tests {
     use std::vec::Vec;
 
     use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, Pusher};
-    use cirrus_ert::{RawMemory, ert_emit};
+    use cirrus_ert::{DefaultHandler, RawMemory, ert_emit};
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
@@ -498,10 +498,13 @@ mod tests {
         let mut records = Records::default();
         let mut garbler = GC::<Sha256, 16>::new(&mut records, delta);
         let mut hash = garbler_hash;
+        let mut handler = DefaultHandler {
+            context: &mut garbler,
+            hash: &mut hash,
+        };
 
         let garbled = ert_emit(
-            &mut garbler,
-            &mut hash,
+            &mut handler,
             RawMemory::from(instructions.as_slice()),
             &mut garbled_rstack,
             &mut garbled_vstack,
@@ -529,10 +532,13 @@ mod tests {
         let mut evaluated_rstack = [0; 8];
         let mut evaluated_vstack = [zero; 64];
         let mut hash = evaluator_hash;
+        let mut handler = DefaultHandler {
+            context: &mut evaluator,
+            hash: &mut hash,
+        };
 
         let evaluated = ert_emit(
-            &mut evaluator,
-            &mut hash,
+            &mut handler,
             RawMemory::from(instructions.as_slice()),
             &mut evaluated_rstack,
             &mut evaluated_vstack,

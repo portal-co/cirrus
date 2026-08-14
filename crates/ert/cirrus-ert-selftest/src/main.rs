@@ -3,7 +3,7 @@
 
 use core::{array, convert::Infallible, panic::PanicInfo, ptr};
 
-use cirrus_ert::{RawMemory, ert_func};
+use cirrus_ert::{DefaultHandler, RawMemory, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 core::arch::global_asm!(
@@ -54,6 +54,10 @@ extern "C" fn rust_main() -> ! {
     );
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
     let mut rstack = [0; 256];
@@ -65,8 +69,7 @@ extern "C" fn rust_main() -> ! {
     let memory = unsafe { RawMemory::new(ptr::null(), None) };
 
     let results = match ert_func::<_, _, 16, 2>(
-        &mut context,
-        &mut hash,
+        &mut handler,
         memory,
         &mut rstack,
         &mut vstack,

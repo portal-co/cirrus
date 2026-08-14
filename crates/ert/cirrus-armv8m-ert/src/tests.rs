@@ -2,7 +2,7 @@ extern crate std;
 
 use core::{array, convert::Infallible};
 
-use crate::{ErtError, RawMemory, ert_emit, simple_add};
+use crate::{DefaultHandler, ErtError, RawMemory, ert_emit, simple_add};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
@@ -30,11 +30,14 @@ fn run(
     let image = image(code);
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
     ert_emit(
-        &mut context,
-        &mut hash,
+        &mut handler,
         RawMemory::from(&image[..]),
         &mut rstack,
         &mut vstack,
@@ -136,12 +139,15 @@ fn non_thumb_entry_and_invalid_encoding_are_rejected() {
     let bytes = [0u8; 2];
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     let mut rstack = [0; 2];
     let mut vstack = [false; 128];
     assert!(matches!(
         ert_emit(
-            &mut context,
-            &mut hash,
+            &mut handler,
             RawMemory::from(&bytes[..]),
             &mut rstack,
             &mut vstack,
@@ -158,6 +164,40 @@ fn non_thumb_entry_and_invalid_encoding_are_rejected() {
         run(&[0xbe00], &mut regs, &mut constants),
         Err(ErtError::Decode(_))
     ));
+}
+
+#[test]
+fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
+    // movs r0, #0x40; ldr r1, [r0]; movs r0, #0; subs r0, #1; svc 0.
+    let code = image(&[0x2040, 0x6801, 0x2000, 0x3801, 0xdf00]);
+    let memory = RawMemory::from(&code[..]).with_ert_detect(0x40, 0xdead_beef);
+    let mut regs = [[false; 32]; 16];
+    let mut constants = [None; 16];
+    let mut context = ();
+    let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
+    let mut rstack = [0; 16];
+    let mut vstack = [false; 128];
+
+    assert!(
+        ert_emit(
+            &mut handler,
+            memory,
+            &mut rstack,
+            &mut vstack,
+            1,
+            &mut regs,
+            &mut constants,
+            false,
+            true,
+        )
+        .is_ok()
+    );
+
+    assert_eq!(constants[1], Some(0xdead_beef));
 }
 
 #[test]

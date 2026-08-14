@@ -18,7 +18,7 @@ use core::array;
 use core::convert::Infallible;
 
 use cirrus_core::{ContextWithCreate, HasError};
-use cirrus_ert::{RawMemory, ert_func};
+use cirrus_ert::{DefaultHandler, RawMemory, ert_func};
 use cirrus_recompile_core::{Idx, Program, Recorder};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
@@ -69,10 +69,13 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
     let mut vstack = [false; 128];
     let mut context = ();
     let mut hash = no_hash_bool;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
 
     let results = ert_func::<_, _, 2, 5>(
-        &mut context,
-        &mut hash,
+        &mut handler,
         RawMemory::from(mem),
         &mut rstack,
         &mut vstack,
@@ -108,10 +111,13 @@ fn record_program(mem: &[u8]) -> Program {
     let mut rstack = [0u32; 8];
     let mut vstack = [Idx(0); 128];
     let mut hash = no_hash_idx;
+    let mut handler = DefaultHandler {
+        context: &mut recorder,
+        hash: &mut hash,
+    };
 
     let results = ert_func::<_, _, 2, 5>(
-        &mut recorder,
-        &mut hash,
+        &mut handler,
         RawMemory::from(mem),
         &mut rstack,
         &mut vstack,

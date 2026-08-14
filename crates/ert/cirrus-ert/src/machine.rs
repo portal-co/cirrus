@@ -3,7 +3,7 @@ use core::{array, error::Error, ops::Range};
 pub(crate) use cirrus_ert_core::add_bits;
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
-use crate::{ContextWithRvOps, ErtError, RawMemory, handlers};
+use crate::{ErtError, Handler, RawMemory, handlers};
 
 pub(crate) const ABI_REGS: [Reg; 8] = [
     Reg::A0,
@@ -17,8 +17,7 @@ pub(crate) const ABI_REGS: [Reg; 8] = [
 ];
 
 pub(crate) struct Machine<'a, W, E> {
-    pub(crate) t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
-    pub(crate) hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+    pub(crate) t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
     pub(crate) mem: RawMemory<'a>,
     pub(crate) rstack: &'a mut [u32],
     pub(crate) vstack: &'a mut [W],
@@ -41,8 +40,7 @@ pub(crate) enum LoadAddress {
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        t: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
-        hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+        t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
         vstack: &'a mut [W],
@@ -55,7 +53,6 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     ) -> Self {
         Self {
             t,
-            hash,
             mem,
             rstack,
             vstack,

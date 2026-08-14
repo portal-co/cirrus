@@ -46,6 +46,7 @@
 
 use core::{array, error::Error, ops::Range};
 
+use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
 use cirrus_ert_core::{
     BitOp, Product, Shift, add_bits, bitwise_word, concrete_product, constant_word, fixed_shift,
     invert_word, select_word,
@@ -88,6 +89,107 @@ pub enum ErtError<E> {
     Unexpected,
 }
 
+/// A handler for the hash and exit `SVC #0`s, and any others a caller adds.
+///
+/// `Machine` reaches [`Handler::ecall`] for every `SVC #0` it decodes. The
+/// caller-balanced-stack requirement for a successful exit is enforced by the
+/// interpreter itself, not by the handler.
+pub trait Handler<Val>: ContextWithArmv8mOps<Val> {
+    /// Handle an `SVC #0`. `regs`, `reg_consts`, and `offsets` are the full
+    /// register file at the call (`offsets[r] = Some(_)` marks `r` as a
+    /// tracked stack-relative descriptor, which a written register must
+    /// clear); `zero` and `one` are the caller's symbolic Boolean constants,
+    /// useful for turning a concrete result into a symbolic word.
+    fn ecall(
+        &mut self,
+        regs: &mut [[Self::Wrapped; 32]; 16],
+        reg_consts: &mut [Option<u32>; 16],
+        offsets: &mut [Option<i32>; 16],
+        zero: &Self::Wrapped,
+        one: &Self::Wrapped,
+    ) -> Result<EcallOutcome, ErtError<Self::Error>>;
+}
+
+/// The effect of a handled `SVC #0` on control flow.
+pub enum EcallOutcome {
+    /// Continue execution at the next instruction.
+    Continue,
+    /// Exit the program, once the interpreter confirms the stack is balanced.
+    Exit,
+}
+
+/// A [`Handler`] that reproduces the historical `SVC #0` convention: concrete
+/// `r0 = 0` calls the `hash` callback on the eight words `r1` through `r8`,
+/// and concrete `r0 = u32::MAX` exits.
+pub struct DefaultHandler<'a, W, E> {
+    /// The Boolean context bit operations are delegated to.
+    pub context: &'a mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + 'a),
+    /// The hash callback invoked for the hash `SVC #0`.
+    pub hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+}
+
+impl<W, E: Error> HasError for DefaultHandler<'_, W, E> {
+    type Error = E;
+}
+
+impl<W, E: Error> ContextWithValue<bool> for DefaultHandler<'_, W, E> {
+    type Wrapped = W;
+}
+
+impl<W, E: Error> ContextWithBitAnd<bool> for DefaultHandler<'_, W, E> {
+    fn bitand(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitand_assign(a, b)
+    }
+}
+
+impl<W, E: Error> ContextWithBitOr<bool> for DefaultHandler<'_, W, E> {
+    fn bitor(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitor_assign(a, b)
+    }
+}
+
+impl<W, E: Error> ContextWithBitXor<bool> for DefaultHandler<'_, W, E> {
+    fn bitxor(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitxor_assign(a, b)
+    }
+}
+
+impl<W: Clone, E: Error> Handler<bool> for DefaultHandler<'_, W, E> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]; 16],
+        reg_consts: &mut [Option<u32>; 16],
+        offsets: &mut [Option<i32>; 16],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, ErtError<E>> {
+        match reg_consts[0] {
+            Some(0) => {
+                let output = (self.hash)(&regs[1..9]).map_err(ErtError::Emitted)?;
+                for (index, bytes) in output.chunks_exact(4).enumerate() {
+                    let register = (index + 1) as u8;
+                    let value = u32::from_le_bytes(array::from_fn(|byte| bytes[byte]));
+                    offsets[register as usize] = None;
+                    reg_consts[register as usize] = Some(value);
+                    regs[register as usize] = constant_word(zero, one, value);
+                }
+                Ok(EcallOutcome::Continue)
+            }
+            Some(u32::MAX) => Ok(EcallOutcome::Exit),
+            _ => Err(ErtError::Unexpected),
+        }
+    }
+}
+
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// `zero` and `one` are retained to match the RISC-V compatibility helper.
@@ -110,8 +212,7 @@ pub fn simple_add<W: Clone, E: Error>(
 /// eight-byte aligned. `pc` must be an odd Thumb function pointer.
 #[allow(clippy::too_many_arguments)]
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + '_),
-    hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
+    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -129,7 +230,6 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     write_abi_args(regs, reg_consts, vstack, stack_pointer, args);
     Machine::new(
         t,
-        hash,
         mem,
         rstack,
         vstack,
@@ -151,8 +251,7 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 /// aligned.
 #[allow(clippy::too_many_arguments)]
 pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + '_),
-    hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
+    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -168,7 +267,6 @@ pub fn ert_emit<W: Clone, E: Error>(
     }
     Machine::new(
         t,
-        hash,
         mem,
         rstack,
         vstack,
@@ -414,8 +512,7 @@ struct Decoded {
 }
 
 struct Machine<'a, W, E> {
-    t: &'a mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + 'a),
-    hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+    t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
     mem: RawMemory<'a>,
     rstack: &'a mut [u32],
     vstack: &'a mut [W],
@@ -435,8 +532,7 @@ struct Machine<'a, W, E> {
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        t: &'a mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + 'a),
-        hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+        t: &'a mut (dyn Handler<bool, Wrapped = W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
         vstack: &'a mut [W],
@@ -449,7 +545,6 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     ) -> Self {
         let mut machine = Self {
             t,
-            hash,
             mem,
             rstack,
             vstack,
@@ -797,7 +892,14 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 self.call(target & !1, len)
             }
             Op::BranchRegister { register } => self.branch_register(register),
-            Op::Svc(immediate) if immediate == 0 => self.svc(len),
+            Op::Svc(0) => match self
+                .t
+                .ecall(self.regs, self.constants, &mut self.offsets, &self.zero, &self.one)?
+            {
+                EcallOutcome::Continue => self.next(len),
+                EcallOutcome::Exit if self.sp == self.stack_top => Ok(Flow::Exit),
+                EcallOutcome::Exit => Err(ErtError::Unexpected),
+            },
             Op::Svc(_) => Err(ErtError::Unexpected),
         }
     }
@@ -1368,22 +1470,6 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         Ok(Flow::Next(self.rstack[self.rsp]))
     }
 
-    fn svc(&mut self, len: u32) -> Result<Flow, ErtError<E>> {
-        match self.constants[0] {
-            Some(0) => {
-                let output = (self.hash)(&self.regs[1..9]).map_err(ErtError::Emitted)?;
-                for (index, bytes) in output.chunks_exact(4).enumerate() {
-                    self.write_constant(
-                        (index + 1) as u8,
-                        u32::from_le_bytes(array::from_fn(|byte| bytes[byte])),
-                    );
-                }
-                self.next(len)
-            }
-            Some(u32::MAX) if self.sp == self.stack_top => Ok(Flow::Exit),
-            _ => Err(ErtError::Unexpected),
-        }
-    }
 }
 
 fn load_width(kind: LoadKind) -> usize {

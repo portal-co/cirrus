@@ -384,11 +384,11 @@ mod tests {
         vec::Vec,
     };
 
-    use cirrus_armv8m_ert::ert_func as arm_ert_func;
+    use cirrus_armv8m_ert::{DefaultHandler as ArmDefaultHandler, ert_func as arm_ert_func};
     use cirrus_core::{
         ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError, Pusher,
     };
-    use cirrus_ert::{RawMemory, ert_emit, ert_func as riscv_ert_func};
+    use cirrus_ert::{DefaultHandler, RawMemory, ert_emit, ert_func as riscv_ert_func};
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
@@ -720,10 +720,13 @@ mod tests {
         let mut tables = RecordedTables::default();
         let mut gc = context(&mut tables);
         let mut hash = no_hash;
+        let mut handler = DefaultHandler {
+            context: &mut gc,
+            hash: &mut hash,
+        };
 
         let garbled = ert_emit(
-            &mut gc,
-            &mut hash,
+            &mut handler,
             RawMemory::from(instructions.as_slice()),
             &mut garbled_rstack,
             &mut garbled_vstack,
@@ -750,10 +753,13 @@ mod tests {
         let mut evaluated_rstack = [0; 8];
         let mut evaluated_vstack = [zero; 64];
         let mut evaluator_hash = evaluator_no_hash;
+        let mut evaluator_handler = DefaultHandler {
+            context: &mut evaluator,
+            hash: &mut evaluator_hash,
+        };
 
         let evaluated = ert_emit(
-            &mut evaluator,
-            &mut evaluator_hash,
+            &mut evaluator_handler,
             RawMemory::from(instructions.as_slice()),
             &mut evaluated_rstack,
             &mut evaluated_vstack,
@@ -850,10 +856,13 @@ mod tests {
         let mut tables = RecordedTables::default();
         let mut gc = MeasuredGc::new(context(&mut tables));
         let mut hash = no_hash;
+        let mut handler = DefaultHandler {
+            context: &mut gc,
+            hash: &mut hash,
+        };
 
         let result = ert_emit(
-            &mut gc,
-            &mut hash,
+            &mut handler,
             RawMemory::from(instructions.as_slice()),
             &mut rstack,
             &mut vstack,
@@ -906,10 +915,13 @@ mod tests {
         let mut sink = CountingPusher::default();
         let mut gc = MeasuredGc::new(measuring_context(&mut sink));
         let mut hash = no_hash::<16>;
+        let mut handler = DefaultHandler {
+            context: &mut gc,
+            hash: &mut hash,
+        };
 
         let result = ert_emit(
-            &mut gc,
-            &mut hash,
+            &mut handler,
             RawMemory::from(instructions.as_slice()),
             &mut rstack,
             &mut vstack,
@@ -1209,10 +1221,13 @@ mod tests {
         let mut sink = CountingPusher::default();
         let mut gc = MeasuredGc::new(measuring_context(&mut sink));
         let mut hash = no_hash::<N>;
+        let mut handler = DefaultHandler {
+            context: &mut gc,
+            hash: &mut hash,
+        };
 
         let outcome = riscv_ert_func::<_, _, 16, 2>(
-            &mut gc,
-            &mut hash,
+            &mut handler,
             memory,
             &mut rstack,
             &mut vstack,
@@ -1258,10 +1273,13 @@ mod tests {
         let mut sink = CountingPusher::default();
         let mut gc = MeasuredGc::new(measuring_context(&mut sink));
         let mut hash = no_hash::<N>;
+        let mut handler = ArmDefaultHandler {
+            context: &mut gc,
+            hash: &mut hash,
+        };
 
         let outcome = arm_ert_func::<_, _, 16, 2>(
-            &mut gc,
-            &mut hash,
+            &mut handler,
             memory,
             &mut rstack,
             &mut vstack,

@@ -3,7 +3,7 @@
 
 use core::{array, convert::Infallible, panic::PanicInfo, ptr};
 
-use cirrus_armv8m_ert::{DecodeError, ErtError, RawMemory, ert_func};
+use cirrus_armv8m_ert::{DecodeError, DefaultHandler, ErtError, RawMemory, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 
 core::arch::global_asm!(
@@ -59,6 +59,10 @@ extern "C" fn rust_main() -> ! {
     );
     let mut context = ();
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut context,
+        hash: &mut hash,
+    };
     let mut regs = [[false; 32]; 16];
     let mut constants = [None; 16];
     let mut rstack = [0; 512];
@@ -69,8 +73,7 @@ extern "C" fn rust_main() -> ! {
     // the interpreted workload fetches only code/static data in that image.
     let memory = unsafe { RawMemory::new(ptr::null(), None) };
     let results = match ert_func::<_, _, 16, 2>(
-        &mut context,
-        &mut hash,
+        &mut handler,
         memory,
         &mut rstack,
         &mut vstack,

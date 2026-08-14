@@ -41,10 +41,11 @@
 //! shift amount or multiplicand selects a smaller fixed-shift or constant-product
 //! path, so callers should retain concrete metadata whenever it is known.
 
-use core::error::Error;
+use core::{array, error::Error};
 
+use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
 pub use cirrus_ert_core::RawMemory;
-use rv_asm::DecodeError;
+use rv_asm::{DecodeError, Reg};
 
 mod handlers;
 mod machine;
@@ -69,6 +70,112 @@ pub enum ErtError<E> {
     Unexpected,
 }
 
+/// A handler for the hash and exit `ECALL`s, and any others a caller adds.
+///
+/// `Machine` reaches [`Handler::ecall`] for every `ECALL` it decodes. The
+/// caller-balanced-stack requirement for a successful exit is enforced by the
+/// interpreter itself, not by the handler.
+pub trait Handler<Val>: ContextWithRvOps<Val> {
+    /// Handle an `ECALL`. `regs` and `reg_consts` are the full register file
+    /// at the call; `zero` and `one` are the caller's symbolic Boolean
+    /// constants, useful for turning a concrete result into a symbolic word.
+    fn ecall(
+        &mut self,
+        regs: &mut [[Self::Wrapped; 32]; 32],
+        reg_consts: &mut [Option<u32>; 32],
+        zero: &Self::Wrapped,
+        one: &Self::Wrapped,
+    ) -> Result<EcallOutcome, ErtError<Self::Error>>;
+}
+
+/// The effect of a handled `ECALL` on control flow.
+pub enum EcallOutcome {
+    /// Continue execution at the next instruction.
+    Continue,
+    /// Exit the program, once the interpreter confirms the stack is balanced.
+    Exit,
+}
+
+/// A [`Handler`] that reproduces the historical `ECALL` convention: concrete
+/// `a0 = 0` calls the `hash` callback on the eight words following `a1`, and
+/// concrete `a0 = 0xffff_ffff` exits.
+pub struct DefaultHandler<'a, W, E> {
+    /// The Boolean context bit operations are delegated to.
+    pub context: &'a mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + 'a),
+    /// The hash callback invoked for the hash `ECALL`.
+    pub hash: &'a mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + 'a),
+}
+
+impl<W, E: Error> HasError for DefaultHandler<'_, W, E> {
+    type Error = E;
+}
+
+impl<W, E: Error> ContextWithValue<bool> for DefaultHandler<'_, W, E> {
+    type Wrapped = W;
+}
+
+impl<W, E: Error> ContextWithBitAnd<bool> for DefaultHandler<'_, W, E> {
+    fn bitand(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitand_assign(a, b)
+    }
+}
+
+impl<W, E: Error> ContextWithBitOr<bool> for DefaultHandler<'_, W, E> {
+    fn bitor(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitor_assign(a, b)
+    }
+}
+
+impl<W, E: Error> ContextWithBitXor<bool> for DefaultHandler<'_, W, E> {
+    fn bitxor(&mut self, a: W, b: W) -> Result<W, E> {
+        self.context.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut W, b: W) -> Result<(), E> {
+        self.context.bitxor_assign(a, b)
+    }
+}
+
+impl<W: Clone, E: Error> Handler<bool> for DefaultHandler<'_, W, E> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]; 32],
+        reg_consts: &mut [Option<u32>; 32],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, ErtError<E>> {
+        match reg_consts[Reg::A0.0 as usize] {
+            Some(0) => {
+                let hash = (self.hash)(&regs[Reg::A1.0 as usize..][..(256 / 32)])
+                    .map_err(ErtError::Emitted)?;
+                for ((register, constant), chunk) in regs[Reg::A1.0 as usize..][..(256 / 32)]
+                    .iter_mut()
+                    .zip(reg_consts[Reg::A1.0 as usize..][..(256 / 32)].iter_mut())
+                    .zip(hash.chunks_exact(4))
+                {
+                    let value = u32::from_le_bytes(array::from_fn(|i| chunk[i]));
+                    *constant = Some(value);
+                    for bit in 0..32 {
+                        register[bit] = if (value >> bit) & 1 == 0 {
+                            zero.clone()
+                        } else {
+                            one.clone()
+                        };
+                    }
+                }
+                Ok(EcallOutcome::Continue)
+            }
+            Some(0xffff_ffff) => Ok(EcallOutcome::Exit),
+            _ => Err(ErtError::Unexpected),
+        }
+    }
+}
+
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// The `zero` and `one` parameters are retained for compatibility with existing
@@ -90,8 +197,7 @@ pub fn simple_add<W: Clone, E: Error>(
 /// are placed in or read from the symbolic stack. `args` carries both the
 /// symbolic word and, when known, its concrete value.
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
-    hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
+    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -106,7 +212,6 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
     write_abi_args(regs, reg_consts, vstack, stack_pointer, args);
     Machine::new(
         t,
-        hash,
         mem,
         rstack,
         vstack,
@@ -128,8 +233,7 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 /// documentation](self); an exit is `ECALL` with concrete `a0 = 0xffff_ffff`,
 /// and a hash call is `ECALL` with concrete `a0 = 0`.
 pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
-    hash: &mut (dyn FnMut(&[[W; 32]]) -> Result<[u8; 32], E> + '_),
+    t: &mut (dyn Handler<bool, Wrapped = W, Error = E> + '_),
     mem: RawMemory<'_>,
     rstack: &mut [u32],
     vstack: &mut [W],
@@ -142,7 +246,6 @@ pub fn ert_emit<W: Clone, E: Error>(
     let stack_pointer = u32::try_from(vstack.len() / 8).map_err(|_| ErtError::Unexpected)?;
     Machine::new(
         t,
-        hash,
         mem,
         rstack,
         vstack,

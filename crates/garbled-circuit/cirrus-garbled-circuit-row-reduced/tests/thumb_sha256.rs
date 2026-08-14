@@ -8,7 +8,7 @@ use std::{
     vec::Vec,
 };
 
-use cirrus_armv8m_ert::{RawMemory, ert_func};
+use cirrus_armv8m_ert::{DefaultHandler, RawMemory, ert_func};
 use cirrus_core::Pusher;
 use cirrus_ert_sha256_fixture::sha256_compress;
 use cirrus_garbled_circuit_row_reduced::{Evaluator, GC, GarblingRecord, Label};
@@ -298,9 +298,12 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut bool_vstack = vec![false; STACK_SLOTS];
     let mut bool_context = ();
     let mut bool_hash = bool_no_hash;
+    let mut bool_handler = DefaultHandler {
+        context: &mut bool_context,
+        hash: &mut bool_hash,
+    };
     let bool_result = ert_func::<_, _, 16, 2>(
-        &mut bool_context,
-        &mut bool_hash,
+        &mut bool_handler,
         memory,
         &mut bool_rstack,
         &mut bool_vstack,
@@ -329,11 +332,14 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut records = Records::new();
     let mut garbler = GC::<Sha256, 16>::new(&mut records, delta);
     let mut hash = no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut garbler,
+        hash: &mut hash,
+    };
 
     let started = Instant::now();
     let garbled = ert_func::<_, _, 16, 2>(
-        &mut garbler,
-        &mut hash,
+        &mut handler,
         memory,
         &mut garbled_rstack,
         &mut garbled_vstack,
@@ -377,10 +383,13 @@ fn thumb_sha256_replays_the_three_row_stream_and_reports_traffic() {
     let mut evaluator =
         Evaluator::<Sha256, _, 16>::new(records.0.into_iter().map(GarblingRecord::Table));
     let mut hash = evaluator_no_hash;
+    let mut handler = DefaultHandler {
+        context: &mut evaluator,
+        hash: &mut hash,
+    };
     let started = Instant::now();
     let evaluated = ert_func::<_, _, 16, 2>(
-        &mut evaluator,
-        &mut hash,
+        &mut handler,
         memory,
         &mut evaluated_rstack,
         &mut evaluated_vstack,
