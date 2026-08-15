@@ -1,0 +1,15 @@
+[package]
+name = "cirrus-groth16"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+ark-ec = { workspace = true, features = ["std"] }
+ark-ff = { workspace = true, features = ["std"] }
+ark-groth16 = { workspace = true, features = ["std"] }
+ark-relations = { workspace = true, features = ["std"] }
+ark-snark.workspace = true
+ark-std = { workspace = true, features = ["std"] }
+cirrus-r1cs-backend = { version = "0.1.0", path = "../cirrus-r1cs-backend" }
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }

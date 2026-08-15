@@ -1,0 +1,22 @@
+[package]
+name = "cirrus-zk-tests"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ark-bn254 = { workspace = true, features = ["std", "curve"] }
+ark-ff = { workspace = true, features = ["std"] }
+ark-groth16 = { workspace = true, features = ["std"] }
+ark-r1cs-std = { workspace = true, features = ["std"] }
+ark-relations = { workspace = true, features = ["std"] }
+ark-std = { workspace = true, features = ["std"] }
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }
+cirrus-r1cs-backend = { version = "0.1.0", path = "../cirrus-r1cs-backend" }
+cirrus-groth16 = { version = "0.1.0", path = "../cirrus-groth16" }

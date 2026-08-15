@@ -181,7 +181,7 @@ fn recorded_ert_program_matches_native_execution_via_pinned_rt() {
     let program = record_program(&mem);
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let outputs = cirrus_recompile_rt::execute(&mut (), &program, &bits_of(&program, a, b));
+        let outputs = cirrus_recompile_rt::execute(&mut (), &program, &bits_of(&program, a, b)).unwrap();
         assert_eq!(triple_of(&outputs), golden, "cirrus_recompile_rt::execute mismatch for ({a:#x}, {b:#x})");
     }
 }

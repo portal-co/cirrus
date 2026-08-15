@@ -526,7 +526,7 @@ mod tests {
         );
 
         for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
-            let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]);
+            let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]).unwrap();
             let actual = compiled.run_plaintext(&program, &[x, y]);
             assert_eq!(actual, expected, "mismatch for inputs ({x}, {y})");
         }

@@ -263,7 +263,8 @@ mod tests {
                 &mut gc_backend,
                 &program,
                 &[garbler_zero, garbler_one, garbler_a, garbler_b],
-            );
+            )
+            .unwrap();
 
             let selected = |zero_label: Label<LABEL_BYTES>, bit: bool| -> [u8; LABEL_BYTES] {
                 if bit {
@@ -284,7 +285,8 @@ mod tests {
                     selected(garbler_a, av),
                     selected(garbler_b, bv),
                 ],
-            );
+            )
+            .expect("the matching garbling table is available for every AND gate");
 
             for (i, &plaintext_bit) in plaintext.iter().enumerate() {
                 assert_eq!(

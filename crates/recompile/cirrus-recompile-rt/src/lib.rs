@@ -196,21 +196,28 @@ define_pinned_backend!(pub mod plaintext for [] () as "plaintext");
 /// preserve semantics" check every backend-specific execution test compares
 /// its own lowering's output against.
 ///
-/// `Backend::Wrapped` must be `Copy`: buffer slots are read and written
-/// freely (never dropped), matching every source type this project defines
-/// (`bool`, a garbled-circuit `Label<N>`, an evaluator's `[u8; N]`).
+/// `Backend::Wrapped` must be `Clone`: buffer slots are read by cloning out
+/// of the scratch buffer rather than moving, so backends whose wire
+/// representation isn't `Copy` (for example an R1CS `Boolean<F>` gadget,
+/// which carries a constraint-system handle) can still implement this trait
+/// bundle. Every backend this project currently defines (`bool`, a
+/// garbled-circuit `Label<N>`, an evaluator's `[u8; N]`) is `Copy`, hence
+/// still satisfies this bound for free.
+///
+/// Returns `Err` as soon as any backend operation fails, instead of running
+/// the rest of the program.
 pub fn execute<Backend>(
     backend: &mut Backend,
     program: &Program,
     inputs: &[Backend::Wrapped],
-) -> Vec<Backend::Wrapped>
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
 where
     Backend: cirrus_core::ContextWithBitAnd<bool>
         + cirrus_core::ContextWithBitOr<bool>
         + cirrus_core::ContextWithBitXor<bool>
         + cirrus_core::ContextWithCreate<bool>
         + cirrus_core::ContextWithMux<bool>,
-    Backend::Wrapped: Copy,
+    Backend::Wrapped: Clone,
 {
     assert_eq!(
         inputs.len(),
@@ -218,8 +225,8 @@ where
         "input count must match the recorded program's input slots"
     );
     let mut buf: Vec<Option<Backend::Wrapped>> = vec![None; program.ops.len()];
-    for (&idx, &value) in program.inputs.iter().zip(inputs) {
-        buf[idx.get()] = Some(value);
+    for (&idx, value) in program.inputs.iter().zip(inputs) {
+        buf[idx.get()] = Some(value.clone());
     }
     for (i, op) in program.ops.iter().enumerate() {
         if buf[i].is_some() {
@@ -229,41 +236,36 @@ where
             continue;
         }
         let result = match *op {
-            Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)
-                .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: create failed")),
+            Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)?,
             Op::BitAnd(a, b) => cirrus_core::ContextWithBitAnd::bitand(
                 backend,
-                buf[a.get()].unwrap(),
-                buf[b.get()].unwrap(),
-            )
-            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitand failed")),
+                buf[a.get()].clone().unwrap(),
+                buf[b.get()].clone().unwrap(),
+            )?,
             Op::BitOr(a, b) => cirrus_core::ContextWithBitOr::bitor(
                 backend,
-                buf[a.get()].unwrap(),
-                buf[b.get()].unwrap(),
-            )
-            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitor failed")),
+                buf[a.get()].clone().unwrap(),
+                buf[b.get()].clone().unwrap(),
+            )?,
             Op::BitXor(a, b) => cirrus_core::ContextWithBitXor::bitxor(
                 backend,
-                buf[a.get()].unwrap(),
-                buf[b.get()].unwrap(),
-            )
-            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: bitxor failed")),
+                buf[a.get()].clone().unwrap(),
+                buf[b.get()].clone().unwrap(),
+            )?,
             Op::Mux { cond, then, r#else } => cirrus_core::ContextWithMux::mux(
                 backend,
-                buf[cond.get()].unwrap(),
-                buf[then.get()].unwrap(),
-                buf[r#else.get()].unwrap(),
-            )
-            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute: mux failed")),
+                buf[cond.get()].clone().unwrap(),
+                buf[then.get()].clone().unwrap(),
+                buf[r#else.get()].clone().unwrap(),
+            )?,
         };
         buf[i] = Some(result);
     }
-    program
+    Ok(program
         .outputs
         .iter()
-        .map(|idx| buf[idx.get()].unwrap())
-        .collect()
+        .map(|idx| buf[idx.get()].clone().unwrap())
+        .collect())
 }
 
 /// Run a [`PreparedProgram`] against a generic backend.
@@ -271,18 +273,21 @@ where
 /// This is the reference executor for table-loop lowering.  It uses the same
 /// pinned-operation semantics as [`execute`], but resolves each loop row to
 /// the raw program's absolute scratch slots before calling the backend.
+///
+/// `Backend::Wrapped` need only be `Clone`, for the same reason as
+/// [`execute`]. Returns `Err` as soon as any backend operation fails.
 pub fn execute_prepared<Backend>(
     backend: &mut Backend,
     program: &PreparedProgram,
     inputs: &[Backend::Wrapped],
-) -> Vec<Backend::Wrapped>
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
 where
     Backend: cirrus_core::ContextWithBitAnd<bool>
         + cirrus_core::ContextWithBitOr<bool>
         + cirrus_core::ContextWithBitXor<bool>
         + cirrus_core::ContextWithCreate<bool>
         + cirrus_core::ContextWithMux<bool>,
-    Backend::Wrapped: Copy,
+    Backend::Wrapped: Clone,
 {
     program
         .validate()
@@ -293,8 +298,8 @@ where
         "input count must match the recorded program's input slots"
     );
     let mut buf: Vec<Option<Backend::Wrapped>> = vec![None; program.slots];
-    for (&idx, &value) in program.inputs.iter().zip(inputs) {
-        buf[idx.get()] = Some(value);
+    for (&idx, value) in program.inputs.iter().zip(inputs) {
+        buf[idx.get()] = Some(value.clone());
     }
     execute_range(
         backend,
@@ -303,12 +308,12 @@ where
         &mut buf,
         &mut Vec::new(),
         0,
-    );
-    program
+    )?;
+    Ok(program
         .outputs
         .iter()
-        .map(|idx| buf[idx.get()].unwrap())
-        .collect()
+        .map(|idx| buf[idx.get()].clone().unwrap())
+        .collect())
 }
 
 struct ActiveLoop<'a> {
@@ -323,32 +328,35 @@ fn execute_range<'a, Backend>(
     buf: &mut [Option<Backend::Wrapped>],
     active: &mut Vec<ActiveLoop<'a>>,
     invocation: usize,
-) where
+) -> Result<(), Backend::Error>
+where
     Backend: cirrus_core::ContextWithBitAnd<bool>
         + cirrus_core::ContextWithBitOr<bool>
         + cirrus_core::ContextWithBitXor<bool>
         + cirrus_core::ContextWithCreate<bool>
         + cirrus_core::ContextWithMux<bool>,
-    Backend::Wrapped: Copy,
+    Backend::Wrapped: Clone,
 {
     let start = range.start as usize;
     let end = range.end as usize;
     for statement in &program.statements[start..end] {
         match statement {
             Statement::Op(op) => {
-                execute_scheduled(backend, buf, op.resolve(|slot| resolve_slot(slot, active)))
+                execute_scheduled(backend, buf, op.resolve(|slot| resolve_slot(slot, active)))?
             }
             Statement::Loop(loop_step) => {
                 let descriptor = loop_step.invocations[invocation];
                 for iteration in 0..descriptor.iterations as usize {
                     let row = descriptor.first_row as usize + iteration;
                     active.push(ActiveLoop { loop_step, row });
-                    execute_range(backend, program, loop_step.body, buf, active, row);
+                    let outcome = execute_range(backend, program, loop_step.body, buf, active, row);
                     active.pop();
+                    outcome?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn resolve_slot(slot: PreparedSlot, active: &[ActiveLoop<'_>]) -> cirrus_recompile_core::Idx {
@@ -367,47 +375,44 @@ fn execute_scheduled<Backend>(
     backend: &mut Backend,
     buf: &mut [Option<Backend::Wrapped>],
     scheduled: ScheduledOp,
-) where
+) -> Result<(), Backend::Error>
+where
     Backend: cirrus_core::ContextWithBitAnd<bool>
         + cirrus_core::ContextWithBitOr<bool>
         + cirrus_core::ContextWithBitXor<bool>
         + cirrus_core::ContextWithCreate<bool>
         + cirrus_core::ContextWithMux<bool>,
-    Backend::Wrapped: Copy,
+    Backend::Wrapped: Clone,
 {
     if buf[scheduled.out.get()].is_some() {
-        return;
+        return Ok(());
     }
     let result = match scheduled.op {
-        Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)
-            .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: create failed")),
+        Op::Create(val) => cirrus_core::ContextWithCreate::create(backend, val)?,
         Op::BitAnd(a, b) => cirrus_core::ContextWithBitAnd::bitand(
             backend,
-            buf[a.get()].unwrap(),
-            buf[b.get()].unwrap(),
-        )
-        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitand failed")),
+            buf[a.get()].clone().unwrap(),
+            buf[b.get()].clone().unwrap(),
+        )?,
         Op::BitOr(a, b) => cirrus_core::ContextWithBitOr::bitor(
             backend,
-            buf[a.get()].unwrap(),
-            buf[b.get()].unwrap(),
-        )
-        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitor failed")),
+            buf[a.get()].clone().unwrap(),
+            buf[b.get()].clone().unwrap(),
+        )?,
         Op::BitXor(a, b) => cirrus_core::ContextWithBitXor::bitxor(
             backend,
-            buf[a.get()].unwrap(),
-            buf[b.get()].unwrap(),
-        )
-        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: bitxor failed")),
+            buf[a.get()].clone().unwrap(),
+            buf[b.get()].clone().unwrap(),
+        )?,
         Op::Mux { cond, then, r#else } => cirrus_core::ContextWithMux::mux(
             backend,
-            buf[cond.get()].unwrap(),
-            buf[then.get()].unwrap(),
-            buf[r#else.get()].unwrap(),
-        )
-        .unwrap_or_else(|_| panic!("cirrus_recompile_rt::execute_prepared: mux failed")),
+            buf[cond.get()].clone().unwrap(),
+            buf[then.get()].clone().unwrap(),
+            buf[r#else.get()].clone().unwrap(),
+        )?,
     };
     buf[scheduled.out.get()] = Some(result);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -435,7 +440,7 @@ mod tests {
         let (program, _, _) = sample_program();
         for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
             let expected = cirrus_recompile_core::interpret(&program, &[x, y]);
-            let actual = execute(&mut (), &program, &[x, y]);
+            let actual = execute(&mut (), &program, &[x, y]).unwrap();
             assert_eq!(actual, expected);
         }
     }
@@ -444,7 +449,7 @@ mod tests {
     fn plaintext_pinned_functions_match_generic_execute() {
         let (program, _, _) = sample_program();
         for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
-            let expected = execute(&mut (), &program, &[x, y]);
+            let expected = execute(&mut (), &program, &[x, y]).unwrap();
 
             let mut backend = ();
             let mut buf = vec![false; program.ops.len()];

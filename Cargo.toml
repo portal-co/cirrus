@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cirrus-asm", "crates/cirrus-core", "crates/cirrus-coroutine", "crates/cirrus-coroutine-selftest", "crates/ert/cirrus-ert-core", "crates/ert/cirrus-ert", "crates/ert/cirrus-armv8m-ert", "crates/ert/cirrus-ert-rt", "crates/ert/cirrus-ert-sha256-fixture", "crates/ert/cirrus-ert-selftest", "crates/ert/cirrus-armv8m-ert-selftest", "crates/garbled-circuit/cirrus-garbled-circuit", "crates/garbled-circuit/cirrus-garbled-circuit-row-reduced", "crates/garbled-circuit/cirrus-garbled-circuit-tinylabels", "crates/cirrus-mpc-common", "crates/cirrus-vole", "crates/miniot", "crates/recompile/cirrus-recompile-core", "crates/recompile/cirrus-recompile-rt", "crates/recompile/cirrus-llvm", "crates/recompile/cirrus-llvm-frontend", "crates/recompile/cirrus-llvm-pass-api", "crates/recompile/cirrus-llvm-pass", "crates/recompile/cirrus-rust-codegen", "crates/recompile/cirrus-recompile-tests"]
+members = ["crates/cirrus-asm", "crates/cirrus-core", "crates/cirrus-coroutine", "crates/cirrus-coroutine-selftest", "crates/ert/cirrus-ert-core", "crates/ert/cirrus-ert", "crates/ert/cirrus-armv8m-ert", "crates/ert/cirrus-ert-rt", "crates/ert/cirrus-ert-sha256-fixture", "crates/ert/cirrus-ert-selftest", "crates/ert/cirrus-armv8m-ert-selftest", "crates/garbled-circuit/cirrus-garbled-circuit", "crates/garbled-circuit/cirrus-garbled-circuit-row-reduced", "crates/garbled-circuit/cirrus-garbled-circuit-tinylabels", "crates/cirrus-mpc-common", "crates/cirrus-vole", "crates/miniot", "crates/recompile/cirrus-recompile-core", "crates/recompile/cirrus-recompile-rt", "crates/recompile/cirrus-llvm", "crates/recompile/cirrus-llvm-frontend", "crates/recompile/cirrus-llvm-pass-api", "crates/recompile/cirrus-llvm-pass", "crates/recompile/cirrus-rust-codegen", "crates/recompile/cirrus-recompile-tests", "crates/zk/cirrus-r1cs-backend", "crates/zk/cirrus-groth16", "crates/zk/cirrus-zk-tests"]
 resolver = "3"
 
 [workspace.package]
@@ -20,3 +20,18 @@ rv-asm = { version = "*", git = "https://github.com/portal-co/rv-utils.git" }
 # Recompile backends (LLVM / Rust-source / assembly codegen).
 inkwell = { version = "0.10.0", default-features = false }
 libloading = "0.8"
+
+# arkworks (R1CS-synthesis + Groth16 ZK backend). All pinned to the same
+# 0.6.0 release wave -- verify this stays true when bumping any one of them.
+# `default-features = false` here so `cirrus-r1cs-backend` stays no_std+alloc;
+# std-needing consumers (Groth16 proving, tests) opt back in with
+# `features = ["std"]` on their own dependency entry.
+ark-bn254 = { version = "0.6.0", default-features = false }
+ark-ec = { version = "0.6.0", default-features = false }
+ark-ff = { version = "0.6.0", default-features = false }
+ark-groth16 = { version = "0.6.0", default-features = false }
+ark-r1cs-std = { version = "0.6.0", default-features = false }
+ark-relations = { version = "0.6.0", default-features = false }
+ark-serialize = { version = "0.6.0", default-features = false }
+ark-snark = { version = "0.6.0", default-features = false }
+ark-std = { version = "0.6.0", default-features = false }

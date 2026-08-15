@@ -1,0 +1,13 @@
+[package]
+name = "cirrus-r1cs-backend"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+ark-ff.workspace = true
+ark-r1cs-std.workspace = true
+ark-relations.workspace = true
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }

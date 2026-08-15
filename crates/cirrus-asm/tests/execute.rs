@@ -95,7 +95,7 @@ fn compiled_aarch64_matches_reference_interpreter() {
     let exec = ExecMem::new(&code);
 
     for &(x, y) in &[(false, false), (false, true), (true, false), (true, true)] {
-        let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]);
+        let expected = cirrus_recompile_rt::execute(&mut (), &program, &[x, y]).unwrap();
 
         let mut buf = vec![false; program.ops.len()];
         buf[a.get()] = x;
