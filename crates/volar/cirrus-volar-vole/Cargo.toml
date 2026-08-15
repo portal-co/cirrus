@@ -1,0 +1,15 @@
+[package]
+name = "cirrus-volar-vole"
+edition = "2024"
+version.workspace = true
+description.workspace = true
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+volar-spec.workspace = true
+hybrid-array.workspace = true
+cipher.workspace = true
+
+[dev-dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
+cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }
