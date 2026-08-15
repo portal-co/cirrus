@@ -30,6 +30,8 @@ pub(crate) struct Machine<'a, W, E> {
     pub(crate) stack_top: u32,
     pub(crate) rsp: u32,
     pub(crate) offs: [Option<i32>; 32],
+    #[cfg(feature = "early-exit-loops")]
+    pub(crate) loop_sites: [Option<crate::early_exit::RecognizedSite>; 8],
 }
 
 pub(crate) enum LoadAddress {
@@ -65,6 +67,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             stack_top: sp,
             rsp: 0,
             offs: [const { None }; 32],
+            #[cfg(feature = "early-exit-loops")]
+            loop_sites: [const { None }; 8],
         }
     }
 

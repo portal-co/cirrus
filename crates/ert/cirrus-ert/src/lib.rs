@@ -52,11 +52,19 @@ pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 use cirrus_recompile_core::{Idx, PreparedRecorder};
 use rv_asm::{DecodeError, Reg};
 
+#[cfg(feature = "early-exit-loops")]
+mod early_exit;
 mod handlers;
 mod machine;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "early-exit-loops"))]
+mod early_exit_tests;
+
+#[cfg(feature = "early-exit-loops")]
+pub use cirrus_ert_core::EarlyExitLoopOptions;
 
 use machine::{Machine, add_bits, read_abi_results, write_abi_args};
 
@@ -220,6 +228,10 @@ impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
         one: &H::Wrapped,
     ) -> Result<EcallOutcome, H::Error> {
         self.inner.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
+        self.inner.early_exit_loop_options()
     }
 }
 

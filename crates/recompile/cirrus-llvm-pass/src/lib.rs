@@ -39,6 +39,9 @@ unsafe extern "C" {
     fn cirrus_llvm_pass_link_anchor();
 }
 
+mod deloopify;
+pub use deloopify::deloopify_early_exits;
+
 const MARKER: &str = "__cirrus_entry";
 const CONFIG: &str = "__cirrus_module_config";
 const DEFAULT_OUTPUT_PREFIX: &str = "__cirrus_";
@@ -124,6 +127,59 @@ pub unsafe extern "C" fn cirrus_llvm_pass_run(
             "Cirrus pass panicked; no LLVM state was retained".into(),
         ),
     }
+}
+
+/// C++ calls this with an LLVM-owned module to run the opt-in
+/// "deoptimize secret-dependent early-exit loops" recognizer (see
+/// [`deloopify_early_exits`]) over every function it defines. `0` means no
+/// loop was rewritten, `1` means at least one was, and `-1` returns an
+/// allocated diagnostic (only reachable via an unexpected panic -- the
+/// recognizer itself has no failure mode beyond "did not match").
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cirrus_llvm_pass_deloopify_run(
+    raw_module: LLVMModuleRef,
+    error: *mut *mut c_char,
+) -> i32 {
+    // SAFETY: see `cirrus_llvm_pass_run` -- same archive-retention concern.
+    unsafe { cirrus_llvm_pass_link_anchor() };
+    if !error.is_null() {
+        // SAFETY: caller supplies a valid output slot.
+        unsafe { *error = ptr::null_mut() };
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the C++ pass manager owns both references for the
+        // duration of this call. ManuallyDrop below prevents inkwell from
+        // disposing either of them.
+        unsafe { run_borrowed_module_deloopify(raw_module) }
+    }));
+    match result {
+        Ok(Ok(changed)) => i32::from(changed),
+        Ok(Err(reason)) => store_error(error, reason.to_string()),
+        Err(_) => store_error(
+            error,
+            "Cirrus deloopify pass panicked; no LLVM state was retained".into(),
+        ),
+    }
+}
+
+unsafe fn run_borrowed_module_deloopify(raw_module: LLVMModuleRef) -> Result<bool, PassError> {
+    if raw_module.is_null() {
+        return Err(PassError::new("received null LLVM module"));
+    }
+    // SAFETY: raw_module is borrowed from LLVM's pass manager.
+    let context = ManuallyDrop::new(unsafe { Context::new(LLVMGetModuleContext(raw_module)) });
+    let _ = &context;
+    // SAFETY: raw_module stays valid and must not be disposed by this crate.
+    let module = ManuallyDrop::new(unsafe { Module::new(raw_module) });
+    let mut changed = false;
+    let mut function = module.get_first_function();
+    while let Some(current) = function {
+        if current.count_basic_blocks() != 0 {
+            changed |= deloopify_early_exits(current);
+        }
+        function = current.get_next_function();
+    }
+    Ok(changed)
 }
 
 /// Release a diagnostic allocated by [`cirrus_llvm_pass_run`].

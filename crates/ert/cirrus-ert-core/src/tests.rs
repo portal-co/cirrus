@@ -1,6 +1,59 @@
 extern crate std;
 
-use crate::RawMemory;
+use crate::{ComparePredicate, RawMemory, compare_word};
+
+fn word(value: u32) -> [bool; 32] {
+    core::array::from_fn(|bit| (value >> bit) & 1 != 0)
+}
+
+fn eval(left: u32, right: u32, predicate: ComparePredicate) -> bool {
+    compare_word(&mut (), &word(left), &word(right), predicate, &true).unwrap()
+}
+
+#[test]
+fn eq_and_ne_agree_with_equality() {
+    assert!(eval(42, 42, ComparePredicate::Eq));
+    assert!(!eval(42, 42, ComparePredicate::Ne));
+    assert!(!eval(42, 43, ComparePredicate::Eq));
+    assert!(eval(42, 43, ComparePredicate::Ne));
+    assert!(eval(0, u32::MAX, ComparePredicate::Ne));
+}
+
+#[test]
+fn unsigned_comparisons_match_u32_ordering() {
+    for (left, right) in [(0, 0), (1, 0), (0, 1), (u32::MAX, 0), (0, u32::MAX), (5, 5)] {
+        assert_eq!(
+            eval(left, right, ComparePredicate::GeU),
+            left >= right,
+            "GeU({left}, {right})"
+        );
+        assert_eq!(
+            eval(left, right, ComparePredicate::LtU),
+            left < right,
+            "LtU({left}, {right})"
+        );
+    }
+}
+
+#[test]
+fn signed_comparisons_match_i32_ordering() {
+    let values = [0i32, 1, -1, i32::MIN, i32::MAX, -100, 100];
+    for &left in &values {
+        for &right in &values {
+            let (l, r) = (left as u32, right as u32);
+            assert_eq!(
+                eval(l, r, ComparePredicate::GeS),
+                left >= right,
+                "GeS({left}, {right})"
+            );
+            assert_eq!(
+                eval(l, r, ComparePredicate::LtS),
+                left < right,
+                "LtS({left}, {right})"
+            );
+        }
+    }
+}
 
 #[test]
 fn a_word_read_at_the_detect_address_returns_the_overridden_value() {

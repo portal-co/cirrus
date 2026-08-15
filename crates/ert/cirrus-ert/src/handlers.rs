@@ -797,23 +797,107 @@ fn branch<W: Clone, E: core::error::Error>(
     src2: Reg,
     condition: Branch,
 ) -> Result<Flow, ErtError<E>> {
-    let Some(left) = machine.reg_consts[src1.0 as usize] else {
-        return Err(ErtError::Unexpected);
+    if let (Some(left), Some(right)) = (
+        machine.reg_consts[src1.0 as usize],
+        machine.reg_consts[src2.0 as usize],
+    ) {
+        let taken = match condition {
+            Branch::Equal => left == right,
+            Branch::NotEqual => left != right,
+            Branch::GreaterEqualUnsigned => left >= right,
+            Branch::LessThanUnsigned => left < right,
+            Branch::GreaterEqualSigned => (left as i32) >= (right as i32),
+            Branch::LessThanSigned => (left as i32) < (right as i32),
+        };
+        return Ok(Flow::Next(if taken {
+            machine.pc.wrapping_add_signed(offset.as_i32())
+        } else {
+            machine.pc + 4
+        }));
+    }
+
+    #[cfg(feature = "early-exit-loops")]
+    if let Some(flow) = early_exit_loop_branch(machine, offset, src1, src2, condition)? {
+        return Ok(flow);
+    }
+
+    Err(ErtError::Unexpected)
+}
+
+/// Attempt the opt-in "deoptimize secret-dependent early-exit loops"
+/// recognizer (see `crate::early_exit`) before falling through to today's
+/// hard error. Returns `Ok(None)` whenever the recognizer isn't enabled or
+/// this branch doesn't match the narrow, provably-safe idiom it looks for.
+#[cfg(feature = "early-exit-loops")]
+fn early_exit_loop_branch<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    offset: Imm,
+    src1: Reg,
+    src2: Reg,
+    condition: Branch,
+) -> Result<Option<Flow>, ErtError<E>> {
+    let options = machine.t.early_exit_loop_options();
+    if !options.enabled {
+        return Ok(None);
+    }
+
+    let branch_pc = machine.pc;
+    let cached = machine
+        .loop_sites
+        .iter()
+        .flatten()
+        .find(|site| site.branch_pc == branch_pc)
+        .copied();
+    let site = match cached {
+        Some(site) => site,
+        None => {
+            let predicate = match condition {
+                Branch::Equal => cirrus_ert_core::ComparePredicate::Eq,
+                Branch::NotEqual => cirrus_ert_core::ComparePredicate::Ne,
+                Branch::GreaterEqualUnsigned => cirrus_ert_core::ComparePredicate::GeU,
+                Branch::LessThanUnsigned => cirrus_ert_core::ComparePredicate::LtU,
+                Branch::GreaterEqualSigned => cirrus_ert_core::ComparePredicate::GeS,
+                Branch::LessThanSigned => cirrus_ert_core::ComparePredicate::LtS,
+            };
+            let Some(site) = crate::early_exit::recognize(
+                &machine.mem,
+                branch_pc,
+                offset,
+                predicate,
+                options.max_lookahead_instructions,
+            ) else {
+                return Ok(None);
+            };
+            if let Some(slot) = machine.loop_sites.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(site);
+            }
+            site
+        }
     };
-    let Some(right) = machine.reg_consts[src2.0 as usize] else {
-        return Err(ErtError::Unexpected);
-    };
-    let taken = match condition {
-        Branch::Equal => left == right,
-        Branch::NotEqual => left != right,
-        Branch::GreaterEqualUnsigned => left >= right,
-        Branch::LessThanUnsigned => left < right,
-        Branch::GreaterEqualSigned => (left as i32) >= (right as i32),
-        Branch::LessThanSigned => (left as i32) < (right as i32),
-    };
-    Ok(Flow::Next(if taken {
-        machine.pc.wrapping_add_signed(offset.as_i32())
+
+    let should_take = cirrus_ert_core::compare_word(
+        machine.t,
+        &machine.regs[src1.0 as usize],
+        &machine.regs[src2.0 as usize],
+        site.predicate,
+        &machine.one,
+    )
+    .map_err(ErtError::Emitted)?;
+    let should_exit = if site.exit_when_taken {
+        should_take
     } else {
-        machine.pc + 4
-    }))
+        machine
+            .t
+            .bitxor(should_take, machine.one.clone())
+            .map_err(ErtError::Emitted)?
+    };
+    for slot in site.exit_writes.iter().take(site.exit_write_count) {
+        let (dest, value) = slot.expect("exit_write_count bounds the initialized prefix");
+        let candidate = machine.word_from_constant(value);
+        let current = machine.regs[dest.0 as usize].clone();
+        machine.regs[dest.0 as usize] = select_word(machine, should_exit.clone(), &candidate, &current)?;
+        machine.reg_consts[dest.0 as usize] = None;
+        machine.offs[dest.0 as usize] = None;
+    }
+    Ok(Some(Flow::Next(site.continue_target)))
 }

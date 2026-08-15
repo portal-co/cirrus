@@ -71,8 +71,17 @@ use cirrus_recompile_core::{Idx, PreparedRecorder};
 
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 
+#[cfg(feature = "early-exit-loops")]
+mod early_exit;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "early-exit-loops"))]
+mod early_exit_tests;
+
+#[cfg(feature = "early-exit-loops")]
+pub use cirrus_ert_core::EarlyExitLoopOptions;
 
 const REG_COUNT: usize = 16;
 const SP: u8 = 13;
@@ -290,6 +299,10 @@ impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
         one: &H::Wrapped,
     ) -> Result<EcallOutcome, H::Error> {
         self.inner.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
+        self.inner.early_exit_loop_options()
     }
 }
 
@@ -712,6 +725,8 @@ struct Machine<'a, W, E> {
     flags: [Option<bool>; 4],
     itstate: u8,
     security_state: SecurityState,
+    #[cfg(feature = "early-exit-loops")]
+    loop_sites: [Option<early_exit::RecognizedSite>; 8],
 }
 
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
@@ -745,6 +760,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             flags: [Some(false); 4],
             itstate: 0,
             security_state: SecurityState::Secure,
+            #[cfg(feature = "early-exit-loops")]
+            loop_sites: [const { None }; 8],
         };
         machine.offsets[SP as usize] = Some(0);
         machine.constants[SP as usize] = None;
@@ -1110,12 +1127,22 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 nonzero,
                 target,
             } => {
-                let value = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
-                Ok(Flow::Next(if (value != 0) == nonzero {
-                    target
-                } else {
-                    self.pc + len
-                }))
+                if let Some(value) = self.constants[register as usize] {
+                    return Ok(Flow::Next(if (value != 0) == nonzero {
+                        target
+                    } else {
+                        self.pc + len
+                    }));
+                }
+
+                #[cfg(feature = "early-exit-loops")]
+                if let Some(flow) =
+                    self.early_exit_loop_compare_branch(register, nonzero, target, len)?
+                {
+                    return Ok(flow);
+                }
+
+                Err(ErtError::Unexpected)
             }
             Op::Call { target } => self.call(target, len),
             Op::CallRegister { register } => {
@@ -1169,6 +1196,82 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     fn write_constant(&mut self, register: u8, value: u32) {
         self.write(register, self.word_from_constant(value), Some(value));
+    }
+
+    /// Attempt the opt-in "deoptimize secret-dependent early-exit loops"
+    /// recognizer (see `crate::early_exit`) before `CompareBranch`'s caller
+    /// falls through to today's hard error. Returns `Ok(None)` whenever the
+    /// recognizer isn't enabled or this branch doesn't match the narrow,
+    /// provably-safe idiom it looks for.
+    #[cfg(feature = "early-exit-loops")]
+    fn early_exit_loop_compare_branch(
+        &mut self,
+        register: u8,
+        nonzero: bool,
+        target: u32,
+        len: u32,
+    ) -> Result<Option<Flow>, ErtError<E>> {
+        let options = self.t.early_exit_loop_options();
+        if !options.enabled {
+            return Ok(None);
+        }
+
+        let branch_pc = self.pc;
+        let cached = self
+            .loop_sites
+            .iter()
+            .flatten()
+            .find(|site| site.branch_pc == branch_pc)
+            .copied();
+        let site = match cached {
+            Some(site) => site,
+            None => {
+                let Some(site) = early_exit::recognize(
+                    &self.mem,
+                    branch_pc,
+                    register,
+                    nonzero,
+                    len,
+                    target,
+                    options.max_lookahead_instructions,
+                ) else {
+                    return Ok(None);
+                };
+                if let Some(slot) = self.loop_sites.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(site);
+                }
+                site
+            }
+        };
+
+        let source = self.regs[site.register as usize].clone();
+        let mut is_nonzero = source[0].clone();
+        for bit in &source[1..] {
+            is_nonzero = self.t.bitor(is_nonzero, bit.clone()).map_err(ErtError::Emitted)?;
+        }
+        let should_take = if site.nonzero {
+            is_nonzero
+        } else {
+            self.t
+                .bitxor(is_nonzero, self.one.clone())
+                .map_err(ErtError::Emitted)?
+        };
+        let should_exit = if site.exit_when_taken {
+            should_take
+        } else {
+            self.t
+                .bitxor(should_take, self.one.clone())
+                .map_err(ErtError::Emitted)?
+        };
+        for slot in site.exit_writes.iter().take(site.exit_write_count) {
+            let (dest, value) = slot.expect("exit_write_count bounds the initialized prefix");
+            let candidate = self.word_from_constant(value);
+            let current = self.regs[dest as usize].clone();
+            let selected = select_word(self.t, should_exit.clone(), &candidate, &current)
+                .map_err(ErtError::Emitted)?;
+            self.write(dest, selected, None);
+        }
+        Ok(Some(Flow::Next(site.continue_target)))
     }
 
     fn set_nz(&mut self, value: Option<u32>) {

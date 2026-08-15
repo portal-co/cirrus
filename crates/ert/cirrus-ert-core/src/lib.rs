@@ -12,8 +12,11 @@ use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
 
+mod compare;
 #[cfg(test)]
 mod tests;
+
+pub use compare::{ComparePredicate, compare_word};
 
 /// The Boolean operations needed by the shared symbolic-word machinery.
 pub trait ContextWithErtOps<Val>:
@@ -52,6 +55,45 @@ pub trait Handler<Val>: ContextWithErtOps<Val> {
         zero: &Self::Wrapped,
         one: &Self::Wrapped,
     ) -> Result<EcallOutcome, Self::Error>;
+
+    /// Options for the opt-in secret-dependent early-exit loop
+    /// deoptimization (see [`EarlyExitLoopOptions`]).
+    ///
+    /// Defaults to disabled, which preserves today's behavior exactly: a
+    /// facade's `branch`/`condition` handling hard-errors the moment it
+    /// meets a symbolic condition it cannot resolve concretely.
+    fn early_exit_loop_options(&self) -> EarlyExitLoopOptions {
+        EarlyExitLoopOptions::default()
+    }
+}
+
+/// Options controlling the opt-in "deoptimize secret-dependent early-exit
+/// loops" recognizer: instead of hard-erroring the moment a facade meets a
+/// branch it cannot resolve concretely, it may recognize a narrow,
+/// provably-safe idiom (a concrete-bounded loop with exactly one
+/// secret-dependent early exit that only ever writes a constant/loop-invariant
+/// value) and replay it as an always-runs-every-iteration loop with the
+/// exit folded in via [`select_word`], instead of failing.
+///
+/// Anything outside that narrow idiom keeps hard-erroring exactly as before
+/// — this is purely an additive relaxation, never a silent miscompile risk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EarlyExitLoopOptions {
+    /// Attempt the recognizer instead of hard-erroring on a symbolic branch.
+    pub enabled: bool,
+    /// Bound on how many instructions the recognizer will statically scan
+    /// while classifying a candidate loop body, before giving up and falling
+    /// through to the ordinary hard error.
+    pub max_lookahead_instructions: u16,
+}
+
+impl Default for EarlyExitLoopOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lookahead_instructions: 256,
+        }
+    }
 }
 
 /// The effect of a handled environment call on control flow.

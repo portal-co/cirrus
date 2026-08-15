@@ -8,6 +8,11 @@ description = "Symbolic Armv8-M Thumb-2 interpreter facade"
 # Prepared artifacts allocate their table pool; keep that capability out of
 # allocator-free bare-metal users unless explicitly requested.
 prepared-recording = ["dep:cirrus-recompile-core"]
+# Opt-in recognizer that deoptimizes secret-dependent early-exit loops
+# instead of hard-erroring on the branch. Off by default: it adds a small
+# fixed-capacity per-execution cache to `Machine` that unaffected callers
+# don't need to pay for.
+early-exit-loops = []
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
