@@ -13,3 +13,5 @@ cipher.workspace = true
 [dev-dependencies]
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
 cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }
+cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
+rv-asm.workspace = true
