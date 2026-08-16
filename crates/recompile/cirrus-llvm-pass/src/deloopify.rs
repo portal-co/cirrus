@@ -465,10 +465,10 @@ fn predecessors_excluding<'ctx>(
 mod tests {
     use super::*;
     use cirrus_llvm_frontend::{
-        ArgumentBinding, Export, HostCallRegistry, LowerRequest, LoweringLimits, RegionBinding,
-        RegionByte, ScalarBinding, lower_module,
+        ArgumentBinding, Export, HostCallRegistry, LowerRequest, LoweringLimits, RecorderBackend,
+        RegionBinding, RegionByte, ScalarBinding, lower_module,
     };
-    use cirrus_recompile_core::{Recorder, interpret};
+    use cirrus_recompile_core::interpret;
     use inkwell::context::Context;
     use inkwell::memory_buffer::MemoryBuffer;
 
@@ -511,7 +511,7 @@ mod tests {
             .expect("valid test IR")
     }
 
-    fn request(len: usize) -> LowerRequest<'static, Recorder> {
+    fn request(len: usize) -> LowerRequest<'static, RecorderBackend> {
         let arguments: &'static [ArgumentBinding] = Box::leak(Box::new([
             ArgumentBinding::Region(RegionBinding {
                 bytes: vec![RegionByte::Symbolic; len],

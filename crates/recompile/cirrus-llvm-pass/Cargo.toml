@@ -15,6 +15,7 @@ cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
 cirrus-llvm-frontend = { version = "0.1.0", path = "../cirrus-llvm-frontend" }
 cirrus-llvm-pass-api = { version = "0.1.0", path = "../cirrus-llvm-pass-api" }
 cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+volar-llvm-constchain = { path = "../../../../llvm-bridge/crates/volar-llvm-constchain" }
 inkwell = { workspace = true, features = ["llvm22-1"] }
 
 [build-dependencies]

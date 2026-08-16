@@ -27,12 +27,16 @@ use inkwell::llvm_sys::core::{
     LLVMConstIntGetZExtValue, LLVMGetArgOperand, LLVMGetArrayLength2, LLVMGetAsString,
     LLVMGetElementType, LLVMGetInitializer, LLVMGetModuleContext, LLVMGetNumOperands,
     LLVMGetOperand, LLVMGetTypeKind, LLVMInstructionEraseFromParent, LLVMIsAConstantAggregateZero,
-    LLVMIsAConstantDataSequential, LLVMIsAConstantExpr, LLVMIsAConstantInt, LLVMIsAFunction,
-    LLVMIsAGlobalVariable, LLVMTypeOf,
+    LLVMIsAConstantDataSequential, LLVMIsAConstantInt, LLVMIsAGlobalVariable, LLVMTypeOf,
 };
 use inkwell::llvm_sys::prelude::LLVMModuleRef;
 use inkwell::module::{Linkage, Module};
 use inkwell::types::{AnyTypeEnum, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use volar_llvm_constchain::{
+    ConstChainError, aggregate_fields, decode_array_from_pointer, function_from_pointer,
+    global_from_pointer, int_u32, int_u64, require_fields, require_zero, strip_pointer,
+    usize_from_u64,
+};
 use inkwell::values::{AsValueRef, CallSiteValue, FunctionValue, InstructionOpcode, PointerValue};
 
 unsafe extern "C" {
@@ -96,6 +100,12 @@ impl PassError {
 impl core::fmt::Display for PassError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl From<ConstChainError> for PassError {
+    fn from(error: ConstChainError) -> Self {
+        PassError::new(error.to_string())
     }
 }
 
@@ -1162,43 +1172,6 @@ fn compact_zero(
     Ok(())
 }
 
-fn aggregate_fields(
-    global_or_constant: inkwell::llvm_sys::prelude::LLVMValueRef,
-    what: &str,
-) -> Result<Vec<inkwell::llvm_sys::prelude::LLVMValueRef>, PassError> {
-    let raw = if unsafe { LLVMIsAGlobalVariable(global_or_constant) }.is_null() {
-        global_or_constant
-    } else {
-        // SAFETY: checked as a global above.
-        let initializer = unsafe { LLVMGetInitializer(global_or_constant) };
-        if initializer.is_null() {
-            return Err(PassError::new(format!(
-                "{what} must have a constant initializer"
-            )));
-        }
-        initializer
-    };
-    let count = unsafe { LLVMGetNumOperands(raw) };
-    if count < 0 {
-        return Err(PassError::new(format!(
-            "{what} is not a constant aggregate"
-        )));
-    }
-    Ok((0..count as u32)
-        .map(|index| unsafe { LLVMGetOperand(raw, index) })
-        .collect())
-}
-
-fn require_fields<T>(fields: &[T], expected: usize, what: &str) -> Result<(), PassError> {
-    if fields.len() != expected {
-        return Err(PassError::new(format!(
-            "{what} has {} fields; expected {expected} for Cirrus ABI V1",
-            fields.len()
-        )));
-    }
-    Ok(())
-}
-
 fn require_version(
     fields: &[inkwell::llvm_sys::prelude::LLVMValueRef],
     what: &str,
@@ -1209,116 +1182,6 @@ fn require_version(
         )));
     }
     Ok(())
-}
-
-fn require_zero(
-    raw: inkwell::llvm_sys::prelude::LLVMValueRef,
-    what: &str,
-) -> Result<(), PassError> {
-    if int_u64(raw, what)? != 0 {
-        return Err(PassError::new(format!("{what} must be zero")));
-    }
-    Ok(())
-}
-
-fn int_u32(raw: inkwell::llvm_sys::prelude::LLVMValueRef, what: &str) -> Result<u32, PassError> {
-    let value = int_u64(raw, what)?;
-    u32::try_from(value).map_err(|_| PassError::new(format!("{what} does not fit u32")))
-}
-
-fn int_u64(raw: inkwell::llvm_sys::prelude::LLVMValueRef, what: &str) -> Result<u64, PassError> {
-    if unsafe { LLVMIsAConstantInt(raw) }.is_null() {
-        return Err(PassError::new(format!("{what} must be a constant integer")));
-    }
-    // SAFETY: checked as a constant integer above.
-    Ok(unsafe { LLVMConstIntGetZExtValue(raw) as u64 })
-}
-
-fn usize_from_u64(value: u64, what: &str) -> Result<usize, PassError> {
-    usize::try_from(value).map_err(|_| PassError::new(format!("{what} does not fit target usize")))
-}
-
-fn decode_array_from_pointer<T>(
-    pointer: inkwell::llvm_sys::prelude::LLVMValueRef,
-    expected: u32,
-    decode: impl Fn(inkwell::llvm_sys::prelude::LLVMValueRef) -> Result<T, PassError>,
-) -> Result<Vec<T>, PassError> {
-    if expected == 0 {
-        return Ok(Vec::new());
-    }
-    let global = global_from_pointer(pointer, "array pointer")?;
-    if !global.is_constant() {
-        return Err(PassError::new("array pointer must name a constant global"));
-    }
-    let initializer = unsafe { LLVMGetInitializer(global.as_value_ref()) };
-    if initializer.is_null() {
-        return Err(PassError::new(
-            "array pointer must name a global constant initializer",
-        ));
-    }
-    let count = unsafe { LLVMGetNumOperands(initializer) };
-    if count != expected as i32 {
-        return Err(PassError::new(format!(
-            "array has {count} entries but descriptor declares {expected}"
-        )));
-    }
-    (0..expected)
-        .map(|index| decode(unsafe { LLVMGetOperand(initializer, index) }))
-        .collect()
-}
-
-fn function_from_pointer<'ctx>(
-    raw: inkwell::llvm_sys::prelude::LLVMValueRef,
-    what: &str,
-) -> Result<FunctionValue<'ctx>, PassError> {
-    let raw = strip_pointer(raw, what)?;
-    if unsafe { LLVMIsAFunction(raw) }.is_null() {
-        return Err(PassError::new(format!(
-            "{what} must be a direct LLVM function reference"
-        )));
-    }
-    // SAFETY: checked as a function above and the surrounding module outlives
-    // the inkwell value.
-    unsafe { FunctionValue::new(raw) }.ok_or_else(|| PassError::new(format!("{what} is invalid")))
-}
-
-fn global_from_pointer<'ctx>(
-    raw: inkwell::llvm_sys::prelude::LLVMValueRef,
-    what: &str,
-) -> Result<inkwell::values::GlobalValue<'ctx>, PassError> {
-    let raw = strip_pointer(raw, what)?;
-    if unsafe { LLVMIsAGlobalVariable(raw) }.is_null() {
-        return Err(PassError::new(format!(
-            "{what} must be a pointer to a global constant"
-        )));
-    }
-    // SAFETY: checked as a global variable above and the module outlives it.
-    // SAFETY: checked as a global variable above and the module outlives it.
-    Ok(unsafe { inkwell::values::GlobalValue::new(raw) })
-}
-
-fn strip_pointer(
-    mut raw: inkwell::llvm_sys::prelude::LLVMValueRef,
-    what: &str,
-) -> Result<inkwell::llvm_sys::prelude::LLVMValueRef, PassError> {
-    for _ in 0..4 {
-        if !unsafe { LLVMIsAFunction(raw) }.is_null()
-            || !unsafe { LLVMIsAGlobalVariable(raw) }.is_null()
-        {
-            return Ok(raw);
-        }
-        if unsafe { LLVMIsAConstantExpr(raw) }.is_null() {
-            break;
-        }
-        let operands = unsafe { LLVMGetNumOperands(raw) };
-        if operands < 1 {
-            break;
-        }
-        raw = unsafe { LLVMGetOperand(raw, 0) };
-    }
-    Err(PassError::new(format!(
-        "{what} must be a direct global/function pointer constant"
-    )))
 }
 
 fn c_string_from_pointer(

@@ -6,6 +6,6 @@ description = "Bounded concrete-control LLVM IR frontend for Cirrus programs"
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
-cirrus-ert-core = { version = "0.1.0", path = "../../ert/cirrus-ert-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+volar-llvm-import-core = { path = "../../../../llvm-bridge/crates/volar-llvm-import-core" }
 inkwell = { workspace = true, features = ["llvm22-1"] }
