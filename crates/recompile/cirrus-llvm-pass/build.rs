@@ -1,80 +1,41 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
-fn query(llvm_config: &str, argument: &str) -> String {
-    let output = Command::new(llvm_config)
-        .arg(argument)
-        .output()
-        .unwrap_or_else(|error| panic!("run {llvm_config} {argument}: {error}"));
-    if !output.status.success() {
-        panic!(
-            "{llvm_config} {argument} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout)
-        .expect("llvm-config output is UTF-8")
-        .trim()
-        .to_owned()
-}
+use volar_llvm_pass_build::{AutoRegister, PluginPass, ShimConfig, compile_and_link_shim, generate_shim_source, probe};
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CIRRUS_LLVM_CONFIG");
-    println!("cargo:rerun-if-env-changed=LLVM_SYS_221_PREFIX");
-    println!("cargo:rerun-if-changed=cxx/pass_shim.cpp");
+    let llvm = probe("CIRRUS_LLVM_CONFIG", "LLVM_SYS_221_PREFIX", "22");
 
-    let llvm_config = env::var("CIRRUS_LLVM_CONFIG").unwrap_or_else(|_| {
-        env::var("LLVM_SYS_221_PREFIX")
-            .map(|prefix| {
-                PathBuf::from(prefix)
-                    .join("bin/llvm-config")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|_| {
-                [
-                    "llvm-config".to_owned(),
-                    "llvm-config-22".to_owned(),
-                    "/opt/homebrew/opt/llvm@22/bin/llvm-config".to_owned(),
-                    "/usr/lib/llvm-22/bin/llvm-config".to_owned(),
-                ]
-                .into_iter()
-                .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
-                .unwrap_or_else(|| "llvm-config".to_owned())
-            })
-    });
-    let version = query(&llvm_config, "--version");
-    assert!(
-        version.starts_with("22."),
-        "cirrus-llvm-pass requires LLVM 22, but {llvm_config} reports {version}"
-    );
-    let includedir = query(&llvm_config, "--includedir");
+    let config = ShimConfig {
+        plugin_name: "cirrus-llvm-pass".into(),
+        plugin_version: "0.1".into(),
+        link_anchor_symbol: "cirrus_llvm_pass_link_anchor".into(),
+        free_error_symbol: "cirrus_llvm_pass_free_error".into(),
+        passes: vec![
+            PluginPass {
+                pipeline_name: "cirrus-lower".into(),
+                run_symbol: "cirrus_llvm_pass_run".into(),
+                error_prefix: "cirrus-lower".into(),
+                // Full-LTO pre-link sees individual modules; its merged-
+                // module hook (the FullLinkTimeOptimizationEarlyEP
+                // registration every `AutoRegister` also gets) is the only
+                // phase allowed to resolve cross-module selectors.
+                auto_register: Some(AutoRegister { skip_full_lto_prelink: true }),
+            },
+            PluginPass {
+                pipeline_name: "cirrus-deloopify".into(),
+                run_symbol: "cirrus_llvm_pass_deloopify_run".into(),
+                error_prefix: "cirrus-deloopify".into(),
+                // Deliberately registered only under its own pipeline name,
+                // not auto-run during ordinary/LTO compiles -- it never
+                // runs unless a caller explicitly asks for it (e.g.
+                // `-passes=cirrus-deloopify,cirrus-lower`).
+                auto_register: None,
+            },
+        ],
+    };
+    let source = generate_shim_source(&config);
 
-    cc::Build::new()
-        .cpp(true)
-        .file("cxx/pass_shim.cpp")
-        .include(includedir)
-        .flag_if_supported("-std=c++17")
-        .warnings(false)
-        .compile("cirrus_llvm_pass_shim");
-
-    // Cargo links `cc` output as a static archive. The plugin's sole public
-    // entrypoint lives in that archive, so ordinary archive extraction would
-    // discard it before Clang has a chance to discover it.
-    let archive = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"))
-        .join("libcirrus_llvm_pass_shim.a");
-    if cfg!(target_os = "macos") {
-        println!(
-            "cargo:rustc-cdylib-link-arg=-Wl,-force_load,{}",
-            archive.display()
-        );
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_llvmGetPassPluginInfo");
-    } else {
-        println!(
-            "cargo:rustc-cdylib-link-arg=-Wl,--whole-archive,{},--no-whole-archive",
-            archive.display()
-        );
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=llvmGetPassPluginInfo");
-    }
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    compile_and_link_shim(&source, &out_dir, &llvm.includedir, "cirrus_llvm_pass_shim");
 }

@@ -5,10 +5,7 @@
 //! frontend request, and emits a prepared companion into the borrowed module.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, c_char};
-use std::mem::ManuallyDrop;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
+use std::ffi::c_char;
 
 use cirrus_llvm::emit_prepared_into_module;
 use cirrus_llvm_frontend::{
@@ -25,19 +22,19 @@ use inkwell::context::Context;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
     LLVMConstIntGetZExtValue, LLVMGetArgOperand, LLVMGetArrayLength2, LLVMGetAsString,
-    LLVMGetElementType, LLVMGetInitializer, LLVMGetModuleContext, LLVMGetNumOperands,
-    LLVMGetOperand, LLVMGetTypeKind, LLVMInstructionEraseFromParent, LLVMIsAConstantAggregateZero,
-    LLVMIsAConstantDataSequential, LLVMIsAConstantInt, LLVMIsAGlobalVariable, LLVMTypeOf,
+    LLVMGetElementType, LLVMGetInitializer, LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind,
+    LLVMInstructionEraseFromParent, LLVMIsAConstantAggregateZero, LLVMIsAConstantDataSequential,
+    LLVMIsAConstantInt, LLVMIsAGlobalVariable, LLVMTypeOf,
 };
 use inkwell::llvm_sys::prelude::LLVMModuleRef;
 use inkwell::module::{Linkage, Module};
-use inkwell::types::{AnyTypeEnum, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum, StructType};
 use volar_llvm_constchain::{
     ConstChainError, aggregate_fields, decode_array_from_pointer, function_from_pointer,
     global_from_pointer, int_u32, int_u64, require_fields, require_zero, strip_pointer,
     usize_from_u64,
 };
-use inkwell::values::{AsValueRef, CallSiteValue, FunctionValue, InstructionOpcode, PointerValue};
+use inkwell::values::{AsValueRef, FunctionValue, PointerValue};
 
 unsafe extern "C" {
     fn cirrus_llvm_pass_link_anchor();
@@ -119,24 +116,11 @@ pub unsafe extern "C" fn cirrus_llvm_pass_run(
     // SAFETY: this empty C++ function deliberately anchors the pass-plugin
     // archive member containing llvmGetPassPluginInfo in the final cdylib.
     unsafe { cirrus_llvm_pass_link_anchor() };
-    if !error.is_null() {
-        // SAFETY: caller supplies a valid output slot.
-        unsafe { *error = ptr::null_mut() };
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the C++ pass manager owns both references for the duration
-        // of this call. ManuallyDrop below prevents inkwell from disposing
-        // either of them.
-        unsafe { run_borrowed_module(raw_module) }
-    }));
-    match result {
-        Ok(Ok(changed)) => i32::from(changed),
-        Ok(Err(reason)) => store_error(error, reason.to_string()),
-        Err(_) => store_error(
-            error,
-            "Cirrus pass panicked; no LLVM state was retained".into(),
-        ),
-    }
+    // SAFETY: the C++ pass manager owns raw_module for the duration of this
+    // call; `run_pass_body` borrows it without disposing it, and catches
+    // any panic from `lower_module_with_pass` before it can unwind across
+    // this `extern "C"` boundary.
+    unsafe { volar_llvm_pass_support::run_pass_body(raw_module, error, lower_module_with_pass) }
 }
 
 /// C++ calls this with an LLVM-owned module to run the opt-in
@@ -152,35 +136,15 @@ pub unsafe extern "C" fn cirrus_llvm_pass_deloopify_run(
 ) -> i32 {
     // SAFETY: see `cirrus_llvm_pass_run` -- same archive-retention concern.
     unsafe { cirrus_llvm_pass_link_anchor() };
-    if !error.is_null() {
-        // SAFETY: caller supplies a valid output slot.
-        unsafe { *error = ptr::null_mut() };
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the C++ pass manager owns both references for the
-        // duration of this call. ManuallyDrop below prevents inkwell from
-        // disposing either of them.
-        unsafe { run_borrowed_module_deloopify(raw_module) }
-    }));
-    match result {
-        Ok(Ok(changed)) => i32::from(changed),
-        Ok(Err(reason)) => store_error(error, reason.to_string()),
-        Err(_) => store_error(
-            error,
-            "Cirrus deloopify pass panicked; no LLVM state was retained".into(),
-        ),
+    // SAFETY: see `cirrus_llvm_pass_run`.
+    unsafe {
+        volar_llvm_pass_support::run_pass_body(raw_module, error, |_context, module| {
+            run_deloopify(module)
+        })
     }
 }
 
-unsafe fn run_borrowed_module_deloopify(raw_module: LLVMModuleRef) -> Result<bool, PassError> {
-    if raw_module.is_null() {
-        return Err(PassError::new("received null LLVM module"));
-    }
-    // SAFETY: raw_module is borrowed from LLVM's pass manager.
-    let context = ManuallyDrop::new(unsafe { Context::new(LLVMGetModuleContext(raw_module)) });
-    let _ = &context;
-    // SAFETY: raw_module stays valid and must not be disposed by this crate.
-    let module = ManuallyDrop::new(unsafe { Module::new(raw_module) });
+fn run_deloopify(module: &Module<'_>) -> Result<bool, PassError> {
     let mut changed = false;
     let mut function = module.get_first_function();
     while let Some(current) = function {
@@ -195,31 +159,10 @@ unsafe fn run_borrowed_module_deloopify(raw_module: LLVMModuleRef) -> Result<boo
 /// Release a diagnostic allocated by [`cirrus_llvm_pass_run`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cirrus_llvm_pass_free_error(error: *mut c_char) {
-    if !error.is_null() {
-        // SAFETY: this function only receives pointers made by CString::into_raw.
-        unsafe { drop(CString::from_raw(error)) };
-    }
-}
-
-fn store_error(out: *mut *mut c_char, message: String) -> i32 {
-    if !out.is_null() {
-        let message = CString::new(message)
-            .unwrap_or_else(|_| CString::new("Cirrus pass diagnostic contained NUL").unwrap());
-        // SAFETY: caller supplied a valid output slot.
-        unsafe { *out = message.into_raw() };
-    }
-    -1
-}
-
-unsafe fn run_borrowed_module(raw_module: LLVMModuleRef) -> Result<bool, PassError> {
-    if raw_module.is_null() {
-        return Err(PassError::new("received null LLVM module"));
-    }
-    // SAFETY: raw_module is borrowed from LLVM's pass manager.
-    let context = ManuallyDrop::new(unsafe { Context::new(LLVMGetModuleContext(raw_module)) });
-    // SAFETY: raw_module stays valid and must not be disposed by this crate.
-    let module = ManuallyDrop::new(unsafe { Module::new(raw_module) });
-    lower_module_with_pass(&context, &module)
+    // SAFETY: forwarded to `volar_llvm_pass_support::free_error`'s own
+    // requirement -- `error` is null, or a pointer `run_pass_body`
+    // (transitively `store_error`) previously allocated.
+    unsafe { volar_llvm_pass_support::free_error(error) }
 }
 
 fn lower_module_with_pass<'ctx>(
@@ -272,10 +215,10 @@ fn lower_module_with_pass<'ctx>(
 
     let marker_helpers = marker_calls
         .iter()
-        .filter_map(|(_, owner, _, _)| marker_helper(*owner).then_some(*owner))
+        .filter_map(|(_, owner, _, _)| volar_llvm_pass_support::is_marker_wrapper(*owner, MARKER).then_some(*owner))
         .map(|owner| (owner.as_value_ref() as usize, owner))
         .collect::<BTreeMap<_, _>>();
-    let marker_retention_globals = marker_retention_globals(module, &marker_helpers);
+    let marker_retention_globals = volar_llvm_pass_support::retained_wrapper_globals(module, &marker_helpers);
     let builder = context.create_builder();
     let mut changed = false;
     for (name, candidate) in &candidates {
@@ -564,127 +507,31 @@ fn find_marker_calls<'ctx>(
     PassError,
 > {
     let mut calls = Vec::new();
-    for function in module.get_functions() {
-        for block in function.get_basic_blocks() {
-            let mut instruction = block.get_first_instruction();
-            while let Some(current) = instruction {
-                instruction = current.get_next_instruction();
-                if current.get_opcode() != InstructionOpcode::Call {
-                    continue;
-                }
-                let Ok(call) = CallSiteValue::try_from(current) else {
-                    continue;
-                };
-                let Some(callee) = call.get_called_fn_value() else {
-                    continue;
-                };
-                if value_name(callee.as_value_ref())? != MARKER {
-                    continue;
-                }
-                validate_marker_declaration(callee)?;
-                if call.count_arguments() != 2 {
-                    return Err(PassError::new(
-                        "__cirrus_entry must take exactly (ptr target, ptr descriptor)",
-                    ));
-                }
-                // SAFETY: count_arguments above proves these argument slots exist.
-                let target = unsafe { LLVMGetArgOperand(call.as_value_ref(), 0) };
-                // SAFETY: count_arguments above proves these argument slots exist.
-                let descriptor = unsafe { LLVMGetArgOperand(call.as_value_ref(), 1) };
-                let target = function_from_pointer(target, "__cirrus_entry target")?;
-                let descriptor = global_from_pointer(descriptor, "__cirrus_entry descriptor")?;
-                calls.push((
-                    current.as_value_ref(),
-                    function,
-                    target,
-                    decode_plan(descriptor.as_value_ref())?,
-                ));
-            }
+    for found in volar_llvm_pass_support::find_calls_to(module, MARKER) {
+        let callee = found
+            .call
+            .get_called_fn_value()
+            .expect("find_calls_to only returns calls with a resolved callee");
+        volar_llvm_pass_support::validate_marker_declaration(callee, MARKER, 2).map_err(PassError::new)?;
+        if found.call.count_arguments() != 2 {
+            return Err(PassError::new(
+                "__cirrus_entry must take exactly (ptr target, ptr descriptor)",
+            ));
         }
+        // SAFETY: count_arguments above proves these argument slots exist.
+        let target = unsafe { LLVMGetArgOperand(found.call.as_value_ref(), 0) };
+        // SAFETY: count_arguments above proves these argument slots exist.
+        let descriptor = unsafe { LLVMGetArgOperand(found.call.as_value_ref(), 1) };
+        let target = function_from_pointer(target, "__cirrus_entry target")?;
+        let descriptor = global_from_pointer(descriptor, "__cirrus_entry descriptor")?;
+        calls.push((
+            found.instruction.as_value_ref(),
+            found.caller,
+            target,
+            decode_plan(descriptor.as_value_ref())?,
+        ));
     }
     Ok(calls)
-}
-
-fn validate_marker_declaration(marker: FunctionValue<'_>) -> Result<(), PassError> {
-    if marker.count_basic_blocks() != 0 || marker.get_linkage() != Linkage::External {
-        return Err(PassError::new(
-            "__cirrus_entry must be an external pseudo-intrinsic declaration",
-        ));
-    }
-    let type_ = marker.get_type();
-    if type_.is_var_arg()
-        || type_.get_return_type().is_some()
-        || type_.get_param_types().len() != 2
-        || !type_
-            .get_param_types()
-            .iter()
-            .all(|type_| matches!(type_, BasicMetadataTypeEnum::PointerType(_)))
-    {
-        return Err(PassError::new(
-            "__cirrus_entry must have type void (ptr target, ptr descriptor)",
-        ));
-    }
-    Ok(())
-}
-
-fn marker_helper(function: FunctionValue<'_>) -> bool {
-    let blocks = function.get_basic_blocks();
-    if blocks.len() != 1 {
-        return false;
-    }
-    let mut saw_marker = false;
-    let mut instruction = blocks[0].get_first_instruction();
-    while let Some(current) = instruction {
-        instruction = current.get_next_instruction();
-        match current.get_opcode() {
-            InstructionOpcode::Return => return saw_marker && instruction.is_none(),
-            InstructionOpcode::Call => {
-                let Ok(call) = CallSiteValue::try_from(current) else {
-                    return false;
-                };
-                let Some(callee) = call.get_called_fn_value() else {
-                    return false;
-                };
-                if value_name(callee.as_value_ref()).ok().as_deref() != Some(MARKER) {
-                    return false;
-                }
-                saw_marker = true;
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn marker_retention_globals<'ctx>(
-    module: &Module<'ctx>,
-    helpers: &BTreeMap<usize, FunctionValue<'ctx>>,
-) -> BTreeMap<usize, inkwell::values::GlobalValue<'ctx>> {
-    let Some(used) = module.get_global("llvm.used") else {
-        return BTreeMap::new();
-    };
-    let initializer = unsafe { LLVMGetInitializer(used.as_value_ref()) };
-    if initializer.is_null() {
-        return BTreeMap::new();
-    }
-    let mut retained = BTreeMap::new();
-    for index in 0..unsafe { LLVMGetNumOperands(initializer) } as u32 {
-        let entry = unsafe { LLVMGetOperand(initializer, index) };
-        let Ok(global) = global_from_pointer(entry, "llvm.used marker entry") else {
-            continue;
-        };
-        let initializer = unsafe { LLVMGetInitializer(global.as_value_ref()) };
-        if initializer.is_null() {
-            continue;
-        }
-        let points_to_marker = strip_pointer(initializer, "llvm.used marker initializer")
-            .ok()
-            .is_some_and(|value| helpers.contains_key(&(value as usize)));
-        if points_to_marker {
-            retained.insert(global.as_value_ref() as usize, global);
-        }
-    }
-    retained
 }
 
 fn decode_plan(raw: inkwell::llvm_sys::prelude::LLVMValueRef) -> Result<Plan, PassError> {
