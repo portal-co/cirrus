@@ -1,10 +1,72 @@
 #![no_std]
 #![no_main]
 
-use core::{array, convert::Infallible, panic::PanicInfo, ptr};
+extern crate alloc;
+
+use alloc::vec;
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    array,
+    cell::UnsafeCell,
+    convert::Infallible,
+    panic::PanicInfo,
+    ptr::{self, null_mut},
+};
 
 use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
+use cirrus_volar_boolar::{StorageBank, execute};
+use volar_ir::{
+    boolar::{BIrStmt, LaneId},
+    circuit::BCircuit,
+    ir::IRVarId,
+};
+use volar_ir_common::{Node, StorageId};
+
+const BOOLAR_HEAP_BYTES: usize = 32 * 1024;
+
+#[repr(align(16))]
+struct Heap([u8; BOOLAR_HEAP_BYTES]);
+
+struct BumpAllocator {
+    cursor: UnsafeCell<usize>,
+    heap: UnsafeCell<Heap>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+impl BumpAllocator {
+    const fn new() -> Self {
+        Self {
+            cursor: UnsafeCell::new(0),
+            heap: UnsafeCell::new(Heap([0; BOOLAR_HEAP_BYTES])),
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let cursor = unsafe { *self.cursor.get() };
+        let aligned = cursor
+            .checked_add(layout.align() - 1)
+            .map(|value| value & !(layout.align() - 1))
+            .unwrap_or(BOOLAR_HEAP_BYTES);
+        let Some(end) = aligned.checked_add(layout.size()) else {
+            return null_mut();
+        };
+        if end > BOOLAR_HEAP_BYTES {
+            return null_mut();
+        }
+        unsafe { *self.cursor.get() = end };
+        let base = unsafe { (*self.heap.get()).0.as_mut_ptr() };
+        unsafe { base.add(aligned) }
+    }
+
+    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 
 core::arch::global_asm!(
     r#"
@@ -48,6 +110,9 @@ fn panic(_: &PanicInfo<'_>) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_main() -> ! {
+    if !boolar_storage_probe() {
+        finish_failure(5);
+    }
     let expected = sha256_compress(
         INPUT[0], INPUT[1], INPUT[2], INPUT[3], INPUT[4], INPUT[5], INPUT[6], INPUT[7], INPUT[8],
         INPUT[9], INPUT[10], INPUT[11], INPUT[12], INPUT[13], INPUT[14], INPUT[15],
@@ -102,6 +167,45 @@ fn word(value: u32) -> [bool; 32] {
 
 fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
+}
+
+fn boolar_storage_probe() -> bool {
+    let circuit = BCircuit {
+        params: 2,
+        stmts: vec![
+            Node::new(BIrStmt::One, (), None),
+            Node::new(
+                BIrStmt::StorageWrite {
+                    storage: StorageId(0),
+                    lane: LaneId(0),
+                    src: IRVarId(0),
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+                (),
+                None,
+            ),
+            Node::new(
+                BIrStmt::StorageRead {
+                    storage: StorageId(0),
+                    lane: LaneId(0),
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+                (),
+                None,
+            ),
+        ],
+        outputs: vec![IRVarId(4)],
+    };
+    let mut cells = [false; 4];
+    let mut banks = [StorageBank {
+        storage: StorageId(0),
+        lane: LaneId(0),
+        cells: &mut cells,
+    }];
+    matches!(
+        execute(&mut (), &circuit, &[true, false], &mut banks),
+        Ok(outputs) if outputs.as_slice() == [true] && cells == [false, false, true, false]
+    )
 }
 
 fn finish_success() -> ! {

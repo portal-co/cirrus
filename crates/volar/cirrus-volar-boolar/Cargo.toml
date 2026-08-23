@@ -1,0 +1,13 @@
+[package]
+name = "cirrus-volar-boolar"
+edition = "2024"
+version.workspace = true
+description = "Execute Volar Boolar circuits through Cirrus Boolean contexts"
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+
+[dev-dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
