@@ -35,7 +35,9 @@
 
 extern crate alloc;
 
+use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use core::convert::Infallible;
 
 use cirrus_core::{
@@ -117,6 +119,21 @@ impl Program {
     /// executable representation.
     pub fn prepare(&self, options: &OptimizationOptions) -> PreparedProgram {
         PreparedProgram::from_program(self, options)
+    }
+
+    /// Prepare this program, then compact its scratch-buffer slots.
+    ///
+    /// Shorthand for `self.prepare(options).compact_slots()`. `Program`
+    /// itself can never represent slot reuse -- an op's output slot is
+    /// implicitly its position in [`Program::ops`], so two ops can't share
+    /// one output slot without abandoning that positional identity, which
+    /// every raw-`Program` consumer (including the R1CS/Groth16 backends,
+    /// which treat each [`Idx`] as a fixed-identity witness) depends on.
+    /// [`PreparedProgram`] is the only representation with an explicit,
+    /// position-independent output slot per operation, so this method
+    /// routes through it.
+    pub fn compact(&self, options: &OptimizationOptions) -> PreparedProgram {
+        self.prepare(options).compact_slots()
     }
 }
 
@@ -312,7 +329,11 @@ const INVOCATION_BYTES: usize = core::mem::size_of::<u32>() * 2;
 /// ABI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedProgram {
-    /// Scratch-buffer width, identical to the source [`Program::len`].
+    /// Scratch-buffer width.
+    ///
+    /// Identical to the source [`Program::len`] for any artifact produced by
+    /// [`Program::prepare`]/[`PreparedProgram::reoptimize`] alone --
+    /// [`PreparedProgram::compact_slots`] may shrink it further.
     pub slots: usize,
     /// Input slots in the source program's deterministic order.
     pub inputs: Vec<Idx>,
@@ -1436,10 +1457,21 @@ pub fn interpret_prepared(program: &PreparedProgram, inputs: &[bool]) -> Vec<boo
         "input count must match the recorded program's input slots"
     );
     let mut slots: Vec<Option<bool>> = alloc::vec![None; program.slots];
+    let mut is_input = alloc::vec![false; program.slots];
+    for &idx in &program.inputs {
+        is_input[idx.get()] = true;
+    }
     for (&idx, &value) in program.inputs.iter().zip(inputs) {
         slots[idx.get()] = Some(value);
     }
-    interpret_range(program, program.entry, &mut slots, &mut Vec::new(), 0);
+    interpret_range(
+        program,
+        program.entry,
+        &mut slots,
+        &is_input,
+        &mut Vec::new(),
+        0,
+    );
     program
         .outputs
         .iter()
@@ -1456,6 +1488,7 @@ fn interpret_range<'a>(
     program: &'a PreparedProgram,
     range: StatementRange,
     slots: &mut [Option<bool>],
+    is_input: &[bool],
     active: &mut Vec<ActiveLoop<'a>>,
     invocation: usize,
 ) {
@@ -1464,15 +1497,17 @@ fn interpret_range<'a>(
         .expect("validated prepared range must be present")
     {
         match statement {
-            Statement::Op(op) => {
-                interpret_scheduled_op(slots, op.resolve(|slot| resolve_slot(slot, active)))
-            }
+            Statement::Op(op) => interpret_scheduled_op(
+                slots,
+                is_input,
+                op.resolve(|slot| resolve_slot(slot, active)),
+            ),
             Statement::Loop(loop_step) => {
                 let descriptor = loop_step.invocations[invocation];
                 for iteration in 0..descriptor.iterations as usize {
                     let row = descriptor.first_row as usize + iteration;
                     active.push(ActiveLoop { loop_step, row });
-                    interpret_range(program, loop_step.body, slots, active, row);
+                    interpret_range(program, loop_step.body, slots, is_input, active, row);
                     active.pop();
                 }
             }
@@ -1495,8 +1530,8 @@ fn resolve_slot(slot: PreparedSlot, active: &[ActiveLoop<'_>]) -> Idx {
     }
 }
 
-fn interpret_scheduled_op(slots: &mut [Option<bool>], scheduled: ScheduledOp) {
-    if slots[scheduled.out.get()].is_some() {
+fn interpret_scheduled_op(slots: &mut [Option<bool>], is_input: &[bool], scheduled: ScheduledOp) {
+    if is_input[scheduled.out.get()] {
         return;
     }
     let value = match scheduled.op {
@@ -1513,6 +1548,249 @@ fn interpret_scheduled_op(slots: &mut [Option<bool>], scheduled: ScheduledOp) {
         }
     };
     slots[scheduled.out.get()] = Some(value);
+}
+
+/// Per-slot liveness, in units of the virtual-time ticks [`compute_liveness`]
+/// assigns while walking a [`PreparedProgram`] in its canonical execution
+/// order (one tick per [`Statement::Op`] visited, including every loop
+/// iteration/row).
+struct SlotLiveness {
+    /// First tick each absolute slot is defined, `None` if a slot's only
+    /// defining statement sits in a loop body no invocation ever runs.
+    def: Vec<Option<u32>>,
+    /// Last tick each absolute slot is read or written. A declared input
+    /// starts at tick `0`; a declared output is pinned to `u32::MAX` so it
+    /// always outlives every computed value.
+    last_ref: Vec<u32>,
+}
+
+/// A slot's physical-slot reassignment, from [`assign_compact_slots`].
+struct SlotAssignment {
+    /// `map[old.get()]` is the compacted absolute slot for original slot
+    /// `old`. Every declared input maps into a permanently reserved prefix
+    /// `0..inputs.len()`, in declared order; no other value is ever assigned
+    /// into that prefix.
+    map: Vec<u32>,
+    /// The compacted program's new [`PreparedProgram::slots`] width.
+    new_slots: usize,
+}
+
+impl PreparedProgram {
+    /// Reassign scratch-buffer slots so that values with disjoint live
+    /// ranges share one physical slot, shrinking [`PreparedProgram::slots`]
+    /// where profitable.
+    ///
+    /// This is a single-shot pass, not a fixed point, and it never runs
+    /// implicitly inside [`Program::prepare`] or
+    /// [`PreparedProgram::reoptimize`] -- call it explicitly, and only after
+    /// loop abstraction has already reached its own fixed point. Running it
+    /// first would scramble the positional-arithmetic regularity
+    /// `classify_slot` depends on to recognize loop-eligible repetition, so
+    /// [`Program::compact`] always calls [`Program::prepare`] first.
+    ///
+    /// Every declared input keeps one physical slot reserved for the whole
+    /// execution, renumbered into a tight `0..inputs.len()` prefix; only
+    /// computed values participate in reuse. This is what lets every
+    /// existing backend consume a compacted program with no changes: each
+    /// backend's own "skip emitting a write to a declared input slot" check
+    /// stays correct exactly because no computed value is ever assigned an
+    /// input's slot.
+    pub fn compact_slots(&self) -> Self {
+        let liveness = self.compute_liveness();
+        let assignment = self.assign_compact_slots(&liveness);
+        self.rewrite_with(&assignment)
+    }
+
+    fn compute_liveness(&self) -> SlotLiveness {
+        let mut liveness = SlotLiveness {
+            def: alloc::vec![None; self.slots],
+            last_ref: alloc::vec![0; self.slots],
+        };
+        for &input in &self.inputs {
+            liveness.def[input.get()] = Some(0);
+            liveness.last_ref[input.get()] = 0;
+        }
+        let mut tick = 0u32;
+        self.liveness_range(self.entry, &mut Vec::new(), 0, &mut tick, &mut liveness);
+        for &output in &self.outputs {
+            liveness.last_ref[output.get()] = u32::MAX;
+        }
+        liveness
+    }
+
+    fn liveness_range<'a>(
+        &'a self,
+        range: StatementRange,
+        active: &mut Vec<ActiveLoop<'a>>,
+        invocation: usize,
+        tick: &mut u32,
+        liveness: &mut SlotLiveness,
+    ) {
+        for statement in self
+            .range_slice(range)
+            .expect("validated prepared range must be present")
+        {
+            match statement {
+                Statement::Op(op) => {
+                    *tick += 1;
+                    let scheduled = op.resolve(|slot| resolve_slot(slot, active));
+                    for operand in op_operand_slots(scheduled.op).into_iter().flatten() {
+                        liveness.last_ref[operand.get()] =
+                            liveness.last_ref[operand.get()].max(*tick);
+                    }
+                    let out = scheduled.out.get();
+                    if liveness.def[out].is_none() {
+                        liveness.def[out] = Some(*tick);
+                    }
+                    liveness.last_ref[out] = liveness.last_ref[out].max(*tick);
+                }
+                Statement::Loop(loop_step) => {
+                    let descriptor = loop_step.invocations[invocation];
+                    for iteration in 0..descriptor.iterations as usize {
+                        let row = descriptor.first_row as usize + iteration;
+                        active.push(ActiveLoop { loop_step, row });
+                        self.liveness_range(loop_step.body, active, row, tick, liveness);
+                        active.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    fn assign_compact_slots(&self, liveness: &SlotLiveness) -> SlotAssignment {
+        let mut map = alloc::vec![u32::MAX; self.slots];
+        for (position, &input) in self.inputs.iter().enumerate() {
+            map[input.get()] = position as u32;
+        }
+        let mut next_fresh = self.inputs.len() as u32;
+        let mut free = BinaryHeap::<Reverse<u32>>::new();
+        let mut active = BinaryHeap::<Reverse<(u32, u32)>>::new();
+
+        let mut computed = (0..self.slots)
+            .filter(|&slot| map[slot] == u32::MAX)
+            .map(|slot| (slot, liveness.def[slot].unwrap_or(0), liveness.last_ref[slot]))
+            .collect::<Vec<_>>();
+        computed.sort_by_key(|&(_, def, _)| def);
+
+        for (slot, def, last_ref) in computed {
+            while let Some(&Reverse((earliest_last_ref, phys))) = active.peek() {
+                if earliest_last_ref < def {
+                    active.pop();
+                    free.push(Reverse(phys));
+                } else {
+                    break;
+                }
+            }
+            let phys = match free.pop() {
+                Some(Reverse(phys)) => phys,
+                None => {
+                    let phys = next_fresh;
+                    next_fresh += 1;
+                    phys
+                }
+            };
+            map[slot] = phys;
+            active.push(Reverse((last_ref, phys)));
+        }
+
+        SlotAssignment {
+            map,
+            new_slots: next_fresh as usize,
+        }
+    }
+
+    fn rewrite_with(&self, assignment: &SlotAssignment) -> Self {
+        let mut statements = self.statements.clone();
+        for statement in &mut statements {
+            match statement {
+                Statement::Op(op) => *op = remap_prepared_op(*op, &assignment.map),
+                Statement::Loop(loop_step) => {
+                    for slot in &mut loop_step.table {
+                        *slot = assignment.map[*slot as usize];
+                    }
+                }
+            }
+        }
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|idx| Idx(assignment.map[idx.get()]))
+            .collect();
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|idx| Idx(assignment.map[idx.get()]))
+            .collect();
+        let mut compacted = Self {
+            slots: assignment.new_slots,
+            inputs,
+            outputs,
+            entry: self.entry,
+            statements,
+            // Compaction never changes how many operations a fully unrolled
+            // execution would perform -- only how many physical slots back
+            // them -- so the unrolled-byte estimate carries over unchanged;
+            // recomputing it from the new (smaller) `slots` via
+            // `refresh_estimate` would understate it.
+            estimated_unrolled_bytes: self.estimated_unrolled_bytes,
+            estimated_prepared_bytes: 0,
+        };
+        compacted.estimated_prepared_bytes = compacted.estimate_range(compacted.entry);
+        compacted
+            .validate()
+            .expect("slot compaction must preserve prepared-program structural invariants");
+        compacted
+    }
+}
+
+fn op_operand_slots(op: Op) -> [Option<Idx>; 3] {
+    match op {
+        Op::Create(_) => [None, None, None],
+        Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => [Some(a), Some(b), None],
+        Op::Mux { cond, then, r#else } => [Some(cond), Some(then), Some(r#else)],
+    }
+}
+
+fn remap_prepared_slot(slot: PreparedSlot, map: &[u32]) -> PreparedSlot {
+    match slot {
+        PreparedSlot::Static(idx) => PreparedSlot::Static(Idx(map[idx.get()])),
+        table @ PreparedSlot::Table { .. } => table,
+    }
+}
+
+fn remap_prepared_op(op: PreparedOp, map: &[u32]) -> PreparedOp {
+    match op {
+        PreparedOp::Create { value, out } => PreparedOp::Create {
+            value,
+            out: remap_prepared_slot(out, map),
+        },
+        PreparedOp::BitAnd { a, b, out } => PreparedOp::BitAnd {
+            a: remap_prepared_slot(a, map),
+            b: remap_prepared_slot(b, map),
+            out: remap_prepared_slot(out, map),
+        },
+        PreparedOp::BitOr { a, b, out } => PreparedOp::BitOr {
+            a: remap_prepared_slot(a, map),
+            b: remap_prepared_slot(b, map),
+            out: remap_prepared_slot(out, map),
+        },
+        PreparedOp::BitXor { a, b, out } => PreparedOp::BitXor {
+            a: remap_prepared_slot(a, map),
+            b: remap_prepared_slot(b, map),
+            out: remap_prepared_slot(out, map),
+        },
+        PreparedOp::Mux {
+            cond,
+            then,
+            r#else,
+            out,
+        } => PreparedOp::Mux {
+            cond: remap_prepared_slot(cond, map),
+            then: remap_prepared_slot(then, map),
+            r#else: remap_prepared_slot(r#else, map),
+            out: remap_prepared_slot(out, map),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1597,8 +1875,12 @@ mod tests {
         assert_eq!(prepared, program.prepare(&OptimizationOptions::default()));
     }
 
-    #[test]
-    fn nested_loops_support_a_different_inner_trip_count_per_outer_row() {
+    /// Two nested loops where the inner loop's trip count varies per outer
+    /// row (row 0 runs once, row 1 runs twice). Every computed slot (2..6)
+    /// is declared as a program output, so nothing in this particular
+    /// fixture is ever reusable -- it exists to exercise nested,
+    /// variable-trip-count loop structure, not slot reuse.
+    fn nested_variable_trip_count_fixture() -> (Program, PreparedProgram) {
         let raw = Program {
             ops: alloc::vec![
                 Op::Create(false),
@@ -1657,6 +1939,12 @@ mod tests {
             ],
         )
         .unwrap();
+        (raw, prepared)
+    }
+
+    #[test]
+    fn nested_loops_support_a_different_inner_trip_count_per_outer_row() {
+        let (raw, prepared) = nested_variable_trip_count_fixture();
 
         assert_eq!(
             interpret(&raw, &[true, false]),
@@ -1803,6 +2091,217 @@ mod tests {
             interpret_prepared(&prepared, &[true, false]),
             interpret_prepared(&optimized, &[true, false])
         );
+    }
+
+    #[test]
+    fn write_once_guard_still_protects_inputs_after_static_check_swap() {
+        let raw = Program {
+            ops: alloc::vec![Op::Create(false)],
+            inputs: alloc::vec![Idx(0)],
+            outputs: alloc::vec![Idx(0)],
+        };
+        let prepared = raw.prepare(&OptimizationOptions::default());
+        assert_eq!(interpret_prepared(&prepared, &[true]), [true]);
+    }
+
+    #[test]
+    fn compact_slots_reduces_width_and_preserves_semantics_for_flat_program() {
+        let mut recorder = Recorder::new();
+        let a = recorder.create(false).unwrap();
+        let b = recorder.create(false).unwrap();
+        let c = recorder.create(false).unwrap();
+        let d = recorder.create(false).unwrap();
+        // x1 dies as soon as x2 reads it, before x3 is even computed, so x3
+        // (an unrelated, independent chain) should be able to reuse x1's
+        // physical slot after compaction.
+        let x1 = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
+        let x2 = ContextWithBitXor::bitxor(&mut recorder, x1, c).unwrap();
+        let x3 = ContextWithBitAnd::bitand(&mut recorder, c, d).unwrap();
+        let out = ContextWithBitOr::bitor(&mut recorder, x2, x3).unwrap();
+        let program = recorder.finish(alloc::vec![a, b, c, d], alloc::vec![out]);
+        let prepared = program.prepare(&OptimizationOptions::default());
+        let compacted = prepared.compact_slots();
+
+        assert!(compacted.slots < prepared.slots);
+        for &(va, vb, vc, vd) in &[
+            (false, false, false, false),
+            (true, false, true, false),
+            (true, true, false, true),
+            (false, true, true, true),
+        ] {
+            let inputs = [va, vb, vc, vd];
+            assert_eq!(
+                interpret_prepared(&prepared, &inputs),
+                interpret_prepared(&compacted, &inputs)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_slots_reuses_slots_inside_a_loop_body() {
+        let mut recorder = Recorder::new();
+        let c = recorder.create(false).unwrap();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for _ in 0..8 {
+            a.push(recorder.create(false).unwrap());
+            b.push(recorder.create(false).unwrap());
+        }
+        let mut outputs = Vec::new();
+        for i in 0..8 {
+            // `t` never survives past its own iteration, so every
+            // iteration's `t` should collapse onto one reused physical
+            // slot; `out[i]` is a declared output and must not be reused.
+            let t = ContextWithBitAnd::bitand(&mut recorder, a[i], b[i]).unwrap();
+            let out = ContextWithBitXor::bitxor(&mut recorder, t, c).unwrap();
+            outputs.push(out);
+        }
+        let mut inputs = alloc::vec![c];
+        inputs.extend(a.iter().copied());
+        inputs.extend(b.iter().copied());
+        let program = recorder.finish(inputs, outputs);
+        let prepared = program.prepare(&OptimizationOptions::default());
+        assert!(prepared.has_loops());
+
+        let compacted = prepared.compact_slots();
+        assert!(compacted.has_loops());
+        assert!(compacted.slots < prepared.slots);
+
+        let sample = (0..17).map(|i| i % 3 == 0).collect::<Vec<_>>();
+        assert_eq!(
+            interpret_prepared(&prepared, &sample),
+            interpret_prepared(&compacted, &sample)
+        );
+    }
+
+    #[test]
+    fn compact_slots_reuses_slots_across_nested_loop_rows_with_different_trip_counts() {
+        let (_, prepared) = nested_variable_trip_count_fixture();
+        let compacted = prepared.compact_slots();
+
+        // Every computed slot in this fixture is a declared output (see the
+        // fixture's own doc comment), so nothing here is actually
+        // reusable -- this test's job is confirming compaction is a
+        // correctness-preserving no-op under nested, variable-trip-count
+        // loops. `compact_slots_reuses_slots_inside_a_loop_body` above
+        // covers the case where reuse actually happens.
+        assert_eq!(compacted.slots, prepared.slots);
+        for &(a, b) in &[
+            (true, false),
+            (false, true),
+            (true, true),
+            (false, false),
+        ] {
+            assert_eq!(
+                interpret_prepared(&prepared, &[a, b]),
+                interpret_prepared(&compacted, &[a, b])
+            );
+        }
+    }
+
+    #[test]
+    fn compact_slots_preserves_input_and_output_identity_order() {
+        let mut recorder = Recorder::new();
+        let a = recorder.create(false).unwrap();
+        let b = recorder.create(false).unwrap();
+        let c = recorder.create(false).unwrap();
+        let and = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
+        let or = ContextWithBitOr::bitor(&mut recorder, a, b).unwrap();
+        let xor = ContextWithBitXor::bitxor(&mut recorder, b, c).unwrap();
+        // Outputs declared out of definition order, and not every computed
+        // value is an output (`or` is scratch-only).
+        let program = recorder.finish(alloc::vec![a, b, c], alloc::vec![xor, and, or]);
+        let prepared = program.prepare(&OptimizationOptions::default());
+        let compacted = prepared.compact_slots();
+
+        for &(va, vb, vc) in &[
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            let inputs = [va, vb, vc];
+            assert_eq!(
+                interpret_prepared(&prepared, &inputs),
+                interpret_prepared(&compacted, &inputs)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_slots_never_shares_an_input_slot_with_any_other_def() {
+        let mut recorder = Recorder::new();
+        let a = recorder.create(false).unwrap();
+        let b = recorder.create(false).unwrap();
+        // `a`'s real last use is early (only read once, right away), which
+        // is exactly the case that could tempt an allocator into reusing
+        // its slot for something else if inputs weren't pinned.
+        let and = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
+        let xor = ContextWithBitXor::bitxor(&mut recorder, and, b).unwrap();
+        let program = recorder.finish(alloc::vec![a, b], alloc::vec![xor]);
+        let prepared = program.prepare(&OptimizationOptions::default());
+
+        let liveness = prepared.compute_liveness();
+        let assignment = prepared.assign_compact_slots(&liveness);
+        let input_phys_slots = prepared
+            .inputs
+            .iter()
+            .map(|idx| assignment.map[idx.get()])
+            .collect::<Vec<_>>();
+        for slot in 0..prepared.slots {
+            if prepared.inputs.iter().any(|idx| idx.get() == slot) {
+                continue;
+            }
+            assert!(!input_phys_slots.contains(&assignment.map[slot]));
+        }
+    }
+
+    #[test]
+    fn compact_slots_is_a_no_op_shape_when_nothing_is_reusable() {
+        let mut recorder = Recorder::new();
+        let a = recorder.create(false).unwrap();
+        let b = recorder.create(false).unwrap();
+        let c = recorder.create(false).unwrap();
+        // Three independent chains, all declared as outputs -- every
+        // computed value is live through to the very end, so there is
+        // nothing for compaction to reuse.
+        let and = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
+        let or = ContextWithBitOr::bitor(&mut recorder, b, c).unwrap();
+        let xor = ContextWithBitXor::bitxor(&mut recorder, a, c).unwrap();
+        let program = recorder.finish(alloc::vec![a, b, c], alloc::vec![and, or, xor]);
+        let prepared = program.prepare(&OptimizationOptions::default());
+        let compacted = prepared.compact_slots();
+
+        assert_eq!(compacted.slots, prepared.slots);
+    }
+
+    #[test]
+    fn compact_slots_handles_a_loop_with_zero_iterations_without_panicking() {
+        let prepared = PreparedProgram::new(
+            2,
+            Vec::new(),
+            Vec::new(),
+            StatementRange::new(0, 1),
+            alloc::vec![
+                Statement::Loop(PreparedLoop {
+                    body: StatementRange::new(1, 2),
+                    invocations: alloc::vec![LoopInvocation {
+                        first_row: 0,
+                        iterations: 0,
+                    }],
+                    fields_per_iteration: 1,
+                    table: Vec::new(),
+                }),
+                Statement::Op(PreparedOp::Create {
+                    value: true,
+                    out: PreparedSlot::Table { depth: 0, field: 0 },
+                }),
+            ],
+        )
+        .unwrap();
+
+        let compacted = prepared.compact_slots();
+        assert!(compacted.validate().is_ok());
     }
 
     #[test]

@@ -298,6 +298,10 @@ where
         "input count must match the recorded program's input slots"
     );
     let mut buf: Vec<Option<Backend::Wrapped>> = vec![None; program.slots];
+    let mut is_input = vec![false; program.slots];
+    for &idx in &program.inputs {
+        is_input[idx.get()] = true;
+    }
     for (&idx, value) in program.inputs.iter().zip(inputs) {
         buf[idx.get()] = Some(value.clone());
     }
@@ -306,6 +310,7 @@ where
         program,
         program.entry,
         &mut buf,
+        &is_input,
         &mut Vec::new(),
         0,
     )?;
@@ -326,6 +331,7 @@ fn execute_range<'a, Backend>(
     program: &'a PreparedProgram,
     range: StatementRange,
     buf: &mut [Option<Backend::Wrapped>],
+    is_input: &[bool],
     active: &mut Vec<ActiveLoop<'a>>,
     invocation: usize,
 ) -> Result<(), Backend::Error>
@@ -341,15 +347,26 @@ where
     let end = range.end as usize;
     for statement in &program.statements[start..end] {
         match statement {
-            Statement::Op(op) => {
-                execute_scheduled(backend, buf, op.resolve(|slot| resolve_slot(slot, active)))?
-            }
+            Statement::Op(op) => execute_scheduled(
+                backend,
+                buf,
+                is_input,
+                op.resolve(|slot| resolve_slot(slot, active)),
+            )?,
             Statement::Loop(loop_step) => {
                 let descriptor = loop_step.invocations[invocation];
                 for iteration in 0..descriptor.iterations as usize {
                     let row = descriptor.first_row as usize + iteration;
                     active.push(ActiveLoop { loop_step, row });
-                    let outcome = execute_range(backend, program, loop_step.body, buf, active, row);
+                    let outcome = execute_range(
+                        backend,
+                        program,
+                        loop_step.body,
+                        buf,
+                        is_input,
+                        active,
+                        row,
+                    );
                     active.pop();
                     outcome?;
                 }
@@ -374,6 +391,7 @@ fn resolve_slot(slot: PreparedSlot, active: &[ActiveLoop<'_>]) -> cirrus_recompi
 fn execute_scheduled<Backend>(
     backend: &mut Backend,
     buf: &mut [Option<Backend::Wrapped>],
+    is_input: &[bool],
     scheduled: ScheduledOp,
 ) -> Result<(), Backend::Error>
 where
@@ -384,7 +402,7 @@ where
         + cirrus_core::ContextWithMux<bool>,
     Backend::Wrapped: Clone,
 {
-    if buf[scheduled.out.get()].is_some() {
+    if is_input[scheduled.out.get()] {
         return Ok(());
     }
     let result = match scheduled.op {

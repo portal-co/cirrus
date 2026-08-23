@@ -531,4 +531,42 @@ mod tests {
             assert_eq!(actual, expected, "mismatch for inputs ({x}, {y})");
         }
     }
+
+    #[test]
+    fn compiled_program_matches_the_reference_interpreter_after_slot_compaction() {
+        // x1 dies before x3 is computed, so `Program::compact` should reuse
+        // its physical slot for x3 -- this exercises the compacted artifact
+        // through the real `rustc`-compiled backend, confirming compaction
+        // needs no `cirrus-rust-codegen`-side changes.
+        let mut recorder = Recorder::new();
+        let a = recorder.create(false).unwrap();
+        let b = recorder.create(false).unwrap();
+        let c = recorder.create(false).unwrap();
+        let d = recorder.create(false).unwrap();
+        let x1 = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
+        let x2 = ContextWithBitXor::bitxor(&mut recorder, x1, c).unwrap();
+        let x3 = ContextWithBitAnd::bitand(&mut recorder, c, d).unwrap();
+        let out = ContextWithBitOr::bitor(&mut recorder, x2, x3).unwrap();
+        let program = recorder.finish(vec![a, b, c, d], vec![out]);
+        let compacted = program.compact(&OptimizationOptions::default());
+        assert!(compacted.slots < program.len());
+
+        let compiled = CompiledProgram::compile_prepared(
+            &compacted,
+            "cirrus_rust_codegen_compact_test_fn",
+            &BackendTarget::plaintext(),
+        );
+
+        for &(va, vb, vc, vd) in &[
+            (false, false, false, false),
+            (true, false, true, false),
+            (true, true, false, true),
+            (false, true, true, true),
+        ] {
+            let sample = [va, vb, vc, vd];
+            let expected = cirrus_recompile_core::interpret_prepared(&compacted, &sample);
+            let actual = compiled.run_prepared_plaintext(&compacted, &sample);
+            assert_eq!(actual, expected, "mismatch for inputs {sample:?}");
+        }
+    }
 }
