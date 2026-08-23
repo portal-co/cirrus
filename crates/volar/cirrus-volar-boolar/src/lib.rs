@@ -48,6 +48,44 @@ pub struct StorageBank<'a, W> {
     pub cells: &'a mut [W],
 }
 
+/// The dense storage allocation required for one Boolar storage lane.
+///
+/// `cells` is always a non-zero power of two and is suitable for directly
+/// constructing a [`StorageBank`].  Requirements include lanes referenced
+/// only by [`BCircuit::pre_init`], so callers can allocate storage before the
+/// first execution rather than discovering a missing bank midway through it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageRequirement {
+    pub storage: StorageId,
+    pub lane: LaneId,
+    pub address_bits: usize,
+    pub cells: usize,
+}
+
+/// Why a circuit's storage layout cannot be represented by dense banks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageLayoutError {
+    /// An address has too many bits to form a platform `usize` cell count.
+    AddressWidthOverflow { bits: usize },
+    /// The same storage lane was used with incompatible address widths.
+    ConflictingAddressWidth {
+        storage: StorageId,
+        lane: LaneId,
+        first: usize,
+        second: usize,
+    },
+    /// A pre-initialisation segment cannot be represented in a `usize` bank.
+    PreInitOffsetOverflow { storage: StorageId, lane: LaneId },
+    /// Static data extends beyond the lane capacity implied by its addresses.
+    PreInitOutOfBounds {
+        storage: StorageId,
+        lane: LaneId,
+        offset: u64,
+        data_len: usize,
+        cells: usize,
+    },
+}
+
 /// Why Boolar execution could not complete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecuteError<E> {
@@ -74,6 +112,9 @@ pub enum ExecuteError<E> {
         address_bits: usize,
         cells: usize,
     },
+    /// The circuit's storage accesses and static initialization cannot share
+    /// one dense layout.
+    StorageLayout(StorageLayoutError),
     /// The circuit uses a Boolar statement that has no Cirrus context meaning.
     UnsupportedStatement,
     /// The underlying Cirrus Boolean context rejected an operation.
@@ -86,11 +127,156 @@ struct Value<W> {
     known: Option<bool>,
 }
 
+/// Derive the dense storage banks needed by `circuit`.
+///
+/// Every storage statement for one `(storage, lane)` pair must use the same
+/// address width. Static initialization is checked against that capacity.
+pub fn storage_requirements<P: Clone>(
+    circuit: &BCircuit<P>,
+) -> Result<Vec<StorageRequirement>, StorageLayoutError> {
+    let mut requirements: Vec<(StorageRequirement, bool)> = Vec::new();
+
+    for node in &circuit.stmts {
+        let (storage, lane, address_bits) = match &node.kind {
+            BIrStmt::StorageRead {
+                storage,
+                lane,
+                addr,
+            }
+            | BIrStmt::StorageWrite {
+                storage,
+                lane,
+                addr,
+                ..
+            } => (*storage, *lane, addr.len()),
+            _ => continue,
+        };
+        let cells = cells_for_address_bits(address_bits)?;
+        if let Some((requirement, has_access)) = requirements
+            .iter_mut()
+            .find(|(requirement, _)| requirement.storage == storage && requirement.lane == lane)
+        {
+            if *has_access && requirement.address_bits != address_bits {
+                return Err(StorageLayoutError::ConflictingAddressWidth {
+                    storage,
+                    lane,
+                    first: requirement.address_bits,
+                    second: address_bits,
+                });
+            }
+            requirement.address_bits = address_bits;
+            requirement.cells = cells;
+            *has_access = true;
+        } else {
+            requirements.push((
+                StorageRequirement {
+                    storage,
+                    lane,
+                    address_bits,
+                    cells,
+                },
+                true,
+            ));
+        }
+    }
+
+    for segment in &circuit.pre_init {
+        let data_len = u64::try_from(segment.data.len()).map_err(|_| {
+            StorageLayoutError::PreInitOffsetOverflow {
+                storage: segment.storage,
+                lane: segment.lane,
+            }
+        })?;
+        let end = segment.offset.checked_add(data_len).ok_or(
+            StorageLayoutError::PreInitOffsetOverflow {
+                storage: segment.storage,
+                lane: segment.lane,
+            },
+        )?;
+        if let Some((requirement, has_access)) = requirements.iter_mut().find(|(requirement, _)| {
+            requirement.storage == segment.storage && requirement.lane == segment.lane
+        }) {
+            if end > requirement.cells as u64 {
+                return Err(StorageLayoutError::PreInitOutOfBounds {
+                    storage: segment.storage,
+                    lane: segment.lane,
+                    offset: segment.offset,
+                    data_len: segment.data.len(),
+                    cells: requirement.cells,
+                });
+            }
+            debug_assert!(*has_access);
+        } else {
+            let minimum_cells =
+                usize::try_from(end).map_err(|_| StorageLayoutError::PreInitOffsetOverflow {
+                    storage: segment.storage,
+                    lane: segment.lane,
+                })?;
+            let cells = minimum_cells.max(1).checked_next_power_of_two().ok_or(
+                StorageLayoutError::PreInitOffsetOverflow {
+                    storage: segment.storage,
+                    lane: segment.lane,
+                },
+            )?;
+            requirements.push((
+                StorageRequirement {
+                    storage: segment.storage,
+                    lane: segment.lane,
+                    address_bits: cells.trailing_zeros() as usize,
+                    cells,
+                },
+                false,
+            ));
+        }
+    }
+
+    Ok(requirements
+        .into_iter()
+        .map(|(requirement, _)| requirement)
+        .collect())
+}
+
+/// Install a circuit's static storage values into fresh caller-owned banks.
+///
+/// Call this once before repeatedly using [`execute_initialized`] to carry
+/// state across transition circuits. [`execute`] is the convenient one-shot
+/// version and invokes this automatically.
+pub fn initialize_storage<C, P>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    banks: &mut [StorageBank<'_, Wire<C>>],
+) -> Result<(), ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    P: Clone,
+    Wire<C>: Clone,
+{
+    validate_circuit_storage::<C, P>(circuit, banks)?;
+    for segment in &circuit.pre_init {
+        let bank = find_bank(banks, segment.storage, segment.lane)
+            .expect("validated pre-init storage bank");
+        let start = usize::try_from(segment.offset).map_err(|_| {
+            ExecuteError::StorageLayout(StorageLayoutError::PreInitOffsetOverflow {
+                storage: segment.storage,
+                lane: segment.lane,
+            })
+        })?;
+        for (offset, bit) in segment.data.iter().copied().enumerate() {
+            banks[bank].cells[start + offset] =
+                context.create(bit).map_err(ExecuteError::Context)?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute a fused Boolar circuit through `context`.
 ///
 /// Parameters and caller-supplied storage cells are treated as unknown. The
 /// interpreter tracks only values proven by Boolar constants and Boolean
 /// operations on them, using those facts to shrink storage MUX/demux trees.
+/// Static [`BCircuit::pre_init`] values are installed before execution. For a
+/// transition loop, initialize once with [`initialize_storage`] and then use
+/// [`execute_initialized`] so writes from earlier transitions persist.
 pub fn execute<C, P>(
     context: &mut C,
     circuit: &BCircuit<P>,
@@ -108,8 +294,46 @@ where
             found: inputs.len(),
         });
     }
-    validate_banks(banks)?;
+    let bank_facts = initialize_with_facts(context, circuit, banks)?;
+    execute_impl(context, circuit, inputs, banks, bank_facts)
+}
 
+/// Execute a circuit against already-initialized storage.
+///
+/// This is the persistent-state counterpart to [`execute`]. It deliberately
+/// does not replay `pre_init`; callers should use [`initialize_storage`] once
+/// for a fresh storage image.
+pub fn execute_initialized<C, P>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, Wire<C>>],
+) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    P: Clone,
+    Wire<C>: Clone,
+{
+    validate_circuit_storage::<C, P>(circuit, banks)?;
+    let bank_facts = banks
+        .iter()
+        .map(|bank| alloc::vec![None; bank.cells.len()])
+        .collect();
+    execute_impl(context, circuit, inputs, banks, bank_facts)
+}
+
+fn execute_impl<C, P>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, Wire<C>>],
+    mut bank_facts: Vec<Vec<Option<bool>>>,
+) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    P: Clone,
+    Wire<C>: Clone,
+{
     let mut values = Vec::with_capacity(circuit.params as usize + circuit.stmts.len());
     values.extend(
         inputs
@@ -117,10 +341,6 @@ where
             .cloned()
             .map(|wire| Value { wire, known: None }),
     );
-    let mut bank_facts: Vec<Vec<Option<bool>>> = banks
-        .iter()
-        .map(|bank| alloc::vec![None; bank.cells.len()])
-        .collect();
     let mut canonical_one = None;
 
     for node in &circuit.stmts {
@@ -215,6 +435,71 @@ where
         .iter()
         .map(|output| Ok(value_at(&values, *output)?.wire.clone()))
         .collect()
+}
+
+fn initialize_with_facts<C, P>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    banks: &mut [StorageBank<'_, Wire<C>>],
+) -> Result<Vec<Vec<Option<bool>>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    P: Clone,
+    Wire<C>: Clone,
+{
+    validate_circuit_storage::<C, P>(circuit, banks)?;
+    let mut facts: Vec<Vec<Option<bool>>> = banks
+        .iter()
+        .map(|bank| alloc::vec![None; bank.cells.len()])
+        .collect();
+    for segment in &circuit.pre_init {
+        let bank = find_bank(banks, segment.storage, segment.lane)
+            .expect("validated pre-init storage bank");
+        let start = usize::try_from(segment.offset).map_err(|_| {
+            ExecuteError::StorageLayout(StorageLayoutError::PreInitOffsetOverflow {
+                storage: segment.storage,
+                lane: segment.lane,
+            })
+        })?;
+        for (offset, bit) in segment.data.iter().copied().enumerate() {
+            banks[bank].cells[start + offset] =
+                context.create(bit).map_err(ExecuteError::Context)?;
+            facts[bank][start + offset] = Some(bit);
+        }
+    }
+    Ok(facts)
+}
+
+fn validate_circuit_storage<C, P>(
+    circuit: &BCircuit<P>,
+    banks: &[StorageBank<'_, Wire<C>>],
+) -> Result<(), ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    P: Clone,
+{
+    validate_banks(banks)?;
+    for requirement in storage_requirements(circuit).map_err(ExecuteError::StorageLayout)? {
+        let bank = find_bank(banks, requirement.storage, requirement.lane).ok_or(
+            ExecuteError::MissingStorageBank {
+                storage: requirement.storage,
+                lane: requirement.lane,
+            },
+        )?;
+        validate_address_width(
+            requirement.storage,
+            requirement.lane,
+            requirement.address_bits,
+            banks[bank].cells.len(),
+        )?;
+    }
+    Ok(())
+}
+
+fn cells_for_address_bits(bits: usize) -> Result<usize, StorageLayoutError> {
+    1usize
+        .checked_shl(bits as u32)
+        .ok_or(StorageLayoutError::AddressWidthOverflow { bits })
 }
 
 fn validate_banks<W, E>(banks: &[StorageBank<'_, W>]) -> Result<(), ExecuteError<E>> {
@@ -525,7 +810,29 @@ mod tests {
     };
     use cirrus_recompile_core::{Recorder, interpret};
     use core::convert::Infallible;
+    use volar_ir::boolar::BIrPreInitSegment;
     use volar_ir_common::Node;
+
+    #[test]
+    fn bounded_riscv_fixture_lowers_to_initialized_five_bit_memory() {
+        use volar_riscv_test_programs::{parse_and_expand, wat_gen::test_program_wat};
+        use volar_vaffle_target::{
+            VaffleTarget, import_config::WaffleImportConfig, waffle_lower::lower_waffle_module,
+        };
+
+        let wasm = wat::parse_str(test_program_wat()).expect("RISC fixture WAT should assemble");
+        let module = parse_and_expand(&wasm).expect("RISC fixture should parse and expand");
+        let mut target = VaffleTarget::new();
+        let errors = lower_waffle_module(
+            &module,
+            &mut target,
+            &WaffleImportConfig::default().with_memory_address_bits(5),
+        );
+        assert!(errors.is_empty(), "unexpected lowering errors: {errors:?}");
+        assert_eq!(target.module.pre_init.len(), 2, "code and data memories must be initialized");
+        assert_eq!(target.module.pre_init[0].data.len(), 32, "RISC code fits the five-bit RAM");
+        assert_eq!(target.module.pre_init[1].data.len(), 20, "data RAM includes the result word");
+    }
 
     const STORAGE: StorageId = StorageId(7);
     const LANE: LaneId = LaneId(3);
@@ -537,6 +844,7 @@ mod tests {
                 .into_iter()
                 .map(|stmt| Node::new(stmt, (), None))
                 .collect(),
+            pre_init: vec![],
             outputs,
         }
     }
@@ -604,6 +912,118 @@ mod tests {
             assert_eq!(outputs, vec![true]);
             assert_eq!(cells, core::array::from_fn(|cell| cell == address));
         }
+    }
+
+    #[test]
+    fn derives_and_installs_preinitialized_storage() {
+        let mut circuit = circuit(
+            2,
+            vec![BIrStmt::StorageRead {
+                storage: STORAGE,
+                lane: LANE,
+                addr: vec![IRVarId(0), IRVarId(1)],
+            }],
+            vec![IRVarId(2)],
+        );
+        circuit.pre_init = vec![BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            offset: 0,
+            data: vec![false, true, true, false],
+        }];
+        assert_eq!(
+            storage_requirements(&circuit),
+            Ok(vec![StorageRequirement {
+                storage: STORAGE,
+                lane: LANE,
+                address_bits: 2,
+                cells: 4,
+            }])
+        );
+
+        let mut cells = [false; 4];
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            cells: &mut cells,
+        }];
+        assert_eq!(
+            execute(&mut (), &circuit, &[false, true], &mut banks).unwrap(),
+            vec![true]
+        );
+        assert_eq!(cells, [false, true, true, false]);
+    }
+
+    #[test]
+    fn rejects_preinit_outside_addressable_memory() {
+        let mut circuit = circuit(
+            2,
+            vec![BIrStmt::StorageRead {
+                storage: STORAGE,
+                lane: LANE,
+                addr: vec![IRVarId(0), IRVarId(1)],
+            }],
+            vec![IRVarId(2)],
+        );
+        circuit.pre_init = vec![BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            offset: 3,
+            data: vec![true, false],
+        }];
+        assert_eq!(
+            storage_requirements(&circuit),
+            Err(StorageLayoutError::PreInitOutOfBounds {
+                storage: STORAGE,
+                lane: LANE,
+                offset: 3,
+                data_len: 2,
+                cells: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn initialized_execution_preserves_transition_storage() {
+        let mut circuit = circuit(
+            2,
+            vec![
+                BIrStmt::StorageWrite {
+                    storage: STORAGE,
+                    lane: LANE,
+                    src: IRVarId(0),
+                    addr: vec![IRVarId(1)],
+                },
+                BIrStmt::StorageRead {
+                    storage: STORAGE,
+                    lane: LANE,
+                    addr: vec![IRVarId(1)],
+                },
+            ],
+            vec![IRVarId(3)],
+        );
+        circuit.pre_init = vec![BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            offset: 0,
+            data: vec![false, false],
+        }];
+        let mut cells = [true; 2];
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            cells: &mut cells,
+        }];
+        initialize_storage(&mut (), &circuit, &mut banks).unwrap();
+        assert_eq!(
+            execute_initialized(&mut (), &circuit, &[true, true], &mut banks).unwrap(),
+            vec![true]
+        );
+        assert_eq!(
+            execute_initialized(&mut (), &circuit, &[false, false], &mut banks).unwrap(),
+            vec![false]
+        );
+        assert_eq!(cells, [false, true]);
     }
 
     #[test]

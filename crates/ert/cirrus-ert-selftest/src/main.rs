@@ -194,6 +194,7 @@ fn boolar_storage_probe() -> bool {
                 None,
             ),
         ],
+        pre_init: vec![],
         outputs: vec![IRVarId(4)],
     };
     let mut cells = [false; 4];

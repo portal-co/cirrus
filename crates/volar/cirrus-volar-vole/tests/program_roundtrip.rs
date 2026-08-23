@@ -15,10 +15,9 @@
 //! time.
 
 use cipher::consts::U1;
-use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
-};
+use cirrus_core::ContextWithCreate;
 use cirrus_recompile_core::Recorder;
+use cirrus_volar_boolar::execute as execute_boolar;
 use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext};
 use hybrid_array::Array;
 use volar_spec::{
@@ -30,6 +29,8 @@ use volar_spec::{
         setup::{random_nonzero_delta, vole_commit_bit},
     },
 };
+use volar_ir::circuit::BCircuit;
+use volar_lir_test_corpus::make_biir_half_adder;
 
 const CASES: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
 
@@ -71,16 +72,12 @@ fn bit_to_t(b: bool) -> Galois128 {
 }
 
 fn sample_program() -> cirrus_recompile_core::Program {
+    let circuit = BCircuit::try_from_ir(&make_biir_half_adder()).expect("corpus fixture is fused");
     let mut recorder = Recorder::new();
-    let zero = recorder.create(false).unwrap();
-    let one = recorder.create(true).unwrap();
     let a = recorder.create(false).unwrap();
     let b = recorder.create(false).unwrap();
-    let and = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
-    let or = ContextWithBitOr::bitor(&mut recorder, a, b).unwrap();
-    let xor = ContextWithBitXor::bitxor(&mut recorder, a, b).unwrap();
-    let mux = ContextWithMux::mux(&mut recorder, a, one, zero).unwrap();
-    recorder.finish(vec![zero, one, a, b], vec![and, or, xor, mux])
+    let outputs = execute_boolar(&mut recorder, &circuit, &[a, b], &mut []).unwrap();
+    recorder.finish(vec![a, b], outputs)
 }
 
 #[test]
@@ -88,7 +85,7 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
     let program = sample_program();
 
     for &(av, bv) in &CASES {
-        let raw_inputs = [false, true, av, bv];
+        let raw_inputs = [av, bv];
 
         let mut rng = TestRng(0xC1_2C_55_00 ^ (av as u64) << 8 ^ (bv as u64));
         let delta = random_nonzero_delta::<U1, Galois128, _>(&mut rng, sample_g128, is_zero_g128);
@@ -125,16 +122,16 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
             );
         }
 
-        // Explicit soundness check at the "and" output wire (outputs[0]),
+        // Explicit soundness check at the "and" output wire (outputs[1]),
         // whose two operands are the raw `a`/`b` inputs directly.
-        let q_a = verifier_inputs[2].clone();
-        let q_b = verifier_inputs[3].clone();
+        let q_a = verifier_inputs[0].clone();
+        let q_b = verifier_inputs[1].clone();
         let and_hat = hats.0[0].clone();
         let (_, ok) =
-            vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[0], &and_hat);
+            vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[1], &and_hat);
         assert!(ok, "honest and-gate check rejected for ({av}, {bv})");
 
-        // Negative case: keep the honestly-derived `q_and` (verifier_outputs[0],
+        // Negative case: keep the honestly-derived `q_and` (verifier_outputs[1],
         // matching what the prover actually committed to), but check it
         // against a DIFFERENT hat than the one it was derived from -- this
         // is what a tampered transcript looks like from the verifier's
@@ -146,7 +143,7 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
         let mut bad_hat = and_hat;
         bad_hat[0] = bad_hat[0] + Galois128(1);
         let (_, bad_ok) =
-            vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[0], &bad_hat);
+            vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[1], &bad_hat);
         assert!(!bad_ok, "verifier accepted a corrupted hat for ({av}, {bv})");
     }
 }

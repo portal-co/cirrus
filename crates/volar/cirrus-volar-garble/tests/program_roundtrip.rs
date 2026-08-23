@@ -5,14 +5,15 @@
 //! but calling `cirrus_recompile_rt::execute` directly (no codegen step).
 
 use cipher::consts::U16;
-use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
-};
+use cirrus_core::ContextWithCreate;
 use cirrus_recompile_core::Recorder;
+use cirrus_volar_boolar::execute as execute_boolar;
 use cirrus_volar_garble::{VolarEvalBackend, VolarGarbleBackend};
 use hybrid_array::Array;
 use sha2::Sha256;
 use volar_spec::garble::{Garble, GlobalSecret};
+use volar_ir::circuit::BCircuit;
+use volar_lir_test_corpus::make_biir_half_adder;
 
 const CASES: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
 
@@ -29,16 +30,12 @@ impl<T> cirrus_core::Pusher<T> for VecPusher<T> {
 }
 
 fn sample_program() -> cirrus_recompile_core::Program {
+    let circuit = BCircuit::try_from_ir(&make_biir_half_adder()).expect("corpus fixture is fused");
     let mut recorder = Recorder::new();
-    let zero = recorder.create(false).unwrap();
-    let one = recorder.create(true).unwrap();
     let a = recorder.create(false).unwrap();
     let b = recorder.create(false).unwrap();
-    let and = ContextWithBitAnd::bitand(&mut recorder, a, b).unwrap();
-    let or = ContextWithBitOr::bitor(&mut recorder, a, b).unwrap();
-    let xor = ContextWithBitXor::bitxor(&mut recorder, a, b).unwrap();
-    let mux = ContextWithMux::mux(&mut recorder, a, one, zero).unwrap();
-    recorder.finish(vec![zero, one, a, b], vec![and, or, xor, mux])
+    let outputs = execute_boolar(&mut recorder, &circuit, &[a, b], &mut []).unwrap();
+    recorder.finish(vec![a, b], outputs)
 }
 
 #[test]
@@ -46,7 +43,7 @@ fn garble_then_evaluate_matches_the_interpret_oracle() {
     let program = sample_program();
 
     for &(av, bv) in &CASES {
-        let raw_inputs = [false, true, av, bv];
+        let raw_inputs = [av, bv];
         let expected = cirrus_recompile_core::interpret(&program, &raw_inputs);
 
         let mut tables = VecPusher::default();
@@ -57,7 +54,7 @@ fn garble_then_evaluate_matches_the_interpret_oracle() {
         // the caller (a garbler never learns the true bit, so any label is
         // a valid false-label reference) -- directly, rather than through
         // `Op::Create`, exactly like a real program's data inputs.
-        let garbler_input_labels: [Garble<U16>; 4] = core::array::from_fn(|salt| Garble {
+        let garbler_input_labels: [Garble<U16>; 2] = core::array::from_fn(|salt| Garble {
             base: Array::<u8, U16>::from_fn(|i| (i as u8) ^ (salt as u8 * 17)),
         });
 

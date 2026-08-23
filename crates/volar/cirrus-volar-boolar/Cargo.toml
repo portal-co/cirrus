@@ -11,3 +11,6 @@ volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar
 
 [dev-dependencies]
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
+volar-vaffle-target = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-riscv-test-programs = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+wat = "1.212.0"

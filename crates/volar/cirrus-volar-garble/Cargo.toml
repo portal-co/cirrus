@@ -17,3 +17,6 @@ cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recomp
 cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
 rv-asm.workspace = true
 sha2 = { version = "0.11.0", default-features = false }
+cirrus-volar-boolar = { path = "../cirrus-volar-boolar" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-lir-test-corpus = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
