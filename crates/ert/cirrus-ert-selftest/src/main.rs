@@ -23,7 +23,11 @@ use volar_ir::{
 };
 use volar_ir_common::{Node, StorageId};
 
-const BOOLAR_HEAP_BYTES: usize = 32 * 1024;
+/// The QEMU RV32 runner has 128 MiB of RAM.  Keep an intentionally large
+/// allocator below that ceiling so the symbolic test exercises the same memory
+/// envelope as the runner while leaving room for the image, stacks, and a
+/// guard band.
+const BOOLAR_HEAP_BYTES: usize = 120 * 1024 * 1024;
 
 #[repr(align(16))]
 struct Heap([u8; BOOLAR_HEAP_BYTES]);
@@ -41,6 +45,15 @@ impl BumpAllocator {
             cursor: UnsafeCell::new(0),
             heap: UnsafeCell::new(Heap([0; BOOLAR_HEAP_BYTES])),
         }
+    }
+
+    /// High-water mark for the no-deallocation allocator. The self-test emits
+    /// this after its Boolar probe so CI and host runs can record the actual
+    /// allocation requirement rather than inferring it from the heap reserve.
+    fn used(&self) -> usize {
+        // SAFETY: the bare-metal self-test is single-threaded and only reads
+        // the cursor after all allocations for the probe have completed.
+        unsafe { *self.cursor.get() }
     }
 }
 
@@ -210,7 +223,43 @@ fn boolar_storage_probe() -> bool {
 }
 
 fn finish_success() -> ! {
+    report_heap_usage();
     finish(0x5555)
+}
+
+fn report_heap_usage() {
+    uart_write(b"cirrus-ert heap_capacity_bytes=");
+    uart_write_decimal(BOOLAR_HEAP_BYTES);
+    uart_write(b" heap_used_bytes=");
+    uart_write_decimal(ALLOCATOR.used());
+    uart_write(b"\n");
+}
+
+fn uart_write(bytes: &[u8]) {
+    for &byte in bytes {
+        // SAFETY: QEMU's `virt` machine maps the first 16550 UART at this
+        // address. Polling the line-status register keeps the metrics line
+        // valid even when a runner does not drain the transmit FIFO eagerly.
+        while unsafe { (0x1000_0005 as *const u8).read_volatile() } & (1 << 5) == 0 {}
+        unsafe { (0x1000_0000 as *mut u8).write_volatile(byte) };
+    }
+}
+
+fn uart_write_decimal(mut value: usize) {
+    let mut digits = [0; 20];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        uart_write(&digits[count..count + 1]);
+    }
 }
 
 fn finish_failure(code: u16) -> ! {

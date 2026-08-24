@@ -19,3 +19,7 @@ cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core", optional = true }
 rv-asm.workspace = true
+
+[dev-dependencies]
+cirrus-ert-sha256-fixture = { path = "../cirrus-ert-sha256-fixture" }
+libc = "0.2"
