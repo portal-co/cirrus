@@ -10,7 +10,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithValue,
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,
+    ContextWithValue, HasError, StorageAddressBit,
 };
 use volar_ir::{
     boolar::{BIrStmt, LaneId},
@@ -35,17 +36,131 @@ impl<T> BoolarContext for T where
 {
 }
 
-/// Caller-owned single-bit storage for one Boolar storage lane.
+/// The ordinary dense-storage implementation of [`ContextWithStorage`].
 ///
-/// The cell count must be a non-zero power of two. A storage statement whose
-/// address has `N` bits uses a bank with exactly `2^N` cells.
-pub struct StorageBank<'a, W> {
+/// Wrap a Boolean context in this adapter when storage should lower to the
+/// traditional MUX/demux trees.  The cells remain a separate caller-owned
+/// slice (`Storage = [Wire]`); the wrapper only supplies the Boolean gates.
+pub struct MuxTreeContext<C> {
+    inner: C,
+}
+
+impl<C> MuxTreeContext<C> {
+    pub fn new(inner: C) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut C {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> C {
+        self.inner
+    }
+}
+
+impl<C: HasError> HasError for MuxTreeContext<C> {
+    type Error = C::Error;
+}
+
+impl<C, Val> ContextWithValue<Val> for MuxTreeContext<C>
+where
+    C: ContextWithValue<Val>,
+{
+    type Wrapped = C::Wrapped;
+}
+
+impl<C> ContextWithCreate<bool> for MuxTreeContext<C>
+where
+    C: ContextWithCreate<bool>,
+{
+    fn create(&mut self, value: bool) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.create(value)
+    }
+}
+
+impl<C> ContextWithBitAnd<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitAnd<bool>,
+{
+    fn bitand(
+        &mut self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitand(left, right)
+    }
+
+    fn bitand_assign(
+        &mut self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitand_assign(left, right)
+    }
+}
+
+impl<C> ContextWithBitOr<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitOr<bool>,
+{
+    fn bitor(
+        &mut self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitor(left, right)
+    }
+
+    fn bitor_assign(
+        &mut self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitor_assign(left, right)
+    }
+}
+
+impl<C> ContextWithBitXor<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitXor<bool>,
+{
+    fn bitxor(
+        &mut self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitxor(left, right)
+    }
+
+    fn bitxor_assign(
+        &mut self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitxor_assign(left, right)
+    }
+}
+
+/// Caller-owned storage for one Boolar storage lane.
+///
+/// The namespace routing is intentionally kept here rather than in
+/// [`ContextWithStorage`]: an implementation can therefore use the same
+/// storage value for several Volar storage namespaces. `address_bits` is the
+/// declared width of the lane's LSB-first Boolean address.
+pub struct StorageBank<'a, S: ?Sized> {
     /// Storage namespace selected by the Boolar statement.
     pub storage: StorageId,
     /// Type-disambiguating one-bit storage lane.
     pub lane: LaneId,
-    /// The current wire for each cell, in little-endian address order.
-    pub cells: &'a mut [W],
+    /// The declared width of this lane's symbolic address.
+    pub address_bits: usize,
+    /// The external storage value used for this lane.
+    pub value: &'a mut S,
 }
 
 /// The dense storage allocation required for one Boolar storage lane.
@@ -97,20 +212,14 @@ pub enum ExecuteError<E> {
     DuplicateStorageBank { storage: StorageId, lane: LaneId },
     /// A circuit storage access had no corresponding caller bank.
     MissingStorageBank { storage: StorageId, lane: LaneId },
-    /// A caller bank was empty or was not a power of two in length.
-    InvalidStorageBankSize {
-        storage: StorageId,
-        lane: LaneId,
-        cells: usize,
-    },
     /// The address is too wide to describe a platform `usize` cell count.
     AddressWidthOverflow { bits: usize },
-    /// A storage bank's capacity does not match the statement address width.
+    /// A storage bank's declared address width does not match a statement.
     StorageAddressWidth {
         storage: StorageId,
         lane: LaneId,
         address_bits: usize,
-        cells: usize,
+        declared_address_bits: usize,
     },
     /// The circuit's storage accesses and static initialization cannot share
     /// one dense layout.
@@ -125,6 +234,94 @@ pub enum ExecuteError<E> {
 struct Value<W> {
     wire: W,
     known: Option<bool>,
+}
+
+impl<C> ContextWithStorage<bool> for MuxTreeContext<C>
+where
+    C: BoolarContext,
+    Wire<C>: Clone,
+{
+    type Storage = [Wire<C>];
+
+    fn storage_read(
+        &mut self,
+        cells: &mut Self::Storage,
+        address: &[StorageAddressBit<Wire<C>>],
+    ) -> Result<Wire<C>, Self::Error> {
+        if let Some(index) = known_storage_address(address) {
+            if let Some(value) = cells.get(index) {
+                return Ok(value.clone());
+            }
+        }
+        let address: Vec<_> = address
+            .iter()
+            .cloned()
+            .map(|bit| Value {
+                wire: bit.wire,
+                known: bit.known,
+            })
+            .collect();
+        let facts = alloc::vec![None; cells.len()];
+        read_mux_storage(self, cells, &facts, &address)
+            .map(|value| value.wire)
+            .map_err(|error| match error {
+                ExecuteError::Context(error) => error,
+                _ => unreachable!("the MUX tree only reports context errors"),
+            })
+    }
+
+    fn storage_write(
+        &mut self,
+        cells: &mut Self::Storage,
+        address: &[StorageAddressBit<Wire<C>>],
+        value: Wire<C>,
+    ) -> Result<(), Self::Error> {
+        if let Some(index) = known_storage_address(address) {
+            if let Some(cell) = cells.get_mut(index) {
+                *cell = value;
+                return Ok(());
+            }
+        }
+        let address: Vec<_> = address
+            .iter()
+            .cloned()
+            .map(|bit| Value {
+                wire: bit.wire,
+                known: bit.known,
+            })
+            .collect();
+        let mut facts = alloc::vec![None; cells.len()];
+        let mut canonical_one = None;
+        write_mux_storage(
+            self,
+            cells,
+            &mut facts,
+            Value {
+                wire: value,
+                known: None,
+            },
+            &address,
+            &mut canonical_one,
+        )
+        .map_err(|error| match error {
+            ExecuteError::Context(error) => error,
+            _ => unreachable!("the MUX tree only reports context errors"),
+        })
+    }
+}
+
+fn known_storage_address<W>(address: &[StorageAddressBit<W>]) -> Option<usize> {
+    let mut index = 0usize;
+    for (bit, value) in address.iter().enumerate() {
+        let value = value.known?;
+        if value {
+            if bit >= usize::BITS as usize {
+                return None;
+            }
+            index |= 1usize << bit;
+        }
+    }
+    Some(index)
 }
 
 /// Derive the dense storage banks needed by `circuit`.
@@ -244,10 +441,10 @@ pub fn storage_requirements<P: Clone>(
 pub fn initialize_storage<C, P>(
     context: &mut C,
     circuit: &BCircuit<P>,
-    banks: &mut [StorageBank<'_, Wire<C>>],
+    banks: &mut [StorageBank<'_, C::Storage>],
 ) -> Result<(), ExecuteError<C::Error>>
 where
-    C: BoolarContext,
+    C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
     Wire<C>: Clone,
 {
@@ -262,8 +459,11 @@ where
             })
         })?;
         for (offset, bit) in segment.data.iter().copied().enumerate() {
-            banks[bank].cells[start + offset] =
-                context.create(bit).map_err(ExecuteError::Context)?;
+            let address = constant_address(context, start + offset, banks[bank].address_bits)?;
+            let value = context.create(bit).map_err(ExecuteError::Context)?;
+            context
+                .storage_write(banks[bank].value, &address, value)
+                .map_err(ExecuteError::Context)?;
         }
     }
     Ok(())
@@ -281,10 +481,10 @@ pub fn execute<C, P>(
     context: &mut C,
     circuit: &BCircuit<P>,
     inputs: &[Wire<C>],
-    banks: &mut [StorageBank<'_, Wire<C>>],
+    banks: &mut [StorageBank<'_, C::Storage>],
 ) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
 where
-    C: BoolarContext,
+    C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
     Wire<C>: Clone,
 {
@@ -294,8 +494,8 @@ where
             found: inputs.len(),
         });
     }
-    let bank_facts = initialize_with_facts(context, circuit, banks)?;
-    execute_impl(context, circuit, inputs, banks, bank_facts)
+    initialize_storage(context, circuit, banks)?;
+    execute_impl(context, circuit, inputs, banks)
 }
 
 /// Execute a circuit against already-initialized storage.
@@ -307,30 +507,25 @@ pub fn execute_initialized<C, P>(
     context: &mut C,
     circuit: &BCircuit<P>,
     inputs: &[Wire<C>],
-    banks: &mut [StorageBank<'_, Wire<C>>],
+    banks: &mut [StorageBank<'_, C::Storage>],
 ) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
 where
-    C: BoolarContext,
+    C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
     Wire<C>: Clone,
 {
     validate_circuit_storage::<C, P>(circuit, banks)?;
-    let bank_facts = banks
-        .iter()
-        .map(|bank| alloc::vec![None; bank.cells.len()])
-        .collect();
-    execute_impl(context, circuit, inputs, banks, bank_facts)
+    execute_impl(context, circuit, inputs, banks)
 }
 
 fn execute_impl<C, P>(
     context: &mut C,
     circuit: &BCircuit<P>,
     inputs: &[Wire<C>],
-    banks: &mut [StorageBank<'_, Wire<C>>],
-    mut bank_facts: Vec<Vec<Option<bool>>>,
+    banks: &mut [StorageBank<'_, C::Storage>],
 ) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
 where
-    C: BoolarContext,
+    C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
     Wire<C>: Clone,
 {
@@ -390,8 +585,14 @@ where
                         storage: *storage,
                         lane: *lane,
                     })?;
-                validate_address_width(*storage, *lane, address.len(), banks[bank].cells.len())?;
-                read_storage(context, &banks[bank].cells, &bank_facts[bank], &address)?
+                validate_address_width(*storage, *lane, address.len(), banks[bank].address_bits)?;
+                let address = storage_address(&address);
+                Value {
+                    wire: context
+                        .storage_read(banks[bank].value, &address)
+                        .map_err(ExecuteError::Context)?,
+                    known: None,
+                }
             }
             BIrStmt::StorageWrite {
                 storage,
@@ -406,15 +607,11 @@ where
                         storage: *storage,
                         lane: *lane,
                     })?;
-                validate_address_width(*storage, *lane, address.len(), banks[bank].cells.len())?;
-                write_storage(
-                    context,
-                    &mut banks[bank].cells,
-                    &mut bank_facts[bank],
-                    source,
-                    &address,
-                    &mut canonical_one,
-                )?;
+                validate_address_width(*storage, *lane, address.len(), banks[bank].address_bits)?;
+                let address = storage_address(&address);
+                context
+                    .storage_write(banks[bank].value, &address, source.wire)
+                    .map_err(ExecuteError::Context)?;
                 Value {
                     wire: context.create(false).map_err(ExecuteError::Context)?,
                     known: Some(false),
@@ -437,45 +634,12 @@ where
         .collect()
 }
 
-fn initialize_with_facts<C, P>(
-    context: &mut C,
-    circuit: &BCircuit<P>,
-    banks: &mut [StorageBank<'_, Wire<C>>],
-) -> Result<Vec<Vec<Option<bool>>>, ExecuteError<C::Error>>
-where
-    C: BoolarContext,
-    P: Clone,
-    Wire<C>: Clone,
-{
-    validate_circuit_storage::<C, P>(circuit, banks)?;
-    let mut facts: Vec<Vec<Option<bool>>> = banks
-        .iter()
-        .map(|bank| alloc::vec![None; bank.cells.len()])
-        .collect();
-    for segment in &circuit.pre_init {
-        let bank = find_bank(banks, segment.storage, segment.lane)
-            .expect("validated pre-init storage bank");
-        let start = usize::try_from(segment.offset).map_err(|_| {
-            ExecuteError::StorageLayout(StorageLayoutError::PreInitOffsetOverflow {
-                storage: segment.storage,
-                lane: segment.lane,
-            })
-        })?;
-        for (offset, bit) in segment.data.iter().copied().enumerate() {
-            banks[bank].cells[start + offset] =
-                context.create(bit).map_err(ExecuteError::Context)?;
-            facts[bank][start + offset] = Some(bit);
-        }
-    }
-    Ok(facts)
-}
-
 fn validate_circuit_storage<C, P>(
     circuit: &BCircuit<P>,
-    banks: &[StorageBank<'_, Wire<C>>],
+    banks: &[StorageBank<'_, C::Storage>],
 ) -> Result<(), ExecuteError<C::Error>>
 where
-    C: BoolarContext,
+    C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
 {
     validate_banks(banks)?;
@@ -490,27 +654,22 @@ where
             requirement.storage,
             requirement.lane,
             requirement.address_bits,
-            banks[bank].cells.len(),
+            banks[bank].address_bits,
         )?;
     }
     Ok(())
 }
 
 fn cells_for_address_bits(bits: usize) -> Result<usize, StorageLayoutError> {
+    let shift = u32::try_from(bits)
+        .map_err(|_| StorageLayoutError::AddressWidthOverflow { bits })?;
     1usize
-        .checked_shl(bits as u32)
+        .checked_shl(shift)
         .ok_or(StorageLayoutError::AddressWidthOverflow { bits })
 }
 
-fn validate_banks<W, E>(banks: &[StorageBank<'_, W>]) -> Result<(), ExecuteError<E>> {
+fn validate_banks<S: ?Sized, E>(banks: &[StorageBank<'_, S>]) -> Result<(), ExecuteError<E>> {
     for (index, bank) in banks.iter().enumerate() {
-        if bank.cells.is_empty() || !bank.cells.len().is_power_of_two() {
-            return Err(ExecuteError::InvalidStorageBankSize {
-                storage: bank.storage,
-                lane: bank.lane,
-                cells: bank.cells.len(),
-            });
-        }
         if banks[..index]
             .iter()
             .any(|prior| prior.storage == bank.storage && prior.lane == bank.lane)
@@ -546,7 +705,42 @@ fn address_values<W: Clone, E>(
         .collect()
 }
 
-fn find_bank<W>(banks: &[StorageBank<'_, W>], storage: StorageId, lane: LaneId) -> Option<usize> {
+fn storage_address<W: Clone>(address: &[Value<W>]) -> Vec<StorageAddressBit<W>> {
+    address
+        .iter()
+        .cloned()
+        .map(|bit| StorageAddressBit {
+            wire: bit.wire,
+            known: bit.known,
+        })
+        .collect()
+}
+
+fn constant_address<C>(
+    context: &mut C,
+    address: usize,
+    address_bits: usize,
+) -> Result<Vec<StorageAddressBit<Wire<C>>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext,
+    Wire<C>: Clone,
+{
+    (0..address_bits)
+        .map(|bit| {
+            let value = (address >> bit) & 1 != 0;
+            Ok(StorageAddressBit {
+                wire: context.create(value).map_err(ExecuteError::Context)?,
+                known: Some(value),
+            })
+        })
+        .collect()
+}
+
+fn find_bank<S: ?Sized>(
+    banks: &[StorageBank<'_, S>],
+    storage: StorageId,
+    lane: LaneId,
+) -> Option<usize> {
     banks
         .iter()
         .position(|bank| bank.storage == storage && bank.lane == lane)
@@ -556,17 +750,14 @@ fn validate_address_width<E>(
     storage: StorageId,
     lane: LaneId,
     address_bits: usize,
-    cells: usize,
+    declared_address_bits: usize,
 ) -> Result<(), ExecuteError<E>> {
-    let expected = 1usize
-        .checked_shl(address_bits as u32)
-        .ok_or(ExecuteError::AddressWidthOverflow { bits: address_bits })?;
-    if expected != cells {
+    if address_bits != declared_address_bits {
         return Err(ExecuteError::StorageAddressWidth {
             storage,
             lane,
             address_bits,
-            cells,
+            declared_address_bits,
         });
     }
     Ok(())
@@ -696,14 +887,36 @@ where
 }
 
 fn candidates<W>(address: &[Value<W>], cells: usize) -> (Vec<usize>, Vec<usize>) {
-    let unknown_bits = address
+    let unknown_bits: Vec<usize> = address
         .iter()
         .enumerate()
         .filter_map(|(bit, value)| value.known.is_none().then_some(bit))
         .collect();
+    if unknown_bits.is_empty() {
+        let mut index = 0usize;
+        for (bit, value) in address.iter().enumerate() {
+            if value.known == Some(true) {
+                if bit >= usize::BITS as usize {
+                    return (Vec::new(), unknown_bits);
+                }
+                index |= 1usize << bit;
+            }
+        }
+        return (
+            if index < cells {
+                alloc::vec![index]
+            } else {
+                Vec::new()
+            },
+            unknown_bits,
+        );
+    }
     let cells = (0..cells)
         .filter(|cell| {
             address.iter().enumerate().all(|(bit, value)| {
+                if bit >= usize::BITS as usize {
+                    return value.known != Some(true);
+                }
                 value
                     .known
                     .is_none_or(|expected| ((cell >> bit) & 1 != 0) == expected)
@@ -713,7 +926,7 @@ fn candidates<W>(address: &[Value<W>], cells: usize) -> (Vec<usize>, Vec<usize>)
     (cells, unknown_bits)
 }
 
-fn read_storage<C>(
+fn read_mux_storage<C>(
     context: &mut C,
     cells: &[Wire<C>],
     facts: &[Option<bool>],
@@ -750,7 +963,7 @@ where
         .expect("a power-of-two storage bank always has a candidate"))
 }
 
-fn write_storage<C>(
+fn write_mux_storage<C>(
     context: &mut C,
     cells: &mut [Wire<C>],
     facts: &mut [Option<bool>],
@@ -829,13 +1042,34 @@ mod tests {
             &WaffleImportConfig::default().with_memory_address_bits(5),
         );
         assert!(errors.is_empty(), "unexpected lowering errors: {errors:?}");
-        assert_eq!(target.module.pre_init.len(), 2, "code and data memories must be initialized");
-        assert_eq!(target.module.pre_init[0].data.len(), 32, "RISC code fits the five-bit RAM");
-        assert_eq!(target.module.pre_init[1].data.len(), 20, "data RAM includes the result word");
+        assert_eq!(
+            target.module.pre_init.len(),
+            2,
+            "code and data memories must be initialized"
+        );
+        assert_eq!(
+            target.module.pre_init[0].data.len(),
+            32,
+            "RISC code fits the five-bit RAM"
+        );
+        assert_eq!(
+            target.module.pre_init[1].data.len(),
+            20,
+            "data RAM includes the result word"
+        );
     }
 
     const STORAGE: StorageId = StorageId(7);
     const LANE: LaneId = LaneId(3);
+
+    fn mux_bank<'a, W>(cells: &'a mut [W], address_bits: usize) -> StorageBank<'a, [W]> {
+        StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits,
+            value: cells,
+        }
+    }
 
     fn circuit(params: u32, stmts: Vec<BIrStmt>, outputs: Vec<IRVarId>) -> BCircuit {
         BCircuit {
@@ -870,8 +1104,9 @@ mod tests {
                 IRVarId(7),
             ],
         );
+        let mut context = MuxTreeContext::new(());
         assert_eq!(
-            execute(&mut (), &circuit, &[true, false], &mut []).unwrap(),
+            execute(&mut context, &circuit, &[true, false], &mut []).unwrap(),
             vec![false, true, true, false, false, true]
         );
     }
@@ -897,13 +1132,10 @@ mod tests {
         );
         for address in 0..4 {
             let mut cells = [false; 4];
-            let mut banks = [StorageBank {
-                storage: STORAGE,
-                lane: LANE,
-                cells: &mut cells,
-            }];
+            let mut banks = [mux_bank(&mut cells, 2)];
+            let mut context = MuxTreeContext::new(());
             let outputs = execute(
-                &mut (),
+                &mut context,
                 &circuit,
                 &[true, address & 1 != 0, address & 2 != 0],
                 &mut banks,
@@ -942,13 +1174,10 @@ mod tests {
         );
 
         let mut cells = [false; 4];
-        let mut banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut cells,
-        }];
+        let mut banks = [mux_bank(&mut cells, 2)];
+        let mut context = MuxTreeContext::new(());
         assert_eq!(
-            execute(&mut (), &circuit, &[false, true], &mut banks).unwrap(),
+            execute(&mut context, &circuit, &[false, true], &mut banks).unwrap(),
             vec![true]
         );
         assert_eq!(cells, [false, true, true, false]);
@@ -1009,18 +1238,15 @@ mod tests {
             data: vec![false, false],
         }];
         let mut cells = [true; 2];
-        let mut banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut cells,
-        }];
-        initialize_storage(&mut (), &circuit, &mut banks).unwrap();
+        let mut banks = [mux_bank(&mut cells, 1)];
+        let mut context = MuxTreeContext::new(());
+        initialize_storage(&mut context, &circuit, &mut banks).unwrap();
         assert_eq!(
-            execute_initialized(&mut (), &circuit, &[true, true], &mut banks).unwrap(),
+            execute_initialized(&mut context, &circuit, &[true, true], &mut banks).unwrap(),
             vec![true]
         );
         assert_eq!(
-            execute_initialized(&mut (), &circuit, &[false, false], &mut banks).unwrap(),
+            execute_initialized(&mut context, &circuit, &[false, false], &mut banks).unwrap(),
             vec![false]
         );
         assert_eq!(cells, [false, true]);
@@ -1053,18 +1279,10 @@ mod tests {
         );
         let mut pruned_cells = [false; 8];
         let mut full_cells = [false; 8];
-        let mut pruned_banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut pruned_cells,
-        }];
-        let mut full_banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut full_cells,
-        }];
-        let mut pruned_context = CountingContext::default();
-        let mut full_context = CountingContext::default();
+        let mut pruned_banks = [mux_bank(&mut pruned_cells, 3)];
+        let mut full_banks = [mux_bank(&mut full_cells, 3)];
+        let mut pruned_context = MuxTreeContext::new(CountingContext::default());
+        let mut full_context = MuxTreeContext::new(CountingContext::default());
         execute(&mut pruned_context, &pruned, &[false], &mut pruned_banks).unwrap();
         execute(
             &mut full_context,
@@ -1073,10 +1291,10 @@ mod tests {
             &mut full_banks,
         )
         .unwrap();
-        assert_eq!(pruned_context.ands, 2);
-        assert_eq!(pruned_context.xors, 2);
-        assert_eq!(full_context.ands, 7);
-        assert_eq!(full_context.xors, 14);
+        assert_eq!(pruned_context.inner().ands, 2);
+        assert_eq!(pruned_context.inner().xors, 2);
+        assert_eq!(full_context.inner().ands, 7);
+        assert_eq!(full_context.inner().xors, 14);
     }
 
     #[test]
@@ -1106,18 +1324,10 @@ mod tests {
         );
         let mut pruned_cells = [false; 4];
         let mut full_cells = [false; 4];
-        let mut pruned_banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut pruned_cells,
-        }];
-        let mut full_banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut full_cells,
-        }];
-        let mut pruned_context = CountingContext::default();
-        let mut full_context = CountingContext::default();
+        let mut pruned_banks = [mux_bank(&mut pruned_cells, 2)];
+        let mut full_banks = [mux_bank(&mut full_cells, 2)];
+        let mut pruned_context = MuxTreeContext::new(CountingContext::default());
+        let mut full_context = MuxTreeContext::new(CountingContext::default());
         execute(
             &mut pruned_context,
             &pruned,
@@ -1133,10 +1343,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pruned_cells, [false, false, true, false]);
-        assert_eq!(pruned_context.ands, 4);
-        assert_eq!(pruned_context.xors, 5);
-        assert_eq!(full_context.ands, 10);
-        assert_eq!(full_context.xors, 10);
+        assert_eq!(pruned_context.inner().ands, 4);
+        assert_eq!(pruned_context.inner().xors, 5);
+        assert_eq!(full_context.inner().ands, 10);
+        assert_eq!(full_context.inner().xors, 10);
     }
 
     #[test]
@@ -1149,11 +1359,11 @@ mod tests {
             ],
             vec![IRVarId(3)],
         );
-        let mut recorder = Recorder::new();
+        let mut recorder = MuxTreeContext::new(Recorder::new());
         let left = recorder.create(false).unwrap();
         let right = recorder.create(false).unwrap();
         let outputs = execute(&mut recorder, &circuit, &[left, right], &mut []).unwrap();
-        let program = recorder.finish(vec![left, right], outputs);
+        let program = recorder.into_inner().finish(vec![left, right], outputs);
         assert_eq!(interpret(&program, &[true, false]), vec![false]);
         assert_eq!(interpret(&program, &[true, true]), vec![true]);
     }
@@ -1169,26 +1379,23 @@ mod tests {
             }],
             vec![IRVarId(0)],
         );
+        let mut context = MuxTreeContext::new(());
         assert_eq!(
-            execute(&mut (), &circuit, &[], &mut []).unwrap_err(),
+            execute(&mut context, &circuit, &[], &mut []).unwrap_err(),
             ExecuteError::MissingStorageBank {
                 storage: STORAGE,
                 lane: LANE
             }
         );
         let mut cells = [false; 2];
-        let mut banks = [StorageBank {
-            storage: STORAGE,
-            lane: LANE,
-            cells: &mut cells,
-        }];
+        let mut banks = [mux_bank(&mut cells, 1)];
         assert_eq!(
-            execute(&mut (), &circuit, &[], &mut banks).unwrap_err(),
+            execute(&mut context, &circuit, &[], &mut banks).unwrap_err(),
             ExecuteError::StorageAddressWidth {
                 storage: STORAGE,
                 lane: LANE,
                 address_bits: 0,
-                cells: 2,
+                declared_address_bits: 1,
             }
         );
     }
@@ -1248,5 +1455,89 @@ mod tests {
             *left = self.bitxor(*left, right)?;
             Ok(())
         }
+    }
+
+    struct DirectStorage {
+        cells: [bool; 4],
+        reads: usize,
+        writes: usize,
+    }
+
+    impl ContextWithStorage<bool> for CountingContext {
+        type Storage = DirectStorage;
+
+        fn storage_read(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+        ) -> Result<bool, Self::Error> {
+            storage.reads += 1;
+            let index = address
+                .iter()
+                .enumerate()
+                .fold(0usize, |index, (bit, value)| {
+                    index | ((value.wire as usize) << bit)
+                });
+            Ok(storage.cells[index])
+        }
+
+        fn storage_write(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+            value: bool,
+        ) -> Result<(), Self::Error> {
+            storage.writes += 1;
+            let index = address
+                .iter()
+                .enumerate()
+                .fold(0usize, |index, (bit, value)| {
+                    index | ((value.wire as usize) << bit)
+                });
+            storage.cells[index] = value;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delegates_storage_to_a_direct_context() {
+        let circuit = circuit(
+            3,
+            vec![
+                BIrStmt::StorageWrite {
+                    storage: STORAGE,
+                    lane: LANE,
+                    src: IRVarId(0),
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+                BIrStmt::StorageRead {
+                    storage: STORAGE,
+                    lane: LANE,
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+            ],
+            vec![IRVarId(4)],
+        );
+        let mut storage = DirectStorage {
+            cells: [false; 4],
+            reads: 0,
+            writes: 0,
+        };
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 2,
+            value: &mut storage,
+        }];
+        let outputs = execute(
+            &mut CountingContext::default(),
+            &circuit,
+            &[true, true, false],
+            &mut banks,
+        )
+        .unwrap();
+        assert_eq!(outputs, [true]);
+        assert_eq!(storage.cells, [false, true, false, false]);
+        assert_eq!((storage.reads, storage.writes), (1, 1));
     }
 }

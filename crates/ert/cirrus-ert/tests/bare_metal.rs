@@ -13,6 +13,7 @@ use std::{
 
 use cirrus_ert::{DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
+use cirrus_volar_boolar::MuxTreeContext;
 
 const TARGET: &str = "riscv32im-unknown-none-elf";
 const BASE: u32 = 0x8000_0000;
@@ -231,19 +232,21 @@ fn run_host_image(image: &Path) {
     let mut constants = [None; 32];
     let mut rstack = [0; 256];
     let mut vstack = [false; 65_536];
+    let storage_bits = vstack.len();
     let args = INPUT.map(|value| (word(value), None));
     let before = resource_usage(libc::RUSAGE_SELF);
     let started = Instant::now();
-    let result = ert_func::<_, _, 16, 2>(
+    let result = ert_func::<_, _, 16, 2, _>(
         &mut RvDefaultHandler {
             inner: DefaultHandler {
-                context: (),
+                context: MuxTreeContext::new(()),
                 hash: no_hash,
             },
         },
+        &mut vstack,
+        storage_bits,
         memory,
         &mut rstack,
-        &mut vstack,
         entry,
         &mut registers,
         &mut constants,
@@ -279,7 +282,7 @@ fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut MuxTreeContext<()>, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 

@@ -3,8 +3,10 @@ extern crate std;
 use core::{array, convert::Infallible};
 
 use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError,
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithValue,
+    HasError,
 };
+use cirrus_volar_boolar::MuxTreeContext;
 
 use crate::{
     ArmDefaultHandler, DefaultHandler, ErtError, RawMemory, SecurityAttribute, SecurityState,
@@ -55,30 +57,39 @@ fn run_with<G, A>(
 ) -> Result<(), ErtError<Infallible>>
 where
     G: FnMut(
-        &mut DefaultHandler<(), fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>>,
+        &mut DefaultHandler<
+            MuxTreeContext<()>,
+            fn(&mut MuxTreeContext<()>, &[[bool; 32]]) -> Result<[u8; 32], Infallible>,
+        >,
         SecurityState,
     ) -> bool,
     A: FnMut(
-        &mut DefaultHandler<(), fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>>,
+        &mut DefaultHandler<
+            MuxTreeContext<()>,
+            fn(&mut MuxTreeContext<()>, &[[bool; 32]]) -> Result<[u8; 32], Infallible>,
+        >,
         u32,
     ) -> SecurityAttribute,
 {
     let image = image(code);
     let mut handler = ArmDefaultHandler {
         inner: DefaultHandler {
-            context: (),
-            hash: no_hash as fn(&mut (), &[[bool; 32]]) -> Result<[u8; 32], Infallible>,
+            context: MuxTreeContext::new(()),
+            hash: no_hash
+                as fn(&mut MuxTreeContext<()>, &[[bool; 32]]) -> Result<[u8; 32], Infallible>,
         },
         svc_permitted,
         security_attribute,
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
     ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(&image[..]),
         &mut rstack,
-        &mut vstack,
         1,
         regs,
         constants,
@@ -95,7 +106,7 @@ fn run(
     let image = image(code);
     let mut handler = ArmDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
         svc_permitted: permit_all,
@@ -103,11 +114,13 @@ fn run(
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
     ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(&image[..]),
         &mut rstack,
-        &mut vstack,
         1,
         regs,
         constants,
@@ -134,6 +147,12 @@ impl HasError for CountingContext {
 
 impl ContextWithValue<bool> for CountingContext {
     type Wrapped = bool;
+}
+
+impl ContextWithCreate<bool> for CountingContext {
+    fn create(&mut self, value: bool) -> Result<bool, Self::Error> {
+        Ok(value)
+    }
 }
 
 impl ContextWithBitAnd<bool> for CountingContext {
@@ -183,7 +202,7 @@ fn run_counting(
     let image = image(code);
     let mut handler = ArmDefaultHandler {
         inner: DefaultHandler {
-            context: CountingContext::default(),
+            context: MuxTreeContext::new(CountingContext::default()),
             hash: no_hash,
         },
         svc_permitted: permit_all,
@@ -191,12 +210,14 @@ fn run_counting(
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
     assert!(
         ert_emit(
             &mut handler,
+            &mut vstack,
+            storage_bits,
             RawMemory::from(&image[..]),
             &mut rstack,
-            &mut vstack,
             1,
             regs,
             constants,
@@ -205,7 +226,7 @@ fn run_counting(
         )
         .is_ok()
     );
-    handler.inner.context
+    handler.inner.context.into_inner()
 }
 
 #[test]
@@ -320,7 +341,13 @@ fn secure_gateway_re_enters_secure_state_and_permits_a_gated_svc() {
     let mut constants = [None; 16];
     let no_gateway = [0x2004, 0x4704, 0x2000, 0x3801, 0xdf00];
     assert!(matches!(
-        run_with(&no_gateway, &mut regs, &mut constants, secure_only, all_non_secure),
+        run_with(
+            &no_gateway,
+            &mut regs,
+            &mut constants,
+            secure_only,
+            all_non_secure
+        ),
         Err(ErtError::Unexpected)
     ));
 
@@ -427,7 +454,7 @@ fn non_thumb_entry_and_invalid_encoding_are_rejected() {
     let bytes = [0u8; 2];
     let mut handler = ArmDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
         svc_permitted: permit_all,
@@ -435,12 +462,14 @@ fn non_thumb_entry_and_invalid_encoding_are_rejected() {
     };
     let mut rstack = [0; 2];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
     assert!(matches!(
         ert_emit(
             &mut handler,
+            &mut vstack,
+            storage_bits,
             RawMemory::from(&bytes[..]),
             &mut rstack,
-            &mut vstack,
             0,
             &mut regs,
             &mut constants,
@@ -465,7 +494,7 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let mut constants = [None; 16];
     let mut handler = ArmDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
         svc_permitted: permit_all,
@@ -473,13 +502,15 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     };
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
 
     assert!(
         ert_emit(
             &mut handler,
+            &mut vstack,
+            storage_bits,
             memory,
             &mut rstack,
-            &mut vstack,
             1,
             &mut regs,
             &mut constants,

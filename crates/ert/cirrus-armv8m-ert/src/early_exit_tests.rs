@@ -1,8 +1,11 @@
 extern crate std;
 
-use core::{array, convert::Infallible};
+use core::convert::Infallible;
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage, ContextWithValue,
+    HasError, StorageAddressBit,
+};
 use cirrus_ert_core::{EarlyExitLoopOptions, EcallOutcome, Handler};
 use std::vec::Vec;
 
@@ -70,7 +73,10 @@ fn add_sp_imm(words: u8) -> u16 {
 /// out of the subtraction).
 fn cbz_cbnz(nonzero: bool, register: u8, pc: u32, target: u32) -> u16 {
     let imm = target.wrapping_sub(pc).wrapping_sub(4);
-    assert!(imm % 2 == 0 && imm <= 126, "CBZ/CBNZ immediate out of range");
+    assert!(
+        imm % 2 == 0 && imm <= 126,
+        "CBZ/CBNZ immediate out of range"
+    );
     let bit6 = ((imm >> 6) & 1) as u16;
     let bits51 = ((imm >> 1) & 31) as u16;
     0xb100 | ((nonzero as u16) << 11) | (bit6 << 9) | (bits51 << 3) | register as u16
@@ -148,6 +154,40 @@ impl ContextWithBitXor<bool> for TestHandler {
     }
     fn bitxor_assign(&mut self, a: &mut bool, b: bool) -> Result<(), Infallible> {
         *a ^= b;
+        Ok(())
+    }
+}
+
+impl ContextWithStorage<bool> for TestHandler {
+    type Storage = [bool];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+    ) -> Result<bool, Infallible> {
+        let index = address
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, address)| {
+                index | ((address.wire as usize) << bit)
+            });
+        Ok(storage[index])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+        value: bool,
+    ) -> Result<(), Infallible> {
+        let index = address
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, address)| {
+                index | ((address.wire as usize) << bit)
+            });
+        storage[index] = value;
         Ok(())
     }
 }
@@ -265,12 +305,14 @@ fn run_memcmp(a: &[u8], b: &[u8], enabled: bool) -> Result<u32, ErtError<Infalli
     let mut rstack = [0u32; 8];
     let mut vstack = [false; 4096];
     let mut handler = TestHandler { enabled };
+    let storage_bits = vstack.len();
 
     ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(mem.as_slice()),
         &mut rstack,
-        &mut vstack,
         1,
         &mut regs,
         &mut constants,

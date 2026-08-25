@@ -1,9 +1,29 @@
-use core::{array, error::Error, ops::Range};
+use core::{array, error::Error, mem::MaybeUninit, ops::Range};
 
 pub(crate) use cirrus_ert_core::add_bits;
 use rv_asm::{Imm, Inst, Reg, Xlen};
 
-use crate::{ErtError, RawMemory, RvHandler, handlers};
+use crate::{EcallOutcome, ErtError, RawMemory, handlers};
+
+/// Object-safe bridge which keeps the machine monomorphic while its caller
+/// supplies arbitrary `ContextWithStorage` implementations.
+pub(crate) trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, Self::Error>;
+
+    fn storage_read_bit(&mut self, bit: usize) -> Result<W, Self::Error>;
+
+    fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;
+
+    #[cfg(feature = "early-exit-loops")]
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions;
+}
 
 pub(crate) const ABI_REGS: [Reg; 8] = [
     Reg::A0,
@@ -17,10 +37,10 @@ pub(crate) const ABI_REGS: [Reg; 8] = [
 ];
 
 pub(crate) struct Machine<'a, W, E> {
-    pub(crate) t: &'a mut (dyn RvHandler<bool, Wrapped = W, Error = E> + 'a),
+    pub(crate) t: &'a mut (dyn Runtime<W, Error = E> + 'a),
     pub(crate) mem: RawMemory<'a>,
     pub(crate) rstack: &'a mut [u32],
-    pub(crate) vstack: &'a mut [W],
+    pub(crate) storage_bits: usize,
     pub(crate) pc: u32,
     pub(crate) regs: &'a mut [[W; 32]; 32],
     pub(crate) reg_consts: &'a mut [Option<u32>; 32],
@@ -42,10 +62,10 @@ pub(crate) enum LoadAddress {
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        t: &'a mut (dyn RvHandler<bool, Wrapped = W, Error = E> + 'a),
+        t: &'a mut (dyn Runtime<W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
-        vstack: &'a mut [W],
+        storage_bits: usize,
         pc: u32,
         regs: &'a mut [[W; 32]; 32],
         reg_consts: &'a mut [Option<u32>; 32],
@@ -57,7 +77,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             t,
             mem,
             rstack,
-            vstack,
+            storage_bits,
             pc,
             regs,
             reg_consts,
@@ -147,10 +167,26 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             .checked_mul(8)
             .ok_or(ErtError::Unexpected)?;
         let end = start.checked_add(width).ok_or(ErtError::Unexpected)?;
-        if end > self.vstack.len() {
+        if end > self.storage_bits {
             return Err(ErtError::Unexpected);
         }
         Ok(start..end)
+    }
+
+    pub(crate) fn read_stack_bit(&mut self, bit: usize) -> Result<W, ErtError<E>> {
+        if bit >= self.storage_bits {
+            return Err(ErtError::Unexpected);
+        }
+        self.t.storage_read_bit(bit).map_err(ErtError::Emitted)
+    }
+
+    pub(crate) fn write_stack_bit(&mut self, bit: usize, value: W) -> Result<(), ErtError<E>> {
+        if bit >= self.storage_bits {
+            return Err(ErtError::Unexpected);
+        }
+        self.t
+            .storage_write_bit(bit, value)
+            .map_err(ErtError::Emitted)
     }
 
     pub(crate) fn load_address(&self, base: Reg, offset: Imm) -> Result<LoadAddress, ErtError<E>> {
@@ -166,13 +202,14 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 }
 
-pub(crate) fn write_abi_args<W, const N: usize>(
+pub(crate) fn write_abi_args<W, E: Error, const N: usize>(
+    t: &mut (dyn Runtime<W, Error = E> + '_),
     regs: &mut [[W; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
-    vstack: &mut [W],
+    storage_bits: usize,
     sp: u32,
     args: [([W; 32], Option<u32>); N],
-) {
+) -> Result<(), E> {
     for (i, (value, constant)) in args.into_iter().enumerate() {
         match ABI_REGS.get(i).copied() {
             Some(register) => {
@@ -181,30 +218,42 @@ pub(crate) fn write_abi_args<W, const N: usize>(
             }
             None => {
                 let stack_start = sp as usize * 8 + 32 * (i - ABI_REGS.len());
-                let stack_slot = &mut vstack[stack_start..stack_start + 32];
+                debug_assert!(stack_start + 32 <= storage_bits);
                 for (bit, value) in value.into_iter().enumerate() {
-                    stack_slot[bit] = value;
+                    t.storage_write_bit(stack_start + bit, value)?;
                 }
             }
         }
     }
+    Ok(())
 }
 
-pub(crate) fn read_abi_results<W: Clone, const M: usize>(
+pub(crate) fn read_abi_results<W: Clone, E: Error, const M: usize>(
+    t: &mut (dyn Runtime<W, Error = E> + '_),
     regs: &[[W; 32]; 32],
     reg_consts: &[Option<u32>; 32],
-    vstack: &[W],
+    storage_bits: usize,
     sp: u32,
-) -> [([W; 32], Option<u32>); M] {
-    array::from_fn(|i| match ABI_REGS.get(i).copied() {
-        Some(register) => (
-            regs[register.0 as usize].clone(),
-            reg_consts[register.0 as usize],
-        ),
-        None => {
-            let stack_start = sp as usize * 8 + 32 * (i - ABI_REGS.len());
-            let stack_slot = &vstack[stack_start..stack_start + 32];
-            (array::from_fn(|bit| stack_slot[bit].clone()), None)
-        }
-    })
+) -> Result<[([W; 32], Option<u32>); M], E> {
+    let mut results: [MaybeUninit<([W; 32], Option<u32>)>; M] =
+        [const { MaybeUninit::uninit() }; M];
+    for (i, result) in results.iter_mut().enumerate() {
+        result.write(match ABI_REGS.get(i).copied() {
+            Some(register) => (
+                regs[register.0 as usize].clone(),
+                reg_consts[register.0 as usize],
+            ),
+            None => {
+                let stack_start = sp as usize * 8 + 32 * (i - ABI_REGS.len());
+                debug_assert!(stack_start + 32 <= storage_bits);
+                let mut word: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
+                for (bit, slot) in word.iter_mut().enumerate() {
+                    slot.write(t.storage_read_bit(stack_start + bit)?);
+                }
+                let word = word.map(|bit| unsafe { bit.assume_init() });
+                (word, None)
+            }
+        });
+    }
+    Ok(results.map(|result| unsafe { result.assume_init() }))
 }

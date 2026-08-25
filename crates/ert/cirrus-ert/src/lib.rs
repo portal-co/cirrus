@@ -9,12 +9,13 @@
 //! symbolic values are emitted through [`ContextWithRvOps`].
 //!
 //! The interpreter reads its little-endian RV32 instruction image through
-//! [`RawMemory`], a symbolic stack in `vstack` (one Boolean wire per bit), and a
-//! concrete return stack in `rstack`. `vstack` is byte-addressed by the guest
-//! stack pointer: [`ert_emit`] starts `sp` at its end, while [`ert_func`]
-//! reserves caller stack slots for arguments or results beyond `a7`. `zero` and
-//! `one` are the caller's symbolic Boolean constants. The hash callback
-//! implements the supported hash environment call.
+//! [`RawMemory`], caller-owned symbolic storage (one Boolean element per bit),
+//! and a concrete return stack in `rstack`. The caller passes both the storage
+//! value and its bit capacity. It is byte-addressed by the guest stack pointer:
+//! [`ert_emit`] starts `sp` at its end, while [`ert_func`] reserves caller stack
+//! slots for arguments or results beyond `a7`. `zero` and `one` are the
+//! caller's symbolic Boolean constants. The hash callback implements the
+//! supported hash environment call.
 //!
 //! [`RawMemory::from_slice`] maps guest address zero to a borrowed host buffer
 //! and safely bounds every access. The unsafe [`RawMemory::new`] constructor is
@@ -46,10 +47,15 @@ use core::{array, error::Error};
 #[cfg(feature = "prepared-recording")]
 use core::convert::Infallible;
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage, ContextWithValue,
+    HasError, StorageAddressBit,
+};
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 #[cfg(feature = "prepared-recording")]
 use cirrus_recompile_core::{Idx, PreparedRecorder};
+#[cfg(feature = "prepared-recording")]
+use cirrus_volar_boolar::MuxTreeContext;
 use rv_asm::{DecodeError, Reg};
 
 #[cfg(feature = "early-exit-loops")]
@@ -66,12 +72,18 @@ mod early_exit_tests;
 #[cfg(feature = "early-exit-loops")]
 pub use cirrus_ert_core::EarlyExitLoopOptions;
 
-use machine::{Machine, add_bits, read_abi_results, write_abi_args};
+use machine::{Machine, Runtime, add_bits, read_abi_results, write_abi_args};
 
 /// The Boolean operations required to execute the supported RISC-V subset.
-pub trait ContextWithRvOps<Val>: cirrus_ert_core::ContextWithErtOps<Val> {}
+pub trait ContextWithRvOps<Val>:
+    cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val>
+{
+}
 
-impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val>> ContextWithRvOps<Val> for T {}
+impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val>>
+    ContextWithRvOps<Val> for T
+{
+}
 
 /// An error while decoding or symbolically executing a program.
 pub enum ErtError<E> {
@@ -132,6 +144,30 @@ impl<C: ContextWithBitXor<bool>, F> ContextWithBitXor<bool> for DefaultHandler<C
     }
 }
 
+impl<C, F> ContextWithStorage<bool> for DefaultHandler<C, F>
+where
+    C: ContextWithStorage<bool>,
+{
+    type Storage = C::Storage;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<C::Wrapped>],
+    ) -> Result<C::Wrapped, C::Error> {
+        self.context.storage_read(storage, address)
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<C::Wrapped>],
+        value: C::Wrapped,
+    ) -> Result<(), C::Error> {
+        self.context.storage_write(storage, address, value)
+    }
+}
+
 impl<C, F, W: Clone, E: Error> Handler<bool> for DefaultHandler<C, F>
 where
     C: ContextWithRvOps<bool, Wrapped = W, Error = E>,
@@ -173,7 +209,7 @@ where
 /// additional requirements beyond [`Handler`] itself. Reserved so a future
 /// RV32 capability can be added here later without changing the shared
 /// [`Handler`] trait.
-pub trait RvHandler<Val>: Handler<Val> {}
+pub trait RvHandler<Val>: Handler<Val> + ContextWithStorage<Val> {}
 
 /// Tunnels any [`Handler`] through as an [`RvHandler`], with no added
 /// behavior today — the RV32 half of the extension pattern Arm's
@@ -218,6 +254,30 @@ impl<H: ContextWithBitXor<bool>> ContextWithBitXor<bool> for RvDefaultHandler<H>
     }
 }
 
+impl<H> ContextWithStorage<bool> for RvDefaultHandler<H>
+where
+    H: ContextWithStorage<bool>,
+{
+    type Storage = H::Storage;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<H::Wrapped>],
+    ) -> Result<H::Wrapped, H::Error> {
+        self.inner.storage_read(storage, address)
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<H::Wrapped>],
+        value: H::Wrapped,
+    ) -> Result<(), H::Error> {
+        self.inner.storage_write(storage, address, value)
+    }
+}
+
 impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
     fn ecall(
         &mut self,
@@ -235,24 +295,136 @@ impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
     }
 }
 
-impl<H: Handler<bool>> RvHandler<bool> for RvDefaultHandler<H> {}
+impl<T, Val> RvHandler<Val> for T where T: Handler<Val> + ContextWithStorage<Val> {}
 
 /// The RV32 handler shape used by [`ert_func_prepared`] and
 /// [`ert_emit_prepared`].
 ///
 /// After execution, consume `handler.inner.context` with
-/// [`PreparedRecorder::finish`] to obtain the prepared artifact.  The hash
-/// closure retains the ordinary ERT backend tunnel and receives the concrete
-/// recorder directly.
+/// [`MuxTreeContext::into_inner`] and then [`PreparedRecorder::finish`] to
+/// obtain the prepared artifact. Storage remains external and is lowered to
+/// the recorder's ordinary MUX/demux Boolean operations.
 #[cfg(feature = "prepared-recording")]
-pub type PreparedRvHandler<F> = RvDefaultHandler<DefaultHandler<PreparedRecorder, F>>;
+pub type PreparedRvHandler<F> =
+    RvDefaultHandler<DefaultHandler<MuxTreeContext<PreparedRecorder>, F>>;
+
+/// Couples an ERT handler with its caller-owned storage for one invocation.
+/// The machine sees this as an object-safe runtime, while every actual storage
+/// access is delegated to the handler's `ContextWithStorage<bool>` impl.
+struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
+    handler: &'a mut H,
+    storage: &'a mut H::Storage,
+    zero: H::Wrapped,
+    one: H::Wrapped,
+}
+
+impl<H: ContextWithStorage<bool> + ?Sized> HasError for StorageRuntime<'_, H> {
+    type Error = H::Error;
+}
+
+impl<H: ContextWithStorage<bool> + ?Sized> ContextWithValue<bool> for StorageRuntime<'_, H> {
+    type Wrapped = H::Wrapped;
+}
+
+impl<H> ContextWithBitAnd<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitAnd<bool> + ?Sized,
+{
+    fn bitand(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitand(a, b)
+    }
+
+    fn bitand_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitand_assign(a, b)
+    }
+}
+
+impl<H> ContextWithBitOr<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitOr<bool> + ?Sized,
+{
+    fn bitor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitor(a, b)
+    }
+
+    fn bitor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitor_assign(a, b)
+    }
+}
+
+impl<H> ContextWithBitXor<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitXor<bool> + ?Sized,
+{
+    fn bitxor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitxor(a, b)
+    }
+
+    fn bitxor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitxor_assign(a, b)
+    }
+}
+
+impl<H, W: Clone, E: Error> Runtime<W> for StorageRuntime<'_, H>
+where
+    H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, E> {
+        self.handler.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {
+        let address = self.storage_address(bit);
+        self.handler.storage_read(self.storage, &address)
+    }
+
+    fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), E> {
+        let address = self.storage_address(bit);
+        self.handler.storage_write(self.storage, &address, value)
+    }
+
+    #[cfg(feature = "early-exit-loops")]
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
+        self.handler.early_exit_loop_options()
+    }
+}
+
+impl<H> StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ?Sized,
+    H::Wrapped: Clone,
+{
+    fn storage_address(
+        &self,
+        value: usize,
+    ) -> [StorageAddressBit<H::Wrapped>; usize::BITS as usize] {
+        array::from_fn(|bit| {
+            let known = (value >> bit) & 1 != 0;
+            StorageAddressBit {
+                wire: if known {
+                    self.one.clone()
+                } else {
+                    self.zero.clone()
+                },
+                known: Some(known),
+            }
+        })
+    }
+}
 
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// The `zero` and `one` parameters are retained for compatibility with existing
 /// callers. The implementation only needs the context operations and `carry`.
 pub fn simple_add<W: Clone, E: Error>(
-    t: &mut (dyn ContextWithRvOps<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W, Error = E> + '_),
     v: &[W; 32],
     w: &[W; 32],
     carry: W,
@@ -265,27 +437,46 @@ pub fn simple_add<W: Clone, E: Error>(
 /// Invoke a symbolic RV32 function using the RISC-V argument and result ABI.
 ///
 /// The first eight arguments and results use `a0` through `a7`; further values
-/// are placed in or read from the symbolic stack. `args` carries both the
-/// symbolic word and, when known, its concrete value.
-pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn RvHandler<bool, Wrapped = W, Error = E> + '_),
+/// are placed in or read from caller-owned symbolic storage. `storage_bits` is
+/// the capacity of that storage in bits. `args` carries both the symbolic word
+/// and, when known, its concrete value.
+pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [W],
     pc: u32,
     regs: &mut [[W; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
     zero: W,
     one: W,
     args: [([W; 32], Option<u32>); N],
-) -> Result<[([W; 32], Option<u32>); M], ErtError<E>> {
-    let stack_pointer = abi_stack_pointer(vstack, N.max(M)).ok_or(ErtError::Unexpected)?;
-    write_abi_args(regs, reg_consts, vstack, stack_pointer, args);
+) -> Result<[([W; 32], Option<u32>); M], ErtError<E>>
+where
+    H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    let stack_pointer = abi_stack_pointer(storage_bits, N.max(M)).ok_or(ErtError::Unexpected)?;
+    let mut runtime = StorageRuntime {
+        handler: t,
+        storage,
+        zero: zero.clone(),
+        one: one.clone(),
+    };
+    write_abi_args(
+        &mut runtime,
+        regs,
+        reg_consts,
+        storage_bits,
+        stack_pointer,
+        args,
+    )
+    .map_err(ErtError::Emitted)?;
     Machine::new(
-        t,
+        &mut runtime,
         mem,
         rstack,
-        vstack,
+        storage_bits,
         pc,
         regs,
         reg_consts,
@@ -294,7 +485,8 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
         stack_pointer,
     )
     .run()?;
-    Ok(read_abi_results(regs, reg_consts, vstack, stack_pointer))
+    read_abi_results(&mut runtime, regs, reg_consts, storage_bits, stack_pointer)
+        .map_err(ErtError::Emitted)
 }
 
 /// Execute RV32 through an opt-in [`PreparedRecorder`].
@@ -306,9 +498,10 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn ert_func_prepared<F, const N: usize, const M: usize>(
     t: &mut PreparedRvHandler<F>,
+    storage: &mut [Idx],
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [Idx],
     pc: u32,
     regs: &mut [[Idx; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
@@ -317,36 +510,59 @@ pub fn ert_func_prepared<F, const N: usize, const M: usize>(
     args: [([Idx; 32], Option<u32>); N],
 ) -> Result<[([Idx; 32], Option<u32>); M], ErtError<Infallible>>
 where
-    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
 {
     ert_func(
-        t, mem, rstack, vstack, pc, regs, reg_consts, zero, one, args,
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+        args,
     )
 }
 
 /// Execute a symbolic RV32 instruction image until the supported exit `ECALL`.
 ///
-/// The interpreter resets `x0` and initializes `sp` to the byte length of
-/// `vstack`. It accepts only the subset described in the [crate
+/// The interpreter resets `x0` and initializes `sp` to the byte length of the
+/// supplied storage capacity. It accepts only the subset described in the [crate
 /// documentation](self); an exit is `ECALL` with concrete `a0 = 0xffff_ffff`,
 /// and a hash call is `ECALL` with concrete `a0 = 0`.
-pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn RvHandler<bool, Wrapped = W, Error = E> + '_),
+pub fn ert_emit<W: Clone, E: Error, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [W],
     pc: u32,
     regs: &mut [[W; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
     zero: W,
     one: W,
-) -> Result<(), ErtError<E>> {
-    let stack_pointer = u32::try_from(vstack.len() / 8).map_err(|_| ErtError::Unexpected)?;
+) -> Result<(), ErtError<E>>
+where
+    H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    if storage_bits % 8 != 0 {
+        return Err(ErtError::Unexpected);
+    }
+    let stack_pointer = u32::try_from(storage_bits / 8).map_err(|_| ErtError::Unexpected)?;
+    let mut runtime = StorageRuntime {
+        handler: t,
+        storage,
+        zero: zero.clone(),
+        one: one.clone(),
+    };
     Machine::new(
-        t,
+        &mut runtime,
         mem,
         rstack,
-        vstack,
+        storage_bits,
         pc,
         regs,
         reg_consts,
@@ -365,9 +581,10 @@ pub fn ert_emit<W: Clone, E: Error>(
 #[allow(clippy::too_many_arguments)]
 pub fn ert_emit_prepared<F>(
     t: &mut PreparedRvHandler<F>,
+    storage: &mut [Idx],
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [Idx],
     pc: u32,
     regs: &mut [[Idx; 32]; 32],
     reg_consts: &mut [Option<u32>; 32],
@@ -375,13 +592,25 @@ pub fn ert_emit_prepared<F>(
     one: Idx,
 ) -> Result<(), ErtError<Infallible>>
 where
-    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
 {
-    ert_emit(t, mem, rstack, vstack, pc, regs, reg_consts, zero, one)
+    ert_emit(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+    )
 }
 
-fn abi_stack_pointer<W>(vstack: &[W], values: usize) -> Option<u32> {
+fn abi_stack_pointer(storage_bits: usize, values: usize) -> Option<u32> {
+    (storage_bits % 8 == 0).then_some(())?;
     let extra_values = values.saturating_sub(machine::ABI_REGS.len());
-    let stack_bytes = u32::try_from(vstack.len() / 8).ok()?;
+    let stack_bytes = u32::try_from(storage_bits / 8).ok()?;
     stack_bytes.checked_sub(u32::try_from(extra_values.checked_mul(4)?).ok()?)
 }

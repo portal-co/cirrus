@@ -3,12 +3,16 @@ extern crate std;
 use core::{array, convert::Infallible};
 
 use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError,
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithValue,
+    HasError,
 };
+use cirrus_volar_boolar::MuxTreeContext;
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_emit, ert_func, simple_add};
+use crate::{
+    DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_emit, ert_func, simple_add,
+};
 
 fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1u32 << bit) != 0)
@@ -40,15 +44,17 @@ fn run(
 ) -> Result<(), ErtError<Infallible>> {
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
     };
+    let storage_bits = vstack.len();
     ert_emit(
         &mut handler,
+        vstack,
+        storage_bits,
         bounded_memory(mem),
         rstack,
-        vstack,
         0,
         regs,
         constants,
@@ -136,6 +142,12 @@ impl ContextWithValue<bool> for CountingContext {
     type Wrapped = bool;
 }
 
+impl ContextWithCreate<bool> for CountingContext {
+    fn create(&mut self, value: bool) -> Result<bool, Self::Error> {
+        Ok(value)
+    }
+}
+
 impl ContextWithBitAnd<bool> for CountingContext {
     fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Self::Error> {
         self.bitand += 1;
@@ -185,22 +197,24 @@ fn run_counting(
     let mut vstack = [false; 64];
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: CountingContext::default(),
+            context: MuxTreeContext::new(CountingContext::default()),
             hash: no_hash,
         },
     };
+    let storage_bits = vstack.len();
     assert_success(ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         bounded_memory(&mem),
         &mut rstack,
-        &mut vstack,
         0,
         regs,
         constants,
         false,
         true,
     ));
-    handler.inner.context
+    handler.inner.context.into_inner()
 }
 
 fn exit_register(regs: &mut [[bool; 32]; 32], constants: &mut [Option<u32>; 32]) {
@@ -1049,19 +1063,24 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
     let mut observed = [[false; 32]; 8];
-    let hash = |_: &mut (), words: &[[bool; 32]]| {
+    let hash = |_: &mut MuxTreeContext<()>, words: &[[bool; 32]]| {
         observed.copy_from_slice(words);
         Ok::<_, Infallible>(array::from_fn(|byte| byte as u8))
     };
     let mut handler = RvDefaultHandler {
-        inner: DefaultHandler { context: (), hash },
+        inner: DefaultHandler {
+            context: MuxTreeContext::new(()),
+            hash,
+        },
     };
 
+    let storage_bits = vstack.len();
     assert_success(ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         bounded_memory(&mem),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut constants,
@@ -1104,16 +1123,18 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let mut vstack = [false; 64];
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
     };
 
+    let storage_bits = vstack.len();
     assert_success(ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         memory,
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut constants,
@@ -1137,16 +1158,18 @@ fn ert_func_moves_register_and_stack_abi_values() {
     });
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
     };
 
-    let results = match ert_func::<_, _, 10, 10>(
+    let storage_bits = vstack.len();
+    let results = match ert_func::<_, _, 10, 10, _>(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         bounded_memory(&mem),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut constants,
@@ -1179,17 +1202,19 @@ fn ert_func_rejects_a_symbolic_stack_too_small_for_abi_words() {
     });
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
     };
 
+    let storage_bits = vstack.len();
     assert!(matches!(
-        ert_func::<_, _, 9, 0>(
+        ert_func::<_, _, 9, 0, _>(
             &mut handler,
+            &mut vstack,
+            storage_bits,
             bounded_memory(&mem),
             &mut rstack,
-            &mut vstack,
             0,
             &mut regs,
             &mut constants,

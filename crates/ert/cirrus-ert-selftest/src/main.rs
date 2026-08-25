@@ -15,7 +15,7 @@ use core::{
 
 use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
-use cirrus_volar_boolar::{StorageBank, execute};
+use cirrus_volar_boolar::{MuxTreeContext, StorageBank, execute};
 use volar_ir::{
     boolar::{BIrStmt, LaneId},
     circuit::BCircuit,
@@ -132,7 +132,7 @@ extern "C" fn rust_main() -> ! {
     );
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: (),
+            context: MuxTreeContext::new(()),
             hash: no_hash,
         },
     };
@@ -140,17 +140,19 @@ extern "C" fn rust_main() -> ! {
     let mut constants = [None; 32];
     let mut rstack = [0; 256];
     let mut vstack = [false; 65_536];
+    let storage_bits = vstack.len();
     let args = INPUT.map(|input| (word(input), None));
     let entry = ptr::addr_of!(__ert_workload_entry) as usize as u32;
     // SAFETY: QEMU maps this image at its native RV32 addresses. The workload
     // only fetches code and concrete static data from that mapped image.
     let memory = unsafe { RawMemory::new(ptr::null(), None) };
 
-    let results = match ert_func::<_, _, 16, 2>(
+    let results = match ert_func::<_, _, 16, 2, _>(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         memory,
         &mut rstack,
-        &mut vstack,
         entry,
         &mut regs,
         &mut constants,
@@ -178,7 +180,7 @@ fn word(value: u32) -> [bool; 32] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut MuxTreeContext<()>, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
@@ -214,10 +216,12 @@ fn boolar_storage_probe() -> bool {
     let mut banks = [StorageBank {
         storage: StorageId(0),
         lane: LaneId(0),
-        cells: &mut cells,
+        address_bits: 2,
+        value: &mut cells[..],
     }];
+    let mut context = MuxTreeContext::new(());
     matches!(
-        execute(&mut (), &circuit, &[true, false], &mut banks),
+        execute(&mut context, &circuit, &[true, false], &mut banks),
         Ok(outputs) if outputs.as_slice() == [true] && cells == [false, false, true, false]
     )
 }

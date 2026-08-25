@@ -56,18 +56,23 @@
 //! The public register and stack convention follows
 //! [AAPCS32](https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst).
 
-use core::{array, error::Error, ops::Range};
+use core::{array, error::Error, mem::MaybeUninit, ops::Range};
 
 #[cfg(feature = "prepared-recording")]
 use core::convert::Infallible;
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage, ContextWithValue,
+    HasError, StorageAddressBit,
+};
 use cirrus_ert_core::{
     BitOp, Product, Shift, add_bits, bitwise_word, concrete_product, constant_word, fixed_shift,
     invert_word, partial_and_not_word, partial_bitwise_word, select_word,
 };
 #[cfg(feature = "prepared-recording")]
 use cirrus_recompile_core::{Idx, PreparedRecorder};
+#[cfg(feature = "prepared-recording")]
+use cirrus_volar_boolar::MuxTreeContext;
 
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 
@@ -90,9 +95,15 @@ const PC: u8 = 15;
 const ABI_REGS: [u8; 4] = [0, 1, 2, 3];
 
 /// Boolean operations required by the Armv8-M facade.
-pub trait ContextWithArmv8mOps<Val>: cirrus_ert_core::ContextWithErtOps<Val> {}
+pub trait ContextWithArmv8mOps<Val>:
+    cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val>
+{
+}
 
-impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ?Sized> ContextWithArmv8mOps<Val> for T {}
+impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val> + ?Sized>
+    ContextWithArmv8mOps<Val> for T
+{
+}
 
 /// A Thumb image decoding failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +175,30 @@ impl<C: ContextWithBitXor<bool>, F> ContextWithBitXor<bool> for DefaultHandler<C
     }
 }
 
+impl<C, F> ContextWithStorage<bool> for DefaultHandler<C, F>
+where
+    C: ContextWithStorage<bool>,
+{
+    type Storage = C::Storage;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<C::Wrapped>],
+    ) -> Result<C::Wrapped, C::Error> {
+        self.context.storage_read(storage, address)
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<C::Wrapped>],
+        value: C::Wrapped,
+    ) -> Result<(), C::Error> {
+        self.context.storage_write(storage, address, value)
+    }
+}
+
 impl<C, F, W: Clone, E: Error> Handler<bool> for DefaultHandler<C, F>
 where
     C: ContextWithArmv8mOps<bool, Wrapped = W, Error = E>,
@@ -225,7 +260,7 @@ pub enum SecurityAttribute {
 /// An Arm-specific [`Handler`] extension gating `SVC #0` and Secure/Non-secure
 /// state transitions on the interpreter's tracked virtual security state
 /// (see [`SecurityState`]) and a caller-supplied address attribution.
-pub trait ArmHandler<Val>: Handler<Val> {
+pub trait ArmHandler<Val>: Handler<Val> + ContextWithStorage<Val> {
     /// Whether an `SVC #0` reached while the CPU is in `state` may proceed
     /// to [`Handler::ecall`]. Called by the interpreter before dispatch;
     /// returning `false` rejects the call as if it were unrecognized.
@@ -289,6 +324,30 @@ impl<H: ContextWithBitXor<bool>, G, A> ContextWithBitXor<bool> for ArmDefaultHan
     }
 }
 
+impl<H, G, A> ContextWithStorage<bool> for ArmDefaultHandler<H, G, A>
+where
+    H: ContextWithStorage<bool>,
+{
+    type Storage = H::Storage;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<H::Wrapped>],
+    ) -> Result<H::Wrapped, H::Error> {
+        self.inner.storage_read(storage, address)
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<H::Wrapped>],
+        value: H::Wrapped,
+    ) -> Result<(), H::Error> {
+        self.inner.storage_write(storage, address, value)
+    }
+}
+
 impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
     fn ecall(
         &mut self,
@@ -306,8 +365,11 @@ impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
     }
 }
 
-impl<H: Handler<bool>, G: FnMut(&mut H, SecurityState) -> bool, A: FnMut(&mut H, u32) -> SecurityAttribute>
-    ArmHandler<bool> for ArmDefaultHandler<H, G, A>
+impl<
+    H: Handler<bool> + ContextWithStorage<bool>,
+    G: FnMut(&mut H, SecurityState) -> bool,
+    A: FnMut(&mut H, u32) -> SecurityAttribute,
+> ArmHandler<bool> for ArmDefaultHandler<H, G, A>
 {
     fn svc_permitted(&mut self, state: SecurityState) -> bool {
         (self.svc_permitted)(&mut self.inner, state)
@@ -321,18 +383,156 @@ impl<H: Handler<bool>, G: FnMut(&mut H, SecurityState) -> bool, A: FnMut(&mut H,
 /// The Thumb handler shape used by [`ert_func_prepared`] and
 /// [`ert_emit_prepared`].
 ///
-/// Its policy closures receive the ordinary [`DefaultHandler`] wrapper, so
-/// they retain the same concrete backend tunnel as non-prepared Thumb ERT.
-/// After execution, consume `handler.inner.context` with
-/// [`PreparedRecorder::finish`].
+/// Its policy closures receive the ordinary [`DefaultHandler`] wrapper. After
+/// execution, consume `handler.inner.context` with
+/// [`MuxTreeContext::into_inner`] and [`PreparedRecorder::finish`].
 #[cfg(feature = "prepared-recording")]
-pub type PreparedArmHandler<F, G, A> = ArmDefaultHandler<DefaultHandler<PreparedRecorder, F>, G, A>;
+pub type PreparedArmHandler<F, G, A> =
+    ArmDefaultHandler<DefaultHandler<MuxTreeContext<PreparedRecorder>, F>, G, A>;
+
+/// Object-safe facade used by the Arm machine while its public caller keeps
+/// the storage type in `ContextWithStorage<bool>`.
+trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, Self::Error>;
+
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions;
+
+    fn svc_permitted(&mut self, state: SecurityState) -> bool;
+
+    fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
+
+    fn storage_read_bit(&mut self, bit: usize) -> Result<W, Self::Error>;
+
+    fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;
+}
+
+struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
+    handler: &'a mut H,
+    storage: &'a mut H::Storage,
+    zero: H::Wrapped,
+    one: H::Wrapped,
+}
+
+impl<H: ContextWithStorage<bool> + ?Sized> HasError for StorageRuntime<'_, H> {
+    type Error = H::Error;
+}
+
+impl<H: ContextWithStorage<bool> + ?Sized> ContextWithValue<bool> for StorageRuntime<'_, H> {
+    type Wrapped = H::Wrapped;
+}
+
+impl<H> ContextWithBitAnd<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitAnd<bool> + ?Sized,
+{
+    fn bitand(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitand(a, b)
+    }
+
+    fn bitand_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitand_assign(a, b)
+    }
+}
+
+impl<H> ContextWithBitOr<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitOr<bool> + ?Sized,
+{
+    fn bitor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitor(a, b)
+    }
+
+    fn bitor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitor_assign(a, b)
+    }
+}
+
+impl<H> ContextWithBitXor<bool> for StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ContextWithBitXor<bool> + ?Sized,
+{
+    fn bitxor(&mut self, a: H::Wrapped, b: H::Wrapped) -> Result<H::Wrapped, H::Error> {
+        self.handler.bitxor(a, b)
+    }
+
+    fn bitxor_assign(&mut self, a: &mut H::Wrapped, b: H::Wrapped) -> Result<(), H::Error> {
+        self.handler.bitxor_assign(a, b)
+    }
+}
+
+impl<H, W: Clone, E: Error> Runtime<W> for StorageRuntime<'_, H>
+where
+    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    fn ecall(
+        &mut self,
+        regs: &mut [[W; 32]],
+        reg_consts: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<EcallOutcome, E> {
+        self.handler.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
+        self.handler.early_exit_loop_options()
+    }
+
+    fn svc_permitted(&mut self, state: SecurityState) -> bool {
+        self.handler.svc_permitted(state)
+    }
+
+    fn security_attribute(&mut self, address: u32) -> SecurityAttribute {
+        self.handler.security_attribute(address)
+    }
+
+    fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {
+        let address = self.storage_address(bit);
+        self.handler.storage_read(self.storage, &address)
+    }
+
+    fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), E> {
+        let address = self.storage_address(bit);
+        self.handler.storage_write(self.storage, &address, value)
+    }
+}
+
+impl<H> StorageRuntime<'_, H>
+where
+    H: ContextWithStorage<bool> + ?Sized,
+    H::Wrapped: Clone,
+{
+    fn storage_address(
+        &self,
+        value: usize,
+    ) -> [StorageAddressBit<H::Wrapped>; usize::BITS as usize] {
+        array::from_fn(|bit| {
+            let known = (value >> bit) & 1 != 0;
+            StorageAddressBit {
+                wire: if known {
+                    self.one.clone()
+                } else {
+                    self.zero.clone()
+                },
+                known: Some(known),
+            }
+        })
+    }
+}
 
 /// Add two little-endian symbolic 32-bit words with an initial carry bit.
 ///
 /// `zero` and `one` are retained to match the RISC-V compatibility helper.
 pub fn simple_add<W: Clone, E: Error>(
-    t: &mut (dyn ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + '_),
+    t: &mut (dyn cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W, Error = E> + '_),
     v: &[W; 32],
     w: &[W; 32],
     carry: W,
@@ -345,32 +545,50 @@ pub fn simple_add<W: Clone, E: Error>(
 /// Invoke an Arm Thumb function through the AAPCS32 word ABI.
 ///
 /// The first four arguments and results occupy `r0` through `r3`; remaining
-/// words use the caller-provided symbolic stack. `vstack` must provide a
+/// words use the caller-provided symbolic storage. `storage_bits` must be a
 /// byte-length divisible by eight so that the public interface's `sp` stays
 /// eight-byte aligned. `pc` must be an odd Thumb function pointer.
 #[allow(clippy::too_many_arguments)]
-pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
-    t: &mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + '_),
+pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [W],
     pc: u32,
     regs: &mut [[W; 32]; 16],
     reg_consts: &mut [Option<u32>; 16],
     zero: W,
     one: W,
     args: [([W; 32], Option<u32>); N],
-) -> Result<[([W; 32], Option<u32>); M], ErtError<E>> {
-    let stack_pointer = abi_stack_pointer(vstack, N.max(M)).ok_or(ErtError::Unexpected)?;
+) -> Result<[([W; 32], Option<u32>); M], ErtError<E>>
+where
+    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    let stack_pointer = abi_stack_pointer(storage_bits, N.max(M)).ok_or(ErtError::Unexpected)?;
     if stack_pointer & 7 != 0 || pc & 1 == 0 {
         return Err(ErtError::Unexpected);
     }
-    write_abi_args(regs, reg_consts, vstack, stack_pointer, args);
+    let mut runtime = StorageRuntime {
+        handler: t,
+        storage,
+        zero: zero.clone(),
+        one: one.clone(),
+    };
+    write_abi_args(
+        &mut runtime,
+        regs,
+        reg_consts,
+        storage_bits,
+        stack_pointer,
+        args,
+    )
+    .map_err(ErtError::Emitted)?;
     Machine::new(
-        t,
+        &mut runtime,
         mem,
         rstack,
-        vstack,
+        storage_bits,
         pc & !1,
         regs,
         reg_consts,
@@ -379,7 +597,8 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
         stack_pointer,
     )
     .run()?;
-    Ok(read_abi_results(regs, reg_consts, vstack, stack_pointer))
+    read_abi_results(&mut runtime, regs, reg_consts, storage_bits, stack_pointer)
+        .map_err(ErtError::Emitted)
 }
 
 /// Execute Thumb code through an opt-in [`PreparedRecorder`].
@@ -391,9 +610,10 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn ert_func_prepared<F, G, A, const N: usize, const M: usize>(
     t: &mut PreparedArmHandler<F, G, A>,
+    storage: &mut [Idx],
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [Idx],
     pc: u32,
     regs: &mut [[Idx; 32]; 16],
     reg_consts: &mut [Option<u32>; 16],
@@ -402,41 +622,64 @@ pub fn ert_func_prepared<F, G, A, const N: usize, const M: usize>(
     args: [([Idx; 32], Option<u32>); N],
 ) -> Result<[([Idx; 32], Option<u32>); M], ErtError<Infallible>>
 where
-    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
-    G: FnMut(&mut DefaultHandler<PreparedRecorder, F>, SecurityState) -> bool,
-    A: FnMut(&mut DefaultHandler<PreparedRecorder, F>, u32) -> SecurityAttribute,
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    G: FnMut(&mut DefaultHandler<MuxTreeContext<PreparedRecorder>, F>, SecurityState) -> bool,
+    A: FnMut(&mut DefaultHandler<MuxTreeContext<PreparedRecorder>, F>, u32) -> SecurityAttribute,
 {
     ert_func(
-        t, mem, rstack, vstack, pc, regs, reg_consts, zero, one, args,
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+        args,
     )
 }
 
 /// Execute Thumb instructions until the supported exit `SVC #0`.
 ///
 /// `pc` is an odd Thumb entry pointer. The interpreter initializes `sp` to the
-/// end of `vstack` and requires that initial byte address to be eight-byte
-/// aligned.
+/// end of the caller-declared storage capacity and requires that initial byte
+/// address to be eight-byte aligned.
 #[allow(clippy::too_many_arguments)]
-pub fn ert_emit<W: Clone, E: Error>(
-    t: &mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + '_),
+pub fn ert_emit<W: Clone, E: Error, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [W],
     pc: u32,
     regs: &mut [[W; 32]; 16],
     reg_consts: &mut [Option<u32>; 16],
     zero: W,
     one: W,
-) -> Result<(), ErtError<E>> {
-    let stack_pointer = u32::try_from(vstack.len() / 8).map_err(|_| ErtError::Unexpected)?;
+) -> Result<(), ErtError<E>>
+where
+    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    if storage_bits % 8 != 0 {
+        return Err(ErtError::Unexpected);
+    }
+    let stack_pointer = u32::try_from(storage_bits / 8).map_err(|_| ErtError::Unexpected)?;
     if stack_pointer & 7 != 0 || pc & 1 == 0 {
         return Err(ErtError::Unexpected);
     }
+    let mut runtime = StorageRuntime {
+        handler: t,
+        storage,
+        zero: zero.clone(),
+        one: one.clone(),
+    };
     Machine::new(
-        t,
+        &mut runtime,
         mem,
         rstack,
-        vstack,
+        storage_bits,
         pc & !1,
         regs,
         reg_consts,
@@ -453,9 +696,10 @@ pub fn ert_emit<W: Clone, E: Error>(
 #[allow(clippy::too_many_arguments)]
 pub fn ert_emit_prepared<F, G, A>(
     t: &mut PreparedArmHandler<F, G, A>,
+    storage: &mut [Idx],
+    storage_bits: usize,
     mem: RawMemory<'_>,
     rstack: &mut [u32],
-    vstack: &mut [Idx],
     pc: u32,
     regs: &mut [[Idx; 32]; 16],
     reg_consts: &mut [Option<u32>; 16],
@@ -463,56 +707,82 @@ pub fn ert_emit_prepared<F, G, A>(
     one: Idx,
 ) -> Result<(), ErtError<Infallible>>
 where
-    F: FnMut(&mut PreparedRecorder, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
-    G: FnMut(&mut DefaultHandler<PreparedRecorder, F>, SecurityState) -> bool,
-    A: FnMut(&mut DefaultHandler<PreparedRecorder, F>, u32) -> SecurityAttribute,
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 32]]) -> Result<[u8; 32], Infallible>,
+    G: FnMut(&mut DefaultHandler<MuxTreeContext<PreparedRecorder>, F>, SecurityState) -> bool,
+    A: FnMut(&mut DefaultHandler<MuxTreeContext<PreparedRecorder>, F>, u32) -> SecurityAttribute,
 {
-    ert_emit(t, mem, rstack, vstack, pc, regs, reg_consts, zero, one)
+    ert_emit(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+    )
 }
 
-fn abi_stack_pointer<W>(vstack: &[W], values: usize) -> Option<u32> {
+fn abi_stack_pointer(storage_bits: usize, values: usize) -> Option<u32> {
+    (storage_bits % 8 == 0).then_some(())?;
     let extra = values.saturating_sub(ABI_REGS.len());
-    let bytes = u32::try_from(vstack.len() / 8).ok()?;
+    let bytes = u32::try_from(storage_bits / 8).ok()?;
     let reservation = u32::try_from(extra.checked_mul(4)?).ok()?;
     let reservation = (reservation + 7) & !7;
     bytes.checked_sub(reservation)
 }
 
-fn write_abi_args<W: Clone, const N: usize>(
+fn write_abi_args<W: Clone, E: Error, const N: usize>(
+    t: &mut (dyn Runtime<W, Error = E> + '_),
     regs: &mut [[W; 32]; REG_COUNT],
     reg_consts: &mut [Option<u32>; REG_COUNT],
-    vstack: &mut [W],
+    storage_bits: usize,
     sp: u32,
     args: [([W; 32], Option<u32>); N],
-) {
+) -> Result<(), E> {
     for (index, (value, constant)) in args.into_iter().enumerate() {
         if let Some(&register) = ABI_REGS.get(index) {
             regs[register as usize] = value;
             reg_consts[register as usize] = constant;
         } else {
             let start = sp as usize * 8 + 32 * (index - ABI_REGS.len());
-            vstack[start..start + 32].clone_from_slice(&value);
+            debug_assert!(start + 32 <= storage_bits);
+            for (bit, value) in value.into_iter().enumerate() {
+                t.storage_write_bit(start + bit, value)?;
+            }
         }
     }
+    Ok(())
 }
 
-fn read_abi_results<W: Clone, const M: usize>(
+fn read_abi_results<W: Clone, E: Error, const M: usize>(
+    t: &mut (dyn Runtime<W, Error = E> + '_),
     regs: &[[W; 32]; REG_COUNT],
     reg_consts: &[Option<u32>; REG_COUNT],
-    vstack: &[W],
+    storage_bits: usize,
     sp: u32,
-) -> [([W; 32], Option<u32>); M] {
-    array::from_fn(|index| {
-        if let Some(&register) = ABI_REGS.get(index) {
+) -> Result<[([W; 32], Option<u32>); M], E> {
+    let mut results: [MaybeUninit<([W; 32], Option<u32>)>; M] =
+        [const { MaybeUninit::uninit() }; M];
+    for (index, result) in results.iter_mut().enumerate() {
+        result.write(if let Some(&register) = ABI_REGS.get(index) {
             (
                 regs[register as usize].clone(),
                 reg_consts[register as usize],
             )
         } else {
             let start = sp as usize * 8 + 32 * (index - ABI_REGS.len());
-            (array::from_fn(|bit| vstack[start + bit].clone()), None)
-        }
-    })
+            debug_assert!(start + 32 <= storage_bits);
+            let mut word: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
+            for (bit, slot) in word.iter_mut().enumerate() {
+                slot.write(t.storage_read_bit(start + bit)?);
+            }
+            (word.map(|bit| unsafe { bit.assume_init() }), None)
+        });
+    }
+    Ok(results.map(|result| unsafe { result.assume_init() }))
 }
 
 #[derive(Clone, Copy)]
@@ -709,10 +979,10 @@ struct Decoded {
 }
 
 struct Machine<'a, W, E> {
-    t: &'a mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + 'a),
+    t: &'a mut (dyn Runtime<W, Error = E> + 'a),
     mem: RawMemory<'a>,
     rstack: &'a mut [u32],
-    vstack: &'a mut [W],
+    storage_bits: usize,
     pc: u32,
     regs: &'a mut [[W; 32]; REG_COUNT],
     constants: &'a mut [Option<u32>; REG_COUNT],
@@ -732,10 +1002,10 @@ struct Machine<'a, W, E> {
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        t: &'a mut (dyn ArmHandler<bool, Wrapped = W, Error = E> + 'a),
+        t: &'a mut (dyn Runtime<W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
-        vstack: &'a mut [W],
+        storage_bits: usize,
         pc: u32,
         regs: &'a mut [[W; 32]; REG_COUNT],
         constants: &'a mut [Option<u32>; REG_COUNT],
@@ -747,7 +1017,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             t,
             mem,
             rstack,
-            vstack,
+            storage_bits,
             pc,
             regs,
             constants,
@@ -1247,7 +1517,10 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         let source = self.regs[site.register as usize].clone();
         let mut is_nonzero = source[0].clone();
         for bit in &source[1..] {
-            is_nonzero = self.t.bitor(is_nonzero, bit.clone()).map_err(ErtError::Emitted)?;
+            is_nonzero = self
+                .t
+                .bitor(is_nonzero, bit.clone())
+                .map_err(ErtError::Emitted)?;
         }
         let should_take = if site.nonzero {
             is_nonzero
@@ -1418,8 +1691,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         let word = if let Some(value) = value {
             self.word_from_constant(value)
         } else {
-            let carry = if subtraction && matches!(kind, Arithmetic::Sub | Arithmetic::ReverseSub)
-            {
+            let carry = if subtraction && matches!(kind, Arithmetic::Sub | Arithmetic::ReverseSub) {
                 self.one.clone()
             } else {
                 carry
@@ -1613,10 +1885,41 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         let address = self.sp.wrapping_add_signed(offset) as usize;
         let start = address.checked_mul(8).ok_or(ErtError::Unexpected)?;
         let end = start.checked_add(width).ok_or(ErtError::Unexpected)?;
-        if end > self.vstack.len() {
+        if end > self.storage_bits {
             return Err(ErtError::Unexpected);
         }
         Ok(start..end)
+    }
+
+    fn read_stack_bit(&mut self, bit: usize) -> Result<W, ErtError<E>> {
+        if bit >= self.storage_bits {
+            return Err(ErtError::Unexpected);
+        }
+        self.t.storage_read_bit(bit).map_err(ErtError::Emitted)
+    }
+
+    fn write_stack_bit(&mut self, bit: usize, value: W) -> Result<(), ErtError<E>> {
+        if bit >= self.storage_bits {
+            return Err(ErtError::Unexpected);
+        }
+        self.t
+            .storage_write_bit(bit, value)
+            .map_err(ErtError::Emitted)
+    }
+
+    fn read_stack_word(&mut self, start: usize) -> Result<[W; 32], ErtError<E>> {
+        let mut word: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
+        for (bit, slot) in word.iter_mut().enumerate() {
+            slot.write(self.read_stack_bit(start + bit)?);
+        }
+        Ok(word.map(|bit| unsafe { bit.assume_init() }))
+    }
+
+    fn write_stack_word(&mut self, start: usize, word: [W; 32]) -> Result<(), ErtError<E>> {
+        for (bit, value) in word.into_iter().enumerate() {
+            self.write_stack_bit(start + bit, value)?;
+        }
+        Ok(())
     }
 
     fn load(
@@ -1636,15 +1939,17 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 let width = load_width(kind);
                 let signed = matches!(kind, LoadKind::ByteSigned | LoadKind::HalfSigned);
                 let range = self.stack_bits(base_offset.wrapping_add(offset), width)?;
-                let word = array::from_fn(|bit| {
-                    if bit < width {
-                        self.vstack[range.start + bit].clone()
+                let mut word: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
+                for (bit, slot) in word.iter_mut().enumerate() {
+                    slot.write(if bit < width {
+                        self.read_stack_bit(range.start + bit)?
                     } else if signed {
-                        self.vstack[range.start + width - 1].clone()
+                        self.read_stack_bit(range.start + width - 1)?
                     } else {
                         self.zero.clone()
-                    }
-                });
+                    });
+                }
+                let word = word.map(|bit| unsafe { bit.assume_init() });
                 self.write(dest, word, None);
             }
             None => {
@@ -1698,7 +2003,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         let offset = self.stack_offset(base, offset)?;
         let range = self.stack_bits(offset, width)?;
         for bit in 0..width {
-            self.vstack[range.start + bit] = self.regs[source as usize][bit].clone();
+            self.write_stack_bit(range.start + bit, self.regs[source as usize][bit].clone())?;
         }
         self.next(len)
     }
@@ -1711,7 +2016,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         for register in 0..REG_COUNT {
             if list & (1 << register) != 0 {
                 let range = self.stack_bits((slot * 4) as i32, 32)?;
-                self.vstack[range].clone_from_slice(&self.regs[register].clone());
+                self.write_stack_word(range.start, self.regs[register].clone())?;
                 slot += 1;
             }
         }
@@ -1725,7 +2030,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         for register in 0..REG_COUNT {
             if list & (1 << register) != 0 {
                 let range = self.stack_bits((slot * 4) as i32, 32)?;
-                let word = array::from_fn(|bit| self.vstack[range.start + bit].clone());
+                let word = self.read_stack_word(range.start)?;
                 if register == PC as usize {
                     returns = true;
                 } else {
@@ -1754,11 +2059,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         for register in 0..REG_COUNT {
             if list & (1 << register) != 0 {
                 let range = self.stack_bits(base_offset.wrapping_add((slot * 4) as i32), 32)?;
-                self.write(
-                    register as u8,
-                    array::from_fn(|bit| self.vstack[range.start + bit].clone()),
-                    None,
-                );
+                let word = self.read_stack_word(range.start)?;
+                self.write(register as u8, word, None);
                 slot += 1;
             }
         }
@@ -1784,7 +2086,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         for register in 0..REG_COUNT {
             if list & (1 << register) != 0 {
                 let range = self.stack_bits(base_offset.wrapping_add((slot * 4) as i32), 32)?;
-                self.vstack[range].clone_from_slice(&self.regs[register].clone());
+                self.write_stack_word(range.start, self.regs[register].clone())?;
                 slot += 1;
             }
         }
@@ -1925,7 +2227,7 @@ fn concrete_shift(value: u32, amount: u32, direction: Shift) -> u32 {
 }
 
 fn arm_runtime_shift<W: Clone, E>(
-    t: &mut (impl ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + ?Sized),
+    t: &mut (impl cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     source: &[W; 32],
     amount: &[W; 32],
     direction: Shift,
@@ -1951,7 +2253,7 @@ fn arm_runtime_shift<W: Clone, E>(
 }
 
 fn multiply_word<W: Clone, E>(
-    t: &mut (impl ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + ?Sized),
+    t: &mut (impl cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     left: &[W; 32],
     right: &[W; 32],
     left_constant: Option<u32>,
@@ -2016,7 +2318,7 @@ fn multiply_word<W: Clone, E>(
 }
 
 fn subtract_if_negative<W: Clone, E>(
-    t: &mut (impl ContextWithArmv8mOps<bool, Wrapped = W, Error = E> + ?Sized),
+    t: &mut (impl cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     value: &[W; 32],
     signed: &[W; 32],
     subtrahend: &[W; 32],

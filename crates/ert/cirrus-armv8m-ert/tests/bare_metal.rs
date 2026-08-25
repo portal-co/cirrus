@@ -13,6 +13,7 @@ use cirrus_armv8m_ert::{
     ert_func,
 };
 use cirrus_ert_sha256_fixture::sha256_compress;
+use cirrus_volar_boolar::MuxTreeContext;
 
 const TARGET: &str = "thumbv8m.main-none-eabi";
 
@@ -100,19 +101,21 @@ fn run_host_image(image: &PathBuf) {
     let mut constants = [None; 16];
     let mut rstack = [0; 512];
     let mut vstack = [false; 131_072];
+    let storage_bits = vstack.len();
     let args = input.map(|value| (array::from_fn(|bit| value & (1 << bit) != 0), None));
-    let result = ert_func::<_, _, 16, 2>(
+    let result = ert_func::<_, _, 16, 2, _>(
         &mut ArmDefaultHandler {
             inner: DefaultHandler {
-                context: (),
+                context: MuxTreeContext::new(()),
                 hash: no_hash,
             },
             svc_permitted: permit_all,
             security_attribute: always_secure,
         },
+        &mut vstack,
+        storage_bits,
         memory,
         &mut rstack,
-        &mut vstack,
         BASE | 1,
         &mut registers,
         &mut constants,
@@ -144,7 +147,7 @@ fn run_host_image(image: &PathBuf) {
     }
 }
 
-fn no_hash(_: &mut (), _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut MuxTreeContext<()>, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 

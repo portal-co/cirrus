@@ -15,6 +15,7 @@ use core::convert::Infallible;
 use cipher::consts::U1;
 use cirrus_core::ContextWithCreate;
 use cirrus_ert::{DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit};
+use cirrus_volar_boolar::MuxTreeContext;
 use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext, VoleVerifyError};
 use hybrid_array::Array;
 use rv_asm::{Inst, Reg, Xlen};
@@ -66,10 +67,16 @@ fn program(instructions: impl IntoIterator<Item = Inst>) -> std::vec::Vec<u8> {
         .collect()
 }
 
-fn no_hash_prover<C>(_: &mut C, _: &[[Vope<U1, Galois128, U1>; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash_prover<C>(
+    _: &mut C,
+    _: &[[Vope<U1, Galois128, U1>; 32]],
+) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
-fn no_hash_verifier<C>(_: &mut C, _: &[[Q<U1, Galois128>; 32]]) -> Result<[u8; 32], VoleVerifyError> {
+fn no_hash_verifier<C>(
+    _: &mut C,
+    _: &[[Q<U1, Galois128>; 32]],
+) -> Result<[u8; 32], VoleVerifyError> {
     Ok([0; 32])
 }
 
@@ -92,10 +99,10 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
     let cot = IdealCot::<U1, Galois128>::new(delta.clone());
 
     let mut hats = VecPusher::<Array<Galois128, U1>>::default();
-    let mut prover_ctx = VoleProverContext {
+    let mut prover_ctx = MuxTreeContext::new(VoleProverContext {
         hats: &mut hats,
         bit_to_t,
-    };
+    });
 
     let mut prover_registers: [[Vope<U1, Galois128, U1>; 32]; 32] =
         core::array::from_fn(|_| core::array::from_fn(|_| Vope::default()));
@@ -106,12 +113,24 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
         core::array::from_fn(|_| prover_ctx.create(true).unwrap());
     prover_registers[Reg::A0.0 as usize] = all_one_prover;
     for bit in 0..32 {
-        let (vope, q) = vole_commit_bit(&cot, &mut rng, sample_g128, bit_to_t, (left_value >> bit) & 1 != 0);
+        let (vope, q) = vole_commit_bit(
+            &cot,
+            &mut rng,
+            sample_g128,
+            bit_to_t,
+            (left_value >> bit) & 1 != 0,
+        );
         prover_registers[Reg::A1.0 as usize][bit] = vope;
         verifier_registers[Reg::A1.0 as usize][bit] = q;
     }
     for bit in 0..32 {
-        let (vope, q) = vole_commit_bit(&cot, &mut rng, sample_g128, bit_to_t, (right_value >> bit) & 1 != 0);
+        let (vope, q) = vole_commit_bit(
+            &cot,
+            &mut rng,
+            sample_g128,
+            bit_to_t,
+            (right_value >> bit) & 1 != 0,
+        );
         prover_registers[Reg::A2.0 as usize][bit] = vope;
         verifier_registers[Reg::A2.0 as usize][bit] = q;
     }
@@ -127,15 +146,16 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
     let mut handler = RvDefaultHandler {
         inner: RvHashHandler {
             context: prover_ctx,
-            hash: no_hash_prover::<VoleProverContext<U1, Galois128>>,
+            hash: no_hash_prover::<MuxTreeContext<VoleProverContext<U1, Galois128>>>,
         },
     };
 
     let proved = ert_emit(
         &mut handler,
+        &mut prover_vstack,
+        64,
         RawMemory::from(instructions.as_slice()),
         &mut prover_rstack,
-        &mut prover_vstack,
         0,
         &mut prover_registers,
         &mut prover_constants,
@@ -149,10 +169,10 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
     // Verifier side: for A0, build the constant-true share the same way
     // `create` does; the "one"/"zero" ABI arguments `ert_emit` itself needs
     // must match too.
-    let mut verifier_ctx = VoleVerifierContext {
+    let mut verifier_ctx = MuxTreeContext::new(VoleVerifierContext {
         delta: delta.clone(),
         hats: hats.0.clone().into_iter(),
-    };
+    });
     let all_one_verifier: [Q<U1, Galois128>; 32] =
         core::array::from_fn(|_| verifier_ctx.create(true).unwrap());
     verifier_registers[Reg::A0.0 as usize] = all_one_verifier;
@@ -168,15 +188,20 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
     let mut verifier_handler = RvDefaultHandler {
         inner: RvHashHandler {
             context: verifier_ctx,
-            hash: no_hash_verifier::<VoleVerifierContext<U1, Galois128, std::vec::IntoIter<Array<Galois128, U1>>>>,
+            hash: no_hash_verifier::<
+                MuxTreeContext<
+                    VoleVerifierContext<U1, Galois128, std::vec::IntoIter<Array<Galois128, U1>>>,
+                >,
+            >,
         },
     };
 
     let verified = ert_emit(
         &mut verifier_handler,
+        &mut verifier_vstack,
+        64,
         RawMemory::from(instructions.as_slice()),
         &mut verifier_rstack,
-        &mut verifier_vstack,
         0,
         &mut verifier_registers,
         &mut verifier_constants,
@@ -191,7 +216,8 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
         // what the prover's own (same-process) committed value evaluates
         // to at Delta.
         assert!(
-            prover_result[bit].clone() * delta.clone() == verifier_registers[Reg::T0.0 as usize][bit],
+            prover_result[bit].clone() * delta.clone()
+                == verifier_registers[Reg::T0.0 as usize][bit],
             "prover/verifier share mismatch at bit {bit}"
         );
         // The circuit computed the right answer: the prover's committed

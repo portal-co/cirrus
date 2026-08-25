@@ -1,13 +1,16 @@
 extern crate std;
 
-use core::{array, convert::Infallible};
+use core::convert::Infallible;
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage, ContextWithValue,
+    HasError, StorageAddressBit,
+};
 use cirrus_ert_core::{EarlyExitLoopOptions, EcallOutcome, Handler};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{ErtError, RawMemory, RvHandler, ert_emit};
+use crate::{ErtError, RawMemory, ert_emit};
 
 fn value(word: &[bool; 32]) -> u32 {
     word.iter()
@@ -71,6 +74,40 @@ impl ContextWithBitXor<bool> for TestHandler {
     }
 }
 
+impl ContextWithStorage<bool> for TestHandler {
+    type Storage = [bool];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+    ) -> Result<bool, Infallible> {
+        let index = address
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, address)| {
+                index | ((address.wire as usize) << bit)
+            });
+        Ok(storage[index])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+        value: bool,
+    ) -> Result<(), Infallible> {
+        let index = address
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, address)| {
+                index | ((address.wire as usize) << bit)
+            });
+        storage[index] = value;
+        Ok(())
+    }
+}
+
 impl Handler<bool> for TestHandler {
     fn ecall(
         &mut self,
@@ -93,8 +130,6 @@ impl Handler<bool> for TestHandler {
         }
     }
 }
-
-impl RvHandler<bool> for TestHandler {}
 
 /// `T2 = 1; for i in 0..len { if a[i] != b[i] { T2 = 0; break; } }`, built
 /// into the canonical rotated-loop shape a real `-O2` toolchain emits: a
@@ -259,12 +294,14 @@ fn run_memcmp(a: &[u8], b: &[u8], enabled: bool) -> Result<u32, ErtError<Infalli
     let mut rstack = [0u32; 8];
     let mut vstack = [false; 4096];
     let mut handler = TestHandler { enabled };
+    let storage_bits = vstack.len();
 
     ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(mem.as_slice()),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut constants,
@@ -453,12 +490,14 @@ fn a_second_branch_on_the_continue_path_is_rejected() {
     let mut rstack = [0u32; 8];
     let mut vstack = [false; 4096];
     let mut handler = TestHandler { enabled: true };
+    let storage_bits = vstack.len();
 
     let result = ert_emit(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(mem.as_slice()),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut constants,

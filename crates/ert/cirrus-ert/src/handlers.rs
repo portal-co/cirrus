@@ -723,7 +723,7 @@ fn load<W: Clone, E: core::error::Error>(
                     continue;
                 }
                 machine.regs[dest.0 as usize][bit] =
-                    machine.vstack[stack_bits.start + source_bit].clone();
+                    machine.read_stack_bit(stack_bits.start + source_bit)?;
             }
         }
     }
@@ -740,7 +740,10 @@ fn store<W: Clone, E: core::error::Error>(
     let offset = machine.stack_offset(base, offset)?;
     let stack_bits = machine.stack_bits(offset, width)?;
     for bit in 0..width {
-        machine.vstack[stack_bits.start + bit] = machine.regs[src.0 as usize][bit].clone();
+        machine.write_stack_bit(
+            stack_bits.start + bit,
+            machine.regs[src.0 as usize][bit].clone(),
+        )?;
     }
     next(machine)
 }
@@ -895,7 +898,8 @@ fn early_exit_loop_branch<W: Clone, E: core::error::Error>(
         let (dest, value) = slot.expect("exit_write_count bounds the initialized prefix");
         let candidate = machine.word_from_constant(value);
         let current = machine.regs[dest.0 as usize].clone();
-        machine.regs[dest.0 as usize] = select_word(machine, should_exit.clone(), &candidate, &current)?;
+        machine.regs[dest.0 as usize] =
+            select_word(machine, should_exit.clone(), &candidate, &current)?;
         machine.reg_consts[dest.0 as usize] = None;
         machine.offs[dest.0 as usize] = None;
     }

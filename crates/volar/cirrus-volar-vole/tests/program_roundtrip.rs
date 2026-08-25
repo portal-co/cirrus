@@ -17,9 +17,11 @@
 use cipher::consts::U1;
 use cirrus_core::ContextWithCreate;
 use cirrus_recompile_core::Recorder;
-use cirrus_volar_boolar::execute as execute_boolar;
+use cirrus_volar_boolar::{MuxTreeContext, execute as execute_boolar};
 use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext};
 use hybrid_array::Array;
+use volar_ir::circuit::BCircuit;
+use volar_lir_test_corpus::make_biir_half_adder;
 use volar_spec::{
     SpecRng,
     field::Galois128,
@@ -29,8 +31,6 @@ use volar_spec::{
         setup::{random_nonzero_delta, vole_commit_bit},
     },
 };
-use volar_ir::circuit::BCircuit;
-use volar_lir_test_corpus::make_biir_half_adder;
 
 const CASES: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
 
@@ -73,11 +73,11 @@ fn bit_to_t(b: bool) -> Galois128 {
 
 fn sample_program() -> cirrus_recompile_core::Program {
     let circuit = BCircuit::try_from_ir(&make_biir_half_adder()).expect("corpus fixture is fused");
-    let mut recorder = Recorder::new();
+    let mut recorder = MuxTreeContext::new(Recorder::new());
     let a = recorder.create(false).unwrap();
     let b = recorder.create(false).unwrap();
     let outputs = execute_boolar(&mut recorder, &circuit, &[a, b], &mut []).unwrap();
-    recorder.finish(vec![a, b], outputs)
+    recorder.into_inner().finish(vec![a, b], outputs)
 }
 
 #[test]
@@ -115,7 +115,11 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
         let verifier_outputs =
             cirrus_recompile_rt::execute(&mut verifier, &program, &verifier_inputs).unwrap();
 
-        for (i, (p, v)) in prover_outputs.iter().zip(verifier_outputs.iter()).enumerate() {
+        for (i, (p, v)) in prover_outputs
+            .iter()
+            .zip(verifier_outputs.iter())
+            .enumerate()
+        {
             assert!(
                 p.clone() * delta.clone() == *v,
                 "output {i} mismatch for ({av}, {bv})"
@@ -127,8 +131,7 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
         let q_a = verifier_inputs[0].clone();
         let q_b = verifier_inputs[1].clone();
         let and_hat = hats.0[0].clone();
-        let (_, ok) =
-            vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[1], &and_hat);
+        let (_, ok) = vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[1], &and_hat);
         assert!(ok, "honest and-gate check rejected for ({av}, {bv})");
 
         // Negative case: keep the honestly-derived `q_and` (verifier_outputs[1],
@@ -144,6 +147,9 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
         bad_hat[0] = bad_hat[0] + Galois128(1);
         let (_, bad_ok) =
             vole_and_verifier_check(&delta, &q_a, &q_b, &verifier_outputs[1], &bad_hat);
-        assert!(!bad_ok, "verifier accepted a corrupted hat for ({av}, {bv})");
+        assert!(
+            !bad_ok,
+            "verifier accepted a corrupted hat for ({av}, {bv})"
+        );
     }
 }
