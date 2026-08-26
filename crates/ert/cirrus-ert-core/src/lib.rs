@@ -11,6 +11,7 @@
 use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
+use volar_circuit_exec_core::{SelectEmitter, select as emit_select};
 
 mod compare;
 #[cfg(test)]
@@ -27,6 +28,38 @@ pub trait ContextWithErtOps<Val>:
 impl<Val, T: ContextWithBitAnd<Val> + ContextWithBitOr<Val> + ContextWithBitXor<Val>>
     ContextWithErtOps<Val> for T
 {
+}
+
+/// Adapts an ERT Boolean context to the shared select-emission seam.
+///
+/// ERT receives its zero/one wires from the caller ABI, so it intentionally
+/// implements only the AND/XOR interface needed for selection rather than
+/// fabricating a constant constructor.
+pub struct ErtSelectEmitter<'a, T: ?Sized> {
+    context: &'a mut T,
+}
+
+impl<'a, T: ?Sized> ErtSelectEmitter<'a, T> {
+    /// Borrow one ERT context for shared Boolean select emission.
+    pub fn new(context: &'a mut T) -> Self {
+        Self { context }
+    }
+}
+
+impl<T, W: Clone, E> SelectEmitter for ErtSelectEmitter<'_, T>
+where
+    T: ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized,
+{
+    type Wire = W;
+    type Error = E;
+
+    fn and(&mut self, left: W, right: W) -> Result<W, E> {
+        self.context.bitand(left, right)
+    }
+
+    fn xor(&mut self, left: W, right: W) -> Result<W, E> {
+        self.context.bitxor(left, right)
+    }
 }
 
 /// A handler for a facade's environment-call instruction (RV32 `ECALL`,
@@ -303,10 +336,14 @@ pub fn select_word<W: Clone, E, const N: usize>(
     then_word: &[W; N],
     else_word: &[W; N],
 ) -> Result<[W; N], E> {
+    let mut emitter = ErtSelectEmitter::new(t);
     try_array(|bit| {
-        let difference = t.bitxor(then_word[bit].clone(), else_word[bit].clone())?;
-        let difference = t.bitand(condition.clone(), difference)?;
-        t.bitxor(else_word[bit].clone(), difference)
+        emit_select(
+            &mut emitter,
+            condition.clone(),
+            then_word[bit].clone(),
+            else_word[bit].clone(),
+        )
     })
 }
 
