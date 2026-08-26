@@ -6,8 +6,10 @@ description = "Execute Volar Boolar circuits through Cirrus Boolean contexts"
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
-volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git", features = ["lazy"] }
 volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+lazy-repo = { path = "../../../../lazy-repo/crates/lazy-repo", default-features = false }
+lazy-repo-crypto = { path = "../../../../lazy-repo/crates/lazy-repo-crypto", default-features = false }
 
 [dev-dependencies]
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }

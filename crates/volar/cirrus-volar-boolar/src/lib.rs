@@ -13,10 +13,13 @@ use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,
     ContextWithValue, HasError, StorageAddressBit,
 };
+use lazy_repo::{ChunkCodec, Repository};
+use lazy_repo_crypto::{EncryptedScratch, ScratchSlot, ScratchStore};
 use volar_ir::{
     boolar::{BIrStmt, LaneId},
     circuit::BCircuit,
     ir::IRVarId,
+    lazy::{BStmtChunk, ChunkLoadError, ChunkedBCircuit, WireSchedule},
 };
 use volar_ir_common::StorageId;
 
@@ -661,8 +664,8 @@ where
 }
 
 fn cells_for_address_bits(bits: usize) -> Result<usize, StorageLayoutError> {
-    let shift = u32::try_from(bits)
-        .map_err(|_| StorageLayoutError::AddressWidthOverflow { bits })?;
+    let shift =
+        u32::try_from(bits).map_err(|_| StorageLayoutError::AddressWidthOverflow { bits })?;
     1usize
         .checked_shl(shift)
         .ok_or(StorageLayoutError::AddressWidthOverflow { bits })
@@ -1011,6 +1014,400 @@ where
     Ok(())
 }
 
+/// Caller-supplied serialization for opaque Cirrus wire values in lazy runs.
+pub trait LazyWireCodec<W> {
+    /// Codec-specific error.
+    type Error;
+    /// Encode one wire and its known-Boolean fact.
+    fn encode(&self, wire: &W, known: Option<bool>, out: &mut Vec<u8>) -> Result<(), Self::Error>;
+    /// Decode one wire and its known-Boolean fact.
+    fn decode(&self, bytes: &[u8]) -> Result<(W, Option<bool>), Self::Error>;
+}
+
+/// The mandatory authenticated scratch adapter used by chunked Boolar runs.
+pub struct AuthenticatedWireScratch<S, C> {
+    scratch: EncryptedScratch<S>,
+    codec: C,
+}
+
+impl<S, C> AuthenticatedWireScratch<S, C> {
+    /// Combine caller-defined wire encoding with XChaCha20-Poly1305 scratch.
+    #[must_use]
+    pub fn new(scratch: EncryptedScratch<S>, codec: C) -> Self {
+        Self { scratch, codec }
+    }
+}
+
+/// Error returned by the bounded chunked interpreter.
+#[derive(Debug)]
+pub enum LazyExecuteError<ContextError, SourceError, ChunkCodecError, ScratchError, WireCodecError>
+{
+    /// Existing Boolar execution or storage validation failed.
+    Execute(ExecuteError<ContextError>),
+    /// Fetching, digest checking, decoding, or range checking a chunk failed.
+    Chunk(ChunkLoadError<SourceError, ChunkCodecError>),
+    /// AEAD-protected scratch rejected a record.
+    Scratch(lazy_repo_crypto::ScratchError<ScratchError>),
+    /// Caller-defined wire serialization failed.
+    WireCodec(WireCodecError),
+    /// The root liveness schedule and streamed circuit disagree.
+    InvalidManifest,
+}
+
+struct ChunkedValues<'a, W, S, C> {
+    schedule: &'a WireSchedule,
+    values: Vec<Option<Value<W>>>,
+    spilled: Vec<bool>,
+    resident: usize,
+    capacity: usize,
+    scratch: &'a mut AuthenticatedWireScratch<S, C>,
+}
+
+impl<'a, W: Clone, S: ScratchStore, C: LazyWireCodec<W>> ChunkedValues<'a, W, S, C> {
+    fn new(
+        schedule: &'a WireSchedule,
+        variable_count: usize,
+        inputs: &[W],
+        scratch: &'a mut AuthenticatedWireScratch<S, C>,
+    ) -> Result<Self, LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        if schedule.last_use.len() != variable_count || schedule.release_at.is_empty() {
+            return Err(LazyExecuteError::InvalidManifest);
+        }
+        let capacity = schedule.persistent_wires() as usize;
+        if capacity == 0 {
+            return Err(LazyExecuteError::InvalidManifest);
+        }
+        let mut result = Self {
+            schedule,
+            values: (0..variable_count).map(|_| None).collect(),
+            spilled: alloc::vec![false; variable_count],
+            resident: 0,
+            capacity,
+            scratch,
+        };
+        for (index, wire) in inputs.iter().cloned().enumerate() {
+            if schedule.last_use[index] != 0 {
+                result.insert(IRVarId(index as u32), Value { wire, known: None })?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn scratch_put(
+        &mut self,
+        variable: IRVarId,
+        value: &Value<W>,
+    ) -> Result<(), LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        let mut bytes = Vec::new();
+        self.scratch
+            .codec
+            .encode(&value.wire, value.known, &mut bytes)
+            .map_err(LazyExecuteError::WireCodec)?;
+        self.scratch
+            .scratch
+            .put(ScratchSlot(variable.0), &bytes)
+            .map_err(LazyExecuteError::Scratch)
+    }
+
+    fn make_room(&mut self) -> Result<(), LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        if self.resident < self.capacity {
+            return Ok(());
+        }
+        let index = self
+            .values
+            .iter()
+            .position(Option::is_some)
+            .ok_or(LazyExecuteError::InvalidManifest)?;
+        let value = self.values[index]
+            .take()
+            .ok_or(LazyExecuteError::InvalidManifest)?;
+        self.scratch_put(IRVarId(index as u32), &value)?;
+        self.spilled[index] = true;
+        self.resident -= 1;
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        variable: IRVarId,
+        value: Value<W>,
+    ) -> Result<(), LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        let index = variable.0 as usize;
+        if index >= self.values.len() || self.values[index].is_some() || self.spilled[index] {
+            return Err(LazyExecuteError::InvalidManifest);
+        }
+        self.make_room()?;
+        self.values[index] = Some(value);
+        self.resident += 1;
+        Ok(())
+    }
+
+    fn get(
+        &mut self,
+        variable: IRVarId,
+    ) -> Result<Value<W>, LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        let index = variable.0 as usize;
+        let Some(present) = self.values.get(index) else {
+            return Err(LazyExecuteError::InvalidManifest);
+        };
+        if let Some(value) = present {
+            return Ok(value.clone());
+        }
+        if !self.spilled.get(index).copied().unwrap_or(false) {
+            return Err(LazyExecuteError::InvalidManifest);
+        }
+        let bytes = self
+            .scratch
+            .scratch
+            .take(ScratchSlot(variable.0))
+            .map_err(LazyExecuteError::Scratch)?;
+        let (wire, known) = self
+            .scratch
+            .codec
+            .decode(&bytes)
+            .map_err(LazyExecuteError::WireCodec)?;
+        let value = Value { wire, known };
+        // `take` removes the encrypted record, so restore it immediately;
+        // the returned clone is only a temporary operand wire.
+        self.scratch_put(variable, &value)?;
+        Ok(value)
+    }
+
+    fn release(
+        &mut self,
+        position: u32,
+    ) -> Result<(), LazyExecuteError<(), (), (), S::Error, C::Error>> {
+        let variables = self
+            .schedule
+            .release_at
+            .get(position as usize)
+            .ok_or(LazyExecuteError::InvalidManifest)?;
+        for variable in variables.iter().copied() {
+            let index = variable as usize;
+            if let Some(value) = self.values.get_mut(index).and_then(Option::take) {
+                drop(value);
+                self.resident -= 1;
+            } else if self.spilled.get(index).copied().unwrap_or(false) {
+                self.scratch
+                    .scratch
+                    .remove(ScratchSlot(variable))
+                    .map_err(LazyExecuteError::Scratch)?;
+                self.spilled[index] = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Execute a content-addressed Boolar circuit one decoded statement range at
+/// a time. The schedule reserves temporary operand wires, and every remaining
+/// live wire above its persistent budget is moved through authenticated scratch.
+pub fn execute_chunked<C, P, Source, ChunkSer, Scratch, WireSer>(
+    context: &mut C,
+    circuit: &ChunkedBCircuit,
+    repository: &mut Repository<Source>,
+    chunk_codec: &ChunkSer,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, C::Storage>],
+    scratch: &mut AuthenticatedWireScratch<Scratch, WireSer>,
+) -> Result<
+    Vec<Wire<C>>,
+    LazyExecuteError<C::Error, Source::Error, ChunkSer::Error, Scratch::Error, WireSer::Error>,
+>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    P: Clone,
+    Source: lazy_repo::ChunkSource,
+    ChunkSer: ChunkCodec<BStmtChunk<P>>,
+    Scratch: ScratchStore,
+    WireSer: LazyWireCodec<Wire<C>>,
+    Wire<C>: Clone,
+{
+    if inputs.len() != circuit.params as usize {
+        return Err(LazyExecuteError::Execute(ExecuteError::InputArity {
+            expected: circuit.params as usize,
+            found: inputs.len(),
+        }));
+    }
+    // Reuse the eager static-data installer against a header-only circuit;
+    // it needs no statement body to install pre-init segments.
+    let header: BCircuit<P> = BCircuit {
+        params: circuit.params,
+        stmts: Vec::new(),
+        pre_init: circuit.pre_init.clone(),
+        outputs: Vec::new(),
+    };
+    initialize_storage(context, &header, banks).map_err(LazyExecuteError::Execute)?;
+    let statement_count = circuit.statement_count();
+    let variable_count = circuit
+        .params
+        .checked_add(statement_count)
+        .ok_or(LazyExecuteError::InvalidManifest)? as usize;
+    let mut values = ChunkedValues::new(&circuit.wire_schedule, variable_count, inputs, scratch)
+        .map_err(|error| match error {
+            LazyExecuteError::Scratch(error) => LazyExecuteError::Scratch(error),
+            LazyExecuteError::WireCodec(error) => LazyExecuteError::WireCodec(error),
+            _ => LazyExecuteError::InvalidManifest,
+        })?;
+    let mut expected_statement = 0_u32;
+
+    for chunk_index in 0..circuit.statement_chunks.len() {
+        let decoded = circuit
+            .load_statement_chunk(repository, chunk_index, chunk_codec)
+            .map_err(LazyExecuteError::Chunk)?;
+        if decoded.value.first != expected_statement {
+            return Err(LazyExecuteError::InvalidManifest);
+        }
+        for (offset, node) in decoded.value.stmts.iter().enumerate() {
+            let statement_index = decoded
+                .value
+                .first
+                .checked_add(offset as u32)
+                .ok_or(LazyExecuteError::InvalidManifest)?;
+            let local = |error| match error {
+                LazyExecuteError::Scratch(error) => LazyExecuteError::Scratch(error),
+                LazyExecuteError::WireCodec(error) => LazyExecuteError::WireCodec(error),
+                _ => LazyExecuteError::InvalidManifest,
+            };
+            let value = match &node.kind {
+                BIrStmt::Zero => Value {
+                    wire: context
+                        .create(false)
+                        .map_err(|error| LazyExecuteError::Execute(ExecuteError::Context(error)))?,
+                    known: Some(false),
+                },
+                BIrStmt::One => Value {
+                    wire: context
+                        .create(true)
+                        .map_err(|error| LazyExecuteError::Execute(ExecuteError::Context(error)))?,
+                    known: Some(true),
+                },
+                BIrStmt::And(left, right) => apply_and(
+                    context,
+                    values.get(*left).map_err(local)?,
+                    values.get(*right).map_err(local)?,
+                )
+                .map_err(LazyExecuteError::Execute)?,
+                BIrStmt::Or(left, right) => apply_or(
+                    context,
+                    values.get(*left).map_err(local)?,
+                    values.get(*right).map_err(local)?,
+                )
+                .map_err(LazyExecuteError::Execute)?,
+                BIrStmt::Xor(left, right) => apply_xor(
+                    context,
+                    values.get(*left).map_err(local)?,
+                    values.get(*right).map_err(local)?,
+                )
+                .map_err(LazyExecuteError::Execute)?,
+                BIrStmt::Not(input) => {
+                    // A cached `one` would be an unplanned resident wire.
+                    // Create and discard it within this scheduled operation.
+                    let mut one = None;
+                    apply_not(context, values.get(*input).map_err(local)?, &mut one)
+                        .map_err(LazyExecuteError::Execute)?
+                }
+                BIrStmt::StorageRead {
+                    storage,
+                    lane,
+                    addr,
+                } => {
+                    let address: Vec<_> = addr
+                        .iter()
+                        .map(|id| values.get(*id).map_err(local))
+                        .collect::<Result<_, _>>()?;
+                    let bank = find_bank(banks, *storage, *lane).ok_or(
+                        LazyExecuteError::Execute(ExecuteError::MissingStorageBank {
+                            storage: *storage,
+                            lane: *lane,
+                        }),
+                    )?;
+                    validate_address_width(
+                        *storage,
+                        *lane,
+                        address.len(),
+                        banks[bank].address_bits,
+                    )
+                    .map_err(LazyExecuteError::Execute)?;
+                    Value {
+                        wire: context
+                            .storage_read(banks[bank].value, &storage_address(&address))
+                            .map_err(|error| {
+                                LazyExecuteError::Execute(ExecuteError::Context(error))
+                            })?,
+                        known: None,
+                    }
+                }
+                BIrStmt::StorageWrite {
+                    storage,
+                    lane,
+                    src,
+                    addr,
+                } => {
+                    let source = values.get(*src).map_err(local)?;
+                    let address: Vec<_> = addr
+                        .iter()
+                        .map(|id| values.get(*id).map_err(local))
+                        .collect::<Result<_, _>>()?;
+                    let bank = find_bank(banks, *storage, *lane).ok_or(
+                        LazyExecuteError::Execute(ExecuteError::MissingStorageBank {
+                            storage: *storage,
+                            lane: *lane,
+                        }),
+                    )?;
+                    validate_address_width(
+                        *storage,
+                        *lane,
+                        address.len(),
+                        banks[bank].address_bits,
+                    )
+                    .map_err(LazyExecuteError::Execute)?;
+                    context
+                        .storage_write(banks[bank].value, &storage_address(&address), source.wire)
+                        .map_err(|error| LazyExecuteError::Execute(ExecuteError::Context(error)))?;
+                    Value {
+                        wire: context.create(false).map_err(|error| {
+                            LazyExecuteError::Execute(ExecuteError::Context(error))
+                        })?,
+                        known: Some(false),
+                    }
+                }
+                _ => {
+                    return Err(LazyExecuteError::Execute(
+                        ExecuteError::UnsupportedStatement,
+                    ));
+                }
+            };
+            let variable = circuit
+                .params
+                .checked_add(statement_index)
+                .ok_or(LazyExecuteError::InvalidManifest)?;
+            values.insert(IRVarId(variable), value).map_err(local)?;
+            values
+                .release(statement_index.saturating_add(1))
+                .map_err(local)?;
+            expected_statement = expected_statement.saturating_add(1);
+        }
+    }
+    if expected_statement != statement_count {
+        return Err(LazyExecuteError::InvalidManifest);
+    }
+    circuit
+        .outputs
+        .iter()
+        .map(|output| {
+            values
+                .get(*output)
+                .map(|value| value.wire)
+                .map_err(|error| match error {
+                    LazyExecuteError::Scratch(error) => LazyExecuteError::Scratch(error),
+                    LazyExecuteError::WireCodec(error) => LazyExecuteError::WireCodec(error),
+                    _ => LazyExecuteError::InvalidManifest,
+                })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 extern crate std;
 
@@ -1023,7 +1420,10 @@ mod tests {
     };
     use cirrus_recompile_core::{Recorder, interpret};
     use core::convert::Infallible;
+    use lazy_repo::{CacheConfig, ContentId, MemorySource};
+    use std::{cell::RefCell, collections::BTreeMap};
     use volar_ir::boolar::BIrPreInitSegment;
+    use volar_ir::lazy::{BStmtChunk, chunk_b_circuit};
     use volar_ir_common::Node;
 
     #[test]
@@ -1539,5 +1939,112 @@ mod tests {
         assert_eq!(outputs, [true]);
         assert_eq!(storage.cells, [false, true, false, false]);
         assert_eq!((storage.reads, storage.writes), (1, 1));
+    }
+
+    #[derive(Default)]
+    struct TestChunkCodec(RefCell<Vec<BStmtChunk<()>>>);
+
+    impl ChunkCodec<BStmtChunk<()>> for TestChunkCodec {
+        type Error = Infallible;
+
+        fn encode(&self, value: &BStmtChunk<()>, out: &mut Vec<u8>) -> Result<(), Self::Error> {
+            let mut chunks = self.0.borrow_mut();
+            let index = chunks.len() as u8;
+            chunks.push(value.clone());
+            out.push(index);
+            Ok(())
+        }
+
+        fn decode(&self, bytes: &[u8]) -> Result<BStmtChunk<()>, Self::Error> {
+            Ok(self.0.borrow()[bytes[0] as usize].clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestScratch(BTreeMap<ScratchSlot, Vec<u8>>);
+
+    impl ScratchStore for TestScratch {
+        type Error = Infallible;
+
+        fn put(&mut self, slot: ScratchSlot, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.0.insert(slot, bytes.to_vec());
+            Ok(())
+        }
+
+        fn take(&mut self, slot: ScratchSlot) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.remove(&slot))
+        }
+
+        fn remove(&mut self, slot: ScratchSlot) -> Result<(), Self::Error> {
+            self.0.remove(&slot);
+            Ok(())
+        }
+    }
+
+    struct BoolWireCodec;
+
+    impl LazyWireCodec<bool> for BoolWireCodec {
+        type Error = Infallible;
+
+        fn encode(
+            &self,
+            wire: &bool,
+            known: Option<bool>,
+            out: &mut Vec<u8>,
+        ) -> Result<(), Self::Error> {
+            out.extend_from_slice(&[
+                *wire as u8,
+                known.map_or(0, |value| if value { 2 } else { 1 }),
+            ]);
+            Ok(())
+        }
+
+        fn decode(&self, bytes: &[u8]) -> Result<(bool, Option<bool>), Self::Error> {
+            Ok((
+                bytes[0] != 0,
+                match bytes[1] {
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => None,
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn chunked_runner_spills_wires_and_matches_eager_boolar() {
+        let circuit = circuit(1, vec![BIrStmt::Not(IRVarId(0))], vec![IRVarId(1)]);
+        let codec = TestChunkCodec::default();
+        let mut source = MemorySource::default();
+        let lazy = chunk_b_circuit(&circuit, 1, 3, &codec, &mut source).unwrap();
+        let mut repository = Repository::new(
+            source,
+            CacheConfig {
+                max_resident_bytes: 8,
+                max_chunk_bytes: 8,
+            },
+        );
+        let encrypted = EncryptedScratch::new(
+            TestScratch::default(),
+            [7; 32],
+            [3; 16],
+            ContentId::of(b"boolar-test"),
+            1,
+        )
+        .unwrap();
+        let mut scratch = AuthenticatedWireScratch::new(encrypted, BoolWireCodec);
+        let mut banks: [StorageBank<'_, DirectStorage>; 0] = [];
+        let output = execute_chunked::<_, (), _, _, _, _>(
+            &mut CountingContext::default(),
+            &lazy,
+            &mut repository,
+            &codec,
+            &[true],
+            &mut banks,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(output, [false]);
+        assert_eq!(repository.cache().resident_bytes(), 1);
     }
 }

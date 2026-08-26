@@ -13,3 +13,4 @@ cirrus-armv8m-ert = { path = "../../ert/cirrus-armv8m-ert" }
 cirrus-ert = { path = "../../ert/cirrus-ert" }
 rv-asm.workspace = true
 sha2 = { version = "0.11.0", default-features = false }
+lazy-repo = { path = "../../../../lazy-repo/crates/lazy-repo", default-features = false }

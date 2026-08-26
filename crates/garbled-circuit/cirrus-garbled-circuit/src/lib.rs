@@ -395,6 +395,7 @@ mod tests {
         DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit,
         ert_func as riscv_ert_func,
     };
+    use lazy_repo::{CacheConfig, ChunkCodec, ChunkSink, MemorySource, Repository};
     use rv_asm::{Inst, Reg, Xlen};
     use sha2::Sha256;
 
@@ -674,6 +675,58 @@ mod tests {
         assert_eq!(
             evaluator.bitand([0; 16], [0; 16]),
             Err(EvaluationError::Exhausted)
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    struct TableCodec;
+
+    impl ChunkCodec<[[u8; 16]; 4]> for TableCodec {
+        type Error = Infallible;
+
+        fn encode(&self, table: &[[u8; 16]; 4], out: &mut Vec<u8>) -> Result<(), Self::Error> {
+            for row in table {
+                out.extend_from_slice(row);
+            }
+            Ok(())
+        }
+
+        fn decode(&self, bytes: &[u8]) -> Result<[[u8; 16]; 4], Self::Error> {
+            let mut table = [[0; 16]; 4];
+            for (row, encoded) in table.iter_mut().zip(bytes.chunks_exact(16)) {
+                row.copy_from_slice(encoded);
+            }
+            Ok(table)
+        }
+    }
+
+    #[test]
+    fn baseline_evaluator_accepts_a_digest_checked_lazy_table() {
+        let mut tables = RecordedTables::default();
+        let mut gc = context(&mut tables);
+        let zero = gc
+            .bitand(garbler_label([0; 16]), garbler_label([0; 16]))
+            .unwrap();
+        drop(gc);
+
+        let mut source = MemorySource::default();
+        let mut bytes = Vec::new();
+        TableCodec.encode(&tables.tables[0], &mut bytes).unwrap();
+        let chunk = source.store(bytes).unwrap();
+        let mut repository = Repository::new(
+            source,
+            CacheConfig {
+                max_resident_bytes: 64,
+                max_chunk_bytes: 64,
+            },
+        );
+        let table = repository.decode(&chunk, &TableCodec).unwrap().value;
+        let mut evaluator = Evaluator::new([GarblingRecord::Table(table)].into_iter());
+        assert_eq!(
+            evaluator
+                .bitand(encoded_label([0; 16], true), encoded_label([0; 16], true))
+                .unwrap(),
+            encoded_label(zero.zero_label(), true),
         );
     }
 
