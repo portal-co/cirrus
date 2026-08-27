@@ -35,6 +35,16 @@
 
 extern crate alloc;
 
+mod typed;
+mod types;
+
+pub use typed::{
+    TypedActionTarget, TypedBinaryOp, TypedCompareOp, TypedContext, TypedExecutionError,
+    TypedExternalOp, TypedExternalRegistry, TypedOp, TypedPreparedProgram, TypedProgram,
+    TypedProgramError, execute_typed,
+};
+pub use types::{TypeError, TypeId, TypeLayout, TypeTable, VolarType};
+
 use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 use core::cmp::Reverse;
@@ -175,6 +185,13 @@ impl Program {
         self.externals.push(external);
         self.ops.push(Op::External(id));
         slot
+    }
+
+    /// Convert this Boolean trace into a [`TypedProgram`] with explicit `Bit`
+    /// metadata on every slot.  The returned program is the migration seam
+    /// for typed contexts and preserves all external occurrence metadata.
+    pub fn typed(&self) -> Result<TypedProgram, TypedProgramError> {
+        TypedProgram::from_boolean(self)
     }
 }
 

@@ -26,6 +26,10 @@
 
 extern crate alloc;
 
+mod typed;
+
+pub use typed::TypedVoleValue;
+
 use alloc::vec::Vec;
 use core::{
     convert::Infallible,

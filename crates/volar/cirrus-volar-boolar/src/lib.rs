@@ -8,6 +8,12 @@
 
 extern crate alloc;
 
+mod typed;
+mod types;
+
+pub use typed::{TypedLowerError, lower_volar_circuit};
+pub use types::{VolarTypeMap, VolarTypeMapError, lower_volar_types};
+
 use alloc::{string::String, vec::Vec};
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,

@@ -16,7 +16,10 @@
 
 use cipher::consts::U1;
 use cirrus_core::ContextWithCreate;
-use cirrus_recompile_core::Recorder;
+use cirrus_recompile_core::{
+    Recorder, TypeTable, TypedActionTarget, TypedBinaryOp, TypedContext, TypedExternalOp,
+    TypedExternalRegistry, TypedOp, TypedProgram, VolarType, execute_typed,
+};
 use cirrus_volar_boolar::{MuxTreeContext, execute as execute_boolar};
 use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext};
 use hybrid_array::Array;
@@ -27,6 +30,7 @@ use volar_spec::{
     field::Galois128,
     ot::IdealCot,
     vole::{
+        Delta,
         prove::vole_and_verifier_check,
         setup::{random_nonzero_delta, vole_commit_bit},
     },
@@ -78,6 +82,85 @@ fn sample_program() -> cirrus_recompile_core::Program {
     let b = recorder.create(false).unwrap();
     let outputs = execute_boolar(&mut recorder, &circuit, &[a, b], &mut []).unwrap();
     recorder.into_inner().finish(vec![a, b], outputs)
+}
+
+struct NoTypedExternals;
+
+impl<C: TypedContext> TypedExternalRegistry<C> for NoTypedExternals {
+    fn oracle(
+        &mut self,
+        _context: &mut C,
+        _types: &TypeTable,
+        _name: &str,
+        _args: &[C::Value],
+        _result_ty: cirrus_recompile_core::TypeId,
+        _result_index: usize,
+        _occurrence: u64,
+    ) -> Result<C::Value, C::Error> {
+        unreachable!("the typed transcript fixture contains no externals")
+    }
+
+    fn rng(
+        &mut self,
+        _context: &mut C,
+        _types: &TypeTable,
+        _name: &str,
+        _result_ty: cirrus_recompile_core::TypeId,
+        _result_index: usize,
+        _occurrence: u64,
+    ) -> Result<C::Value, C::Error> {
+        unreachable!("the typed transcript fixture contains no externals")
+    }
+
+    fn action(
+        &mut self,
+        _context: &mut C,
+        _types: &TypeTable,
+        _name: &str,
+        _args: &[C::Value],
+        _result_ty: cirrus_recompile_core::TypeId,
+        _result_index: usize,
+        _occurrence: u64,
+    ) -> Result<C::Value, C::Error> {
+        unreachable!("the typed transcript fixture contains no externals")
+    }
+
+    fn action_store(
+        &mut self,
+        _context: &mut C,
+        _types: &TypeTable,
+        _name: &str,
+        _guard: C::Value,
+        _args: &[C::Value],
+        _fallbacks: &[C::Value],
+        _result_tys: &[cirrus_recompile_core::TypeId],
+        _targets: &[TypedActionTarget],
+        _addresses: &[C::Value],
+        _occurrence: u64,
+    ) -> Result<(), C::Error> {
+        unreachable!("the typed transcript fixture contains no externals")
+    }
+}
+
+fn typed_add_program() -> TypedProgram {
+    let mut types = TypeTable::new();
+    let byte = types.push(VolarType::U8);
+    TypedProgram {
+        types,
+        ops: vec![
+            TypedOp::Constant(vec![3]),
+            TypedOp::Constant(vec![5]),
+            TypedOp::Binary {
+                op: TypedBinaryOp::Add,
+                a: cirrus_recompile_core::Idx(0),
+                b: cirrus_recompile_core::Idx(1),
+            },
+        ],
+        slot_tys: vec![byte, byte, byte],
+        inputs: vec![],
+        outputs: vec![cirrus_recompile_core::Idx(2)],
+        externals: Vec::<TypedExternalOp>::new(),
+    }
 }
 
 #[test]
@@ -151,5 +234,36 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
             !bad_ok,
             "verifier accepted a corrupted hat for ({av}, {bv})"
         );
+    }
+}
+
+#[test]
+fn typed_u8_addition_uses_the_normal_vole_transcript() {
+    let program = typed_add_program();
+    let delta = Delta {
+        delta: Array::from_fn(|_| Galois128(23)),
+    };
+    let mut hats = VecPusher::<Array<Galois128, U1>>::default();
+    let mut prover = VoleProverContext {
+        hats: &mut hats,
+        bit_to_t,
+    };
+    let mut externals = NoTypedExternals;
+    let prover_output = execute_typed(&mut prover, &program, &[], &mut externals).unwrap();
+    assert_eq!(prover_output[0].bits.len(), 8);
+
+    let mut verifier = VoleVerifierContext {
+        delta: delta.clone(),
+        hats: hats.0.clone().into_iter(),
+    };
+    let verifier_output = execute_typed(&mut verifier, &program, &[], &mut externals).unwrap();
+    for (index, (prover_bit, verifier_bit)) in prover_output[0]
+        .bits
+        .iter()
+        .zip(&verifier_output[0].bits)
+        .enumerate()
+    {
+        assert!(prover_bit.clone() * delta.clone() == *verifier_bit);
+        assert_eq!(prover_bit.u[0][0], Galois128(((8u8 >> index) & 1) as u128));
     }
 }
