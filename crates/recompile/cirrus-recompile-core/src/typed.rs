@@ -112,6 +112,13 @@ pub enum TypedOp {
     /// This is the typed-program counterpart of Volar IR's `Transmute`.
     /// It performs no context operation; validation requires equal layouts.
     Copy(Idx),
+    /// Assemble a value from individually selected source bits, in canonical
+    /// little-endian output order.
+    ///
+    /// This retains Volar IR's `Merge`, `Splat`, and `Shuffle` semantics in
+    /// the typed program rather than forcing an early conversion to Boolean
+    /// `Program` slots.
+    BitRepack(Vec<(Idx, u8)>),
     /// Apply one same-type binary operation.
     Binary {
         /// Operation selector.
@@ -308,6 +315,24 @@ impl TypedProgram {
                     return Err(TypedProgramError::TypeMismatch);
                 }
             }
+            TypedOp::BitRepack(bits) => {
+                let layout = self.types.layout(out_ty).map_err(TypedProgramError::Type)?;
+                if bits.len() != layout.bits {
+                    return Err(TypedProgramError::TypeMismatch);
+                }
+                for (value, bit) in bits {
+                    let input = type_of(*value)?;
+                    if usize::from(*bit)
+                        >= self
+                            .types
+                            .layout(input)
+                            .map_err(TypedProgramError::Type)?
+                            .bits
+                    {
+                        return Err(TypedProgramError::TypeMismatch);
+                    }
+                }
+            }
             TypedOp::Binary { a, b, .. } => {
                 if type_of(*a)? != out_ty || type_of(*b)? != out_ty {
                     return Err(TypedProgramError::TypeMismatch);
@@ -458,6 +483,14 @@ pub trait TypedContext: HasError {
         value: Self::Value,
     ) -> Result<Self::Value, Self::Error>;
 
+    /// Assemble one typed value from source bits in canonical output order.
+    fn bit_repack(
+        &mut self,
+        types: &TypeTable,
+        ty: TypeId,
+        bits: &[(Self::Value, u8)],
+    ) -> Result<Self::Value, Self::Error>;
+
     /// Compare two same-type values, returning the table's bit type.
     fn compare(
         &mut self,
@@ -585,6 +618,14 @@ where
             TypedOp::Not(input) => {
                 context.not(&program.types, out_ty, read_value(&values, *input)?)
             }
+            TypedOp::BitRepack(bits) => context.bit_repack(
+                &program.types,
+                out_ty,
+                &bits
+                    .iter()
+                    .map(|(value, bit)| Ok((read_value(&values, *value)?, *bit)))
+                    .collect::<Result<Vec<_>, TypedExecutionError<C::Error>>>()?,
+            ),
             TypedOp::Compare { op, a, b } => context.compare(
                 &program.types,
                 program.slot_ty(*a).map_err(TypedExecutionError::Program)?,
@@ -767,6 +808,21 @@ mod tests {
             value: Self::Value,
         ) -> Result<Self::Value, Self::Error> {
             Ok(!value)
+        }
+
+        fn bit_repack(
+            &mut self,
+            _types: &TypeTable,
+            _ty: TypeId,
+            bits: &[(Self::Value, u8)],
+        ) -> Result<Self::Value, Self::Error> {
+            Ok(bits
+                .iter()
+                .enumerate()
+                .take(64)
+                .fold(0u64, |value, (index, (source, bit))| {
+                    value | (((source >> *bit) & 1) << index)
+                }))
         }
 
         fn compare(
@@ -980,6 +1036,28 @@ mod tests {
         assert_eq!(
             prepared.execute(&mut context, &[], &mut NoExternals),
             Ok(alloc::vec![0x5a])
+        );
+    }
+
+    #[test]
+    fn typed_bit_repack_keeps_layout_manipulation_out_of_boolean_programs() {
+        let mut types = TypeTable::new();
+        let byte = types.push(crate::VolarType::U8);
+        let program = TypedProgram {
+            types,
+            ops: alloc::vec![
+                TypedOp::Constant(alloc::vec![0b1001_0110]),
+                TypedOp::BitRepack((0..8).rev().map(|bit| (Idx(0), bit)).collect(),),
+            ],
+            slot_tys: alloc::vec![byte, byte],
+            inputs: Vec::new(),
+            outputs: alloc::vec![Idx(1)],
+            externals: Vec::new(),
+        };
+        let mut context = U64Context;
+        assert_eq!(
+            execute_typed(&mut context, &program, &[], &mut NoExternals),
+            Ok(alloc::vec![0b0110_1001])
         );
     }
 

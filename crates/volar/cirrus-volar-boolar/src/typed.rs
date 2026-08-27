@@ -271,6 +271,26 @@ impl Builder {
         });
         id
     }
+
+    fn value_bits(&self, value: Idx) -> Result<Vec<(Idx, u8)>, TypedLowerError> {
+        let ty = *self
+            .program
+            .slot_tys
+            .get(value.get())
+            .ok_or(TypedLowerError::MissingValue(IRVarId(value.0)))?;
+        let layout = self
+            .program
+            .types
+            .layout(ty)
+            .map_err(|_| TypedLowerError::UnsupportedStatement)?;
+        (0..layout.bits)
+            .map(|bit| {
+                u8::try_from(bit)
+                    .map(|bit| (value, bit))
+                    .map_err(|_| TypedLowerError::UnsupportedStatement)
+            })
+            .collect()
+    }
 }
 
 /// Lower a straight-line, return-terminated Volar circuit to [`TypedProgram`].
@@ -353,6 +373,40 @@ pub fn lower_volar_circuit<P: Clone>(
                 *n,
                 true,
             )?),
+            IRStmt::Merge { parts, ty } => {
+                let ty = builder.source_ty(*ty)?;
+                let mut bits = Vec::new();
+                for part in parts {
+                    bits.extend(builder.value_bits(Builder::value(&values, *part)?)?);
+                }
+                ValueRef::Value(builder.push(ty, TypedOp::BitRepack(bits)))
+            }
+            IRStmt::Splat { src, ty } => {
+                let ty = builder.source_ty(*ty)?;
+                let source = Builder::value(&values, *src)?;
+                if !builder
+                    .program
+                    .types
+                    .is_bit(builder.program.slot_tys[source.get()])
+                {
+                    return Err(TypedLowerError::UnsupportedStatement);
+                }
+                let bits = alloc::vec![(source, 0); builder
+                    .program
+                    .types
+                    .layout(ty)
+                    .map_err(|_| TypedLowerError::UnsupportedStatement)?
+                    .bits];
+                ValueRef::Value(builder.push(ty, TypedOp::BitRepack(bits)))
+            }
+            IRStmt::Shuffle { result_bits, ty } => {
+                let ty = builder.source_ty(*ty)?;
+                let bits = result_bits
+                    .iter()
+                    .map(|(bit, source)| Ok((Builder::value(&values, *source)?, *bit)))
+                    .collect::<Result<Vec<_>, TypedLowerError>>()?;
+                ValueRef::Value(builder.push(ty, TypedOp::BitRepack(bits)))
+            }
             IRStmt::OracleCall {
                 name,
                 args,
@@ -518,11 +572,9 @@ pub fn lower_volar_circuit<P: Clone>(
                 );
                 ValueRef::Value(builder.push(ty, TypedOp::External(external)))
             }
-            IRStmt::StorageRead { .. }
-            | IRStmt::StorageWrite { .. }
-            | IRStmt::Merge { .. }
-            | IRStmt::Splat { .. }
-            | IRStmt::Shuffle { .. } => return Err(TypedLowerError::UnsupportedStatement),
+            IRStmt::StorageRead { .. } | IRStmt::StorageWrite { .. } => {
+                return Err(TypedLowerError::UnsupportedStatement);
+            }
             _ => return Err(TypedLowerError::UnsupportedStatement),
         };
         values.push(value);
@@ -607,5 +659,61 @@ mod tests {
             Some(TypedOp::ActionStore { .. })
         ));
         assert_eq!(program.types.layout(program.slot_tys[4]).unwrap().bits, 256);
+    }
+
+    #[test]
+    fn lowers_merge_splat_and_shuffle_as_typed_repacking() {
+        let mut types = IRTypes::new();
+        let bit = types.bit();
+        let byte = types.primitive(Type::_8);
+        let mut block = IRBlock {
+            params: alloc::vec![bit; 8],
+            stmts: Vec::new(),
+            terminator: IRTerminator::Jmp {
+                target: IRBranchTarget::new(
+                    IRBlockTargetId::Return,
+                    alloc::vec![IRVarId(8), IRVarId(9), IRVarId(10)],
+                ),
+            },
+        };
+        block.push_stmt(
+            IRStmt::Merge {
+                parts: (0..8).map(IRVarId).collect(),
+                ty: byte,
+            },
+            (),
+        );
+        block.push_stmt(
+            IRStmt::Splat {
+                src: IRVarId(0),
+                ty: byte,
+            },
+            (),
+        );
+        block.push_stmt(
+            IRStmt::Shuffle {
+                result_bits: (0..8).rev().map(|bit| (bit, IRVarId(8))).collect(),
+                ty: byte,
+            },
+            (),
+        );
+
+        let program = lower_volar_circuit(&IRBlocks::new(alloc::vec![block]), &types).unwrap();
+        assert_eq!(
+            program
+                .ops
+                .iter()
+                .filter(|op| matches!(op, TypedOp::BitRepack(_)))
+                .count(),
+            3
+        );
+        assert!(program.outputs.iter().all(|output| {
+            program
+                .types
+                .layout(program.slot_tys[output.get()])
+                .unwrap()
+                .bits
+                == 8
+        }));
     }
 }

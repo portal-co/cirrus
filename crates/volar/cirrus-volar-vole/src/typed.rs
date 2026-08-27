@@ -488,6 +488,24 @@ where
     })
 }
 
+fn repack_value<W: Clone>(
+    types: &TypeTable,
+    ty: TypeId,
+    bits: &[(TypedVoleValue<W>, u8)],
+) -> TypedVoleValue<W> {
+    assert_eq!(
+        bits.len(),
+        layout_bits(types, ty),
+        "typed program validation guarantees a complete bit repack"
+    );
+    TypedVoleValue {
+        bits: bits
+            .iter()
+            .map(|(value, bit)| value.bits[usize::from(*bit)].clone())
+            .collect(),
+    }
+}
+
 impl<N, T> TypedContext for VoleProverContext<'_, '_, N, T>
 where
     N: VoleArray<T>,
@@ -524,6 +542,15 @@ where
         Ok(TypedVoleValue {
             bits: not_bits(self, &value.bits)?,
         })
+    }
+
+    fn bit_repack(
+        &mut self,
+        types: &TypeTable,
+        ty: TypeId,
+        bits: &[(Self::Value, u8)],
+    ) -> Result<Self::Value, Self::Error> {
+        Ok(repack_value(types, ty, bits))
     }
 
     fn compare(
@@ -588,6 +615,15 @@ where
         Ok(TypedVoleValue {
             bits: not_bits(self, &value.bits)?,
         })
+    }
+
+    fn bit_repack(
+        &mut self,
+        types: &TypeTable,
+        ty: TypeId,
+        bits: &[(Self::Value, u8)],
+    ) -> Result<Self::Value, Self::Error> {
+        Ok(repack_value(types, ty, bits))
     }
 
     fn compare(
