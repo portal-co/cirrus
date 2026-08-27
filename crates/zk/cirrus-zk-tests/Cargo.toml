@@ -20,3 +20,6 @@ cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-reco
 cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }
 cirrus-r1cs-backend = { version = "0.1.0", path = "../cirrus-r1cs-backend" }
 cirrus-groth16 = { version = "0.1.0", path = "../cirrus-groth16" }
+cirrus-volar-boolar = { version = "0.1.0", path = "../../volar/cirrus-volar-boolar" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }

@@ -44,7 +44,7 @@ pub trait BeaverMul<Val>:
         am: Self::Wrapped,
         bm: Self::Wrapped,
         beaver: [Self::Wrapped; 3],
-    ) -> Result<Self::Wrapped,Self::Error> {
+    ) -> Result<Self::Wrapped, Self::Error> {
         let [a, b, c] = beaver;
         let d = opening.open(self.sub(am, a.clone())?);
         let e = opening.open(self.sub(bm, b.clone())?);

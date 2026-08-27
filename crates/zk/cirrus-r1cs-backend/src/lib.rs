@@ -34,7 +34,7 @@ use ark_r1cs_std::prelude::*;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
-    ContextWithValue, HasError,
+    ContextWithStorage, ContextWithValue, HasError, StorageAddressBit,
 };
 
 pub mod circuit;
@@ -110,4 +110,54 @@ impl<F: PrimeField> ContextWithMux<bool> for R1csBackend<F> {
     ) -> Result<Boolean<F>, SynthesisError> {
         cond.select(&then, &r#else)
     }
+}
+
+/// Dense symbolic storage for the Boolar R1CS host. The caller chooses the
+/// lane capacity; reads and writes are constrained with a one-hot MUX/demux
+/// tree and therefore work even for secret addresses.
+impl<F: PrimeField> ContextWithStorage<bool> for R1csBackend<F> {
+    type Storage = [Boolean<F>];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Boolean<F>>],
+    ) -> Result<Boolean<F>, Self::Error> {
+        let mut result = Boolean::constant(false);
+        for (index, cell) in storage.iter().enumerate() {
+            let selector = storage_selector(address, index)?;
+            result = &result ^ &(&selector & cell);
+        }
+        Ok(result)
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Boolean<F>>],
+        value: Boolean<F>,
+    ) -> Result<(), Self::Error> {
+        for (index, cell) in storage.iter_mut().enumerate() {
+            let selector = storage_selector(address, index)?;
+            *cell = selector.select(&value, cell)?;
+        }
+        Ok(())
+    }
+}
+
+fn storage_selector<F: PrimeField>(
+    address: &[StorageAddressBit<Boolean<F>>],
+    index: usize,
+) -> Result<Boolean<F>, SynthesisError> {
+    let mut selector = Boolean::constant(true);
+    for (bit, address_bit) in address.iter().enumerate() {
+        let expected = (index >> bit) & 1 != 0;
+        let actual = if expected {
+            address_bit.wire.clone()
+        } else {
+            !address_bit.wire.clone()
+        };
+        selector = &selector & &actual;
+    }
+    Ok(selector)
 }

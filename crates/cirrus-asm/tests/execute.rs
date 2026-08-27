@@ -11,7 +11,9 @@
 #![cfg(target_arch = "aarch64")]
 
 use cirrus_asm::recompile::{PinnedAddresses, compile_aarch64, compile_prepared_aarch64};
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
+};
 use cirrus_recompile_core::{
     Idx, LoopInvocation, OptimizationOptions, PreparedLoop, PreparedOp, PreparedProgram,
     PreparedSlot, Recorder, Statement, StatementRange, interpret_prepared,
@@ -165,7 +167,10 @@ fn compiled_aarch64_executes_nested_table_scopes() {
         vec![
             Statement::Loop(PreparedLoop {
                 body: StatementRange::new(1, 3),
-                invocations: vec![LoopInvocation { first_row: 0, iterations: 2 }],
+                invocations: vec![LoopInvocation {
+                    first_row: 0,
+                    iterations: 2,
+                }],
                 fields_per_iteration: 1,
                 table: vec![2, 3],
             }),
@@ -177,8 +182,14 @@ fn compiled_aarch64_executes_nested_table_scopes() {
             Statement::Loop(PreparedLoop {
                 body: StatementRange::new(3, 4),
                 invocations: vec![
-                    LoopInvocation { first_row: 0, iterations: 1 },
-                    LoopInvocation { first_row: 1, iterations: 1 },
+                    LoopInvocation {
+                        first_row: 0,
+                        iterations: 1,
+                    },
+                    LoopInvocation {
+                        first_row: 1,
+                        iterations: 1,
+                    },
                 ],
                 fields_per_iteration: 1,
                 table: vec![4, 5],

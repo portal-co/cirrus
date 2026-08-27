@@ -103,12 +103,9 @@ pub fn deloopify_early_exits<'ctx>(function: FunctionValue<'ctx>) -> bool {
             let body = natural_loop_body(*header, latch, &predecessors);
             // Reject nested loops: another back edge whose header sits
             // strictly inside this loop's body.
-            if back_edges
-                .iter()
-                .any(|(other_latch, other_header)| {
-                    *other_header != *header && *other_latch != latch && body.contains(other_header)
-                })
-            {
+            if back_edges.iter().any(|(other_latch, other_header)| {
+                *other_header != *header && *other_latch != latch && body.contains(other_header)
+            }) {
                 continue;
             }
             if let Some(site) = classify(*header, latch, &body, &successors) {
@@ -183,7 +180,10 @@ fn find_back_edges<'ctx>(
                 back_edges.push((node, successor));
             } else if visited.insert(successor) {
                 on_stack.insert(successor);
-                stack.push((successor, successors.get(&successor).unwrap_or(&empty).iter()));
+                stack.push((
+                    successor,
+                    successors.get(&successor).unwrap_or(&empty).iter(),
+                ));
             }
         } else {
             on_stack.remove(&node);
@@ -397,7 +397,9 @@ fn first_non_phi_position(block: BasicBlock<'_>) -> InstructionValue<'_> {
             return instruction;
         }
     }
-    block.get_terminator().expect("every block has a terminator")
+    block
+        .get_terminator()
+        .expect("every block has a terminator")
 }
 
 fn rewrite(site: &RecognizedSite<'_>) {
@@ -420,7 +422,8 @@ fn rewrite(site: &RecognizedSite<'_>) {
     } else {
         (acc_phi.as_basic_value(), site.exit_value)
     };
-    let Ok(select_result) = builder.build_select(condition, then_value, else_value, "deloopify.select")
+    let Ok(select_result) =
+        builder.build_select(condition, then_value, else_value, "deloopify.select")
     else {
         return;
     };
@@ -457,7 +460,9 @@ fn predecessors_excluding<'ctx>(
     function
         .get_basic_blocks()
         .into_iter()
-        .filter(|candidate| *candidate != excluded && terminator_successors(*candidate).contains(&block))
+        .filter(|candidate| {
+            *candidate != excluded && terminator_successors(*candidate).contains(&block)
+        })
         .collect()
 }
 

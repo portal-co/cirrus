@@ -17,7 +17,7 @@ use core::{convert::Infallible, fmt, marker::PhantomData};
 
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
-    ContextWithValue, HasError, Pusher,
+    ContextWithStorage, ContextWithValue, HasError, Pusher, StorageAddressBit,
 };
 use digest::{Digest, array::Array};
 use volar_spec::{
@@ -107,10 +107,37 @@ impl<D: Digest, N: VoleArray<u8>> ContextWithBitOr<bool> for VolarGarbleBackend<
     }
 }
 impl<D: Digest, N: VoleArray<u8>> ContextWithMux<bool> for VolarGarbleBackend<'_, '_, D, N> {
-    fn mux(&mut self, cond: Garble<N>, then: Garble<N>, r#else: Garble<N>) -> Result<Garble<N>, Infallible> {
+    fn mux(
+        &mut self,
+        cond: Garble<N>,
+        then: Garble<N>,
+        r#else: Garble<N>,
+    ) -> Result<Garble<N>, Infallible> {
         let diff = self.bitxor(then, r#else.clone())?;
         let masked = self.bitand(cond, diff)?;
         self.bitxor(r#else, masked)
+    }
+}
+
+impl<D: Digest, N: VoleArray<u8>> ContextWithStorage<bool> for VolarGarbleBackend<'_, '_, D, N> {
+    type Storage = [Garble<N>];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+    ) -> Result<Garble<N>, Self::Error> {
+        Ok(storage[concrete_storage_index(address)].clone())
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+        value: Garble<N>,
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
     }
 }
 
@@ -230,9 +257,58 @@ impl<D: Digest, I, N: VoleArray<u8>> ContextWithMux<bool> for VolarEvalBackend<D
 where
     I: Iterator<Item = GarbleTable<N>>,
 {
-    fn mux(&mut self, cond: Eval<N>, then: Eval<N>, r#else: Eval<N>) -> Result<Eval<N>, VolarEvalError> {
+    fn mux(
+        &mut self,
+        cond: Eval<N>,
+        then: Eval<N>,
+        r#else: Eval<N>,
+    ) -> Result<Eval<N>, VolarEvalError> {
         let diff = self.bitxor(then, r#else.clone())?;
         let masked = self.bitand(cond, diff)?;
         self.bitxor(r#else, masked)
     }
+}
+
+impl<D: Digest, I, N: VoleArray<u8>> ContextWithStorage<bool> for VolarEvalBackend<D, I, N>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+{
+    type Storage = [Eval<N>];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Eval<N>>],
+    ) -> Result<Eval<N>, Self::Error> {
+        Ok(storage[concrete_storage_index(address)].clone())
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Eval<N>>],
+        value: Eval<N>,
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
+fn concrete_storage_index<W>(address: &[StorageAddressBit<W>]) -> usize {
+    address
+        .iter()
+        .enumerate()
+        .fold(0usize, |index, (bit, address_bit)| {
+            if address_bit
+                .known
+                .expect("ERT storage addresses are concrete")
+            {
+                index
+                    | (1usize
+                        .checked_shl(bit as u32)
+                        .expect("ERT storage address exceeds usize width"))
+            } else {
+                index
+            }
+        })
 }

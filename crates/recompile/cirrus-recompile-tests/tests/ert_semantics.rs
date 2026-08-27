@@ -48,10 +48,26 @@ fn encode(instructions: impl IntoIterator<Item = Inst>) -> Vec<u8> {
 /// concrete values" contract requires.
 fn program_image() -> Vec<u8> {
     encode([
-        Inst::Add { dest: Reg::A2, src1: Reg::A0, src2: Reg::A1 },
-        Inst::And { dest: Reg::A3, src1: Reg::A0, src2: Reg::A1 },
-        Inst::Xor { dest: Reg::A4, src1: Reg::A0, src2: Reg::A1 },
-        Inst::Addi { imm: Imm::new_i32(-1), dest: Reg::A0, src1: Reg::ZERO },
+        Inst::Add {
+            dest: Reg::A2,
+            src1: Reg::A0,
+            src2: Reg::A1,
+        },
+        Inst::And {
+            dest: Reg::A3,
+            src1: Reg::A0,
+            src2: Reg::A1,
+        },
+        Inst::Xor {
+            dest: Reg::A4,
+            src1: Reg::A0,
+            src2: Reg::A1,
+        },
+        Inst::Addi {
+            imm: Imm::new_i32(-1),
+            dest: Reg::A0,
+            src1: Reg::ZERO,
+        },
         Inst::Ecall,
     ])
 }
@@ -67,6 +83,7 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
     let mut reg_consts = [None; 32];
     let mut rstack = [0u32; 8];
     let mut vstack = [false; 128];
+    let storage_bits = vstack.len();
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
             context: (),
@@ -74,11 +91,12 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
         },
     };
 
-    let results = ert_func::<_, _, 2, 5>(
+    let results = ert_func::<_, _, 2, 5, _>(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(mem),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut reg_consts,
@@ -88,7 +106,11 @@ fn native_golden(mem: &[u8], a: u32, b: u32) -> (u32, u32, u32) {
     )
     .unwrap_or_else(|_| panic!("native ERT execution of the fixture program must succeed"));
 
-    (value(&results[2].0), value(&results[3].0), value(&results[4].0))
+    (
+        value(&results[2].0),
+        value(&results[3].0),
+        value(&results[4].0),
+    )
 }
 
 fn no_hash_idx<C>(_: &mut C, _: &[[Idx; 32]]) -> Result<[u8; 32], <Recorder as HasError>::Error> {
@@ -110,6 +132,7 @@ fn record_program(mem: &[u8]) -> Program {
     let mut reg_consts = [None; 32];
     let mut rstack = [0u32; 8];
     let mut vstack = [Idx(0); 128];
+    let storage_bits = vstack.len();
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
             context: recorder,
@@ -117,11 +140,12 @@ fn record_program(mem: &[u8]) -> Program {
         },
     };
 
-    let results = ert_func::<_, _, 2, 5>(
+    let results = ert_func::<_, _, 2, 5, _>(
         &mut handler,
+        &mut vstack,
+        storage_bits,
         RawMemory::from(mem),
         &mut rstack,
-        &mut vstack,
         0,
         &mut regs,
         &mut reg_consts,
@@ -157,7 +181,9 @@ fn bits_of(program: &Program, a: u32, b: u32) -> Vec<bool> {
 
 fn triple_of(outputs: &[bool]) -> (u32, u32, u32) {
     let word_at = |offset: usize| -> u32 {
-        (0..32).fold(0u32, |acc, bit| acc | ((outputs[offset + bit] as u32) << bit))
+        (0..32).fold(0u32, |acc, bit| {
+            acc | ((outputs[offset + bit] as u32) << bit)
+        })
     };
     (word_at(0), word_at(32), word_at(64))
 }
@@ -171,7 +197,11 @@ fn recorded_ert_program_matches_native_execution_via_ir_interpreter() {
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
         let outputs = cirrus_recompile_core::interpret(&program, &bits_of(&program, a, b));
-        assert_eq!(triple_of(&outputs), golden, "interpret() mismatch for ({a:#x}, {b:#x})");
+        assert_eq!(
+            triple_of(&outputs),
+            golden,
+            "interpret() mismatch for ({a:#x}, {b:#x})"
+        );
     }
 }
 
@@ -181,8 +211,13 @@ fn recorded_ert_program_matches_native_execution_via_pinned_rt() {
     let program = record_program(&mem);
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
-        let outputs = cirrus_recompile_rt::execute(&mut (), &program, &bits_of(&program, a, b)).unwrap();
-        assert_eq!(triple_of(&outputs), golden, "cirrus_recompile_rt::execute mismatch for ({a:#x}, {b:#x})");
+        let outputs =
+            cirrus_recompile_rt::execute(&mut (), &program, &bits_of(&program, a, b)).unwrap();
+        assert_eq!(
+            triple_of(&outputs),
+            golden,
+            "cirrus_recompile_rt::execute mismatch for ({a:#x}, {b:#x})"
+        );
     }
 }
 
@@ -198,7 +233,11 @@ fn recorded_ert_program_matches_native_execution_via_rust_backend() {
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
         let outputs = compiled.run_plaintext(&program, &bits_of(&program, a, b));
-        assert_eq!(triple_of(&outputs), golden, "Rust backend mismatch for ({a:#x}, {b:#x})");
+        assert_eq!(
+            triple_of(&outputs),
+            golden,
+            "Rust backend mismatch for ({a:#x}, {b:#x})"
+        );
     }
 }
 
@@ -226,7 +265,11 @@ fn recorded_ert_program_matches_native_execution_via_llvm_backend() {
     for &(a, b) in &CASES {
         let golden = native_golden(&mem, a, b);
         let outputs = compiled.run_plaintext(&program, &bits_of(&program, a, b));
-        assert_eq!(triple_of(&outputs), golden, "LLVM backend mismatch for ({a:#x}, {b:#x})");
+        assert_eq!(
+            triple_of(&outputs),
+            golden,
+            "LLVM backend mismatch for ({a:#x}, {b:#x})"
+        );
     }
 }
 
@@ -290,6 +333,10 @@ fn recorded_ert_program_matches_native_execution_via_asm_backend() {
         }
         unsafe { exec.call(&mut () as *mut (), buf.as_mut_ptr()) };
         let outputs: Vec<bool> = program.outputs.iter().map(|idx| buf[idx.get()]).collect();
-        assert_eq!(triple_of(&outputs), golden, "asm backend mismatch for ({a:#x}, {b:#x})");
+        assert_eq!(
+            triple_of(&outputs),
+            golden,
+            "asm backend mismatch for ({a:#x}, {b:#x})"
+        );
     }
 }

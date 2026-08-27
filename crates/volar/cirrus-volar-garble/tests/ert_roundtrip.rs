@@ -11,7 +11,7 @@ use std::convert::Infallible;
 
 use cipher::consts::U16;
 use cirrus_ert::{DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit};
-use cirrus_volar_garble::{VolarEvalBackend, VolarGarbleBackend, VolarEvalError};
+use cirrus_volar_garble::{VolarEvalBackend, VolarEvalError, VolarGarbleBackend};
 use hybrid_array::Array;
 use rv_asm::{Inst, Reg, Xlen};
 use sha2::Sha256;
@@ -90,9 +90,10 @@ fn ert_add_garbles_and_evaluates_to_the_native_sum() {
 
     let garbled = ert_emit(
         &mut handler,
+        &mut garbled_vstack,
+        64,
         RawMemory::from(instructions.as_slice()),
         &mut garbled_rstack,
-        &mut garbled_vstack,
         0,
         &mut garbled_registers,
         &mut garbled_constants,
@@ -129,16 +130,20 @@ fn ert_add_garbles_and_evaluates_to_the_native_sum() {
 
     let evaluated = ert_emit(
         &mut evaluator_handler,
+        &mut evaluated_vstack,
+        64,
         RawMemory::from(instructions.as_slice()),
         &mut evaluated_rstack,
-        &mut evaluated_vstack,
         0,
         &mut evaluated_registers,
         &mut evaluated_constants,
         evaluator_zero,
         evaluator_one,
     );
-    assert!(evaluated.is_ok(), "evaluation consumes every add table in order");
+    assert!(
+        evaluated.is_ok(),
+        "evaluation consumes every add table in order"
+    );
 
     let expected = left_value.wrapping_add(right_value);
     for bit in 0..32 {

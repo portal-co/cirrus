@@ -1106,11 +1106,7 @@ fn signed_to_mod(value: i64, modulus: u64) -> u64 {
 
 fn add_mod(left: u64, right: u64, modulus: u64) -> u64 {
     let sum = left + right;
-    if sum >= modulus {
-        sum - modulus
-    } else {
-        sum
-    }
+    if sum >= modulus { sum - modulus } else { sum }
 }
 
 fn sub_mod(left: u64, right: u64, modulus: u64) -> u64 {
@@ -1159,9 +1155,9 @@ fn inverse_mod(value: u64, modulus: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_mod, mul_mod, BatchSelect, Error, NoiseSource, Ntt, Parameters, RandomSource, Ring,
-        ZeroNoise, REFERENCE_DELTA, REFERENCE_PARAMETERS, REFERENCE_PLAINTEXT_MODULUS,
-        SMALL_NOISE_MAX_DEVIATION, SMALL_NOISE_STANDARD_DEVIATION,
+        BatchSelect, Error, NoiseSource, Ntt, Parameters, REFERENCE_DELTA, REFERENCE_PARAMETERS,
+        REFERENCE_PLAINTEXT_MODULUS, RandomSource, Ring, SMALL_NOISE_MAX_DEVIATION,
+        SMALL_NOISE_STANDARD_DEVIATION, ZeroNoise, add_mod, mul_mod,
     };
 
     #[derive(Clone, Copy)]

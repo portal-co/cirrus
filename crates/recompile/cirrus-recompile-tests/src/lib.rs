@@ -26,7 +26,7 @@ use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
     ContextWithValue, HasError,
 };
-use cirrus_garbled_circuit::{EvaluationError, GarblingRecord, Label, GC, Evaluator};
+use cirrus_garbled_circuit::{EvaluationError, Evaluator, GC, GarblingRecord, Label};
 use digest::Digest;
 
 /// Byte width of a garbled-wire label these backends use.
@@ -112,7 +112,12 @@ impl<D: Digest, const N: usize> ContextWithBitXor<bool> for GcBackend<'_, '_, D,
 }
 
 impl<D: Digest, const N: usize> ContextWithMux<bool> for GcBackend<'_, '_, D, N> {
-    fn mux(&mut self, cond: Label<N>, then: Label<N>, r#else: Label<N>) -> Result<Label<N>, Infallible> {
+    fn mux(
+        &mut self,
+        cond: Label<N>,
+        then: Label<N>,
+        r#else: Label<N>,
+    ) -> Result<Label<N>, Infallible> {
         let diff = ContextWithBitXor::bitxor(&mut self.gc, then, r#else)?;
         let masked = ContextWithBitAnd::bitand(&mut self.gc, cond, diff)?;
         ContextWithBitXor::bitxor(&mut self.gc, r#else, masked)
@@ -123,7 +128,8 @@ impl<D: Digest, const N: usize> ContextWithMux<bool> for GcBackend<'_, '_, D, N>
 /// `cirrus_recompile_rt::define_pinned_backend!` (which needs a plain
 /// `Ty<'lifetimes>` shape) has a single concrete generic parameter to
 /// substitute rather than a raw `dyn` type.
-pub type BoxedRecords<'a, const N: usize> = std::boxed::Box<dyn Iterator<Item = GarblingRecord<N>> + 'a>;
+pub type BoxedRecords<'a, const N: usize> =
+    std::boxed::Box<dyn Iterator<Item = GarblingRecord<N>> + 'a>;
 
 /// The evaluator pinned backend: wraps [`Evaluator`], adding
 /// [`ContextWithMux`] (the same identity [`GcBackend`] uses) and a
@@ -196,7 +202,12 @@ impl<const N: usize> ContextWithBitXor<bool> for EvalBackend<'_, N> {
 }
 
 impl<const N: usize> ContextWithMux<bool> for EvalBackend<'_, N> {
-    fn mux(&mut self, cond: [u8; N], then: [u8; N], r#else: [u8; N]) -> Result<[u8; N], EvaluationError> {
+    fn mux(
+        &mut self,
+        cond: [u8; N],
+        then: [u8; N],
+        r#else: [u8; N],
+    ) -> Result<[u8; N], EvaluationError> {
         let diff = ContextWithBitXor::bitxor(&mut self.evaluator, then, r#else)?;
         let masked = ContextWithBitAnd::bitand(&mut self.evaluator, cond, diff)?;
         ContextWithBitXor::bitxor(&mut self.evaluator, r#else, masked)

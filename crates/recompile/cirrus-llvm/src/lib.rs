@@ -110,6 +110,10 @@ impl<'ctx> CompiledProgram<'ctx> {
         fn_name: &str,
         pinned: &PinnedAddresses,
     ) -> Self {
+        assert!(
+            program.externals.is_empty(),
+            "LLVM code generation cannot capture a runtime ExternalRegistry; use cirrus-recompile-rt::execute_prepared_with_externals"
+        );
         let module = context.create_module(fn_name);
         let builder = context.create_builder();
         let declared = emit(context, &module, &builder, program, fn_name);
@@ -451,7 +455,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitAnd { out, .. }
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
-        | PreparedOp::Mux { out, .. } => out,
+        | PreparedOp::Mux { out, .. }
+        | PreparedOp::External { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -674,6 +679,9 @@ fn emit_prepared_op<'ctx>(
                     "",
                 )
                 .expect("build table-loop mux");
+        }
+        PreparedOp::External { .. } => {
+            unreachable!("external programs are rejected before LLVM emission")
         }
     }
 }

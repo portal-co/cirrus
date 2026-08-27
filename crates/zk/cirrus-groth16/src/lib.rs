@@ -9,14 +9,16 @@
 //! RNG); the R1CS-synthesis backend itself
 //! (`cirrus-r1cs-backend`) stays `no_std`+`alloc`.
 
-use ark_ec::pairing::Pairing;
 use ark_ec::AdditiveGroup;
+use ark_ec::pairing::Pairing;
 use ark_ff::Field;
 pub use ark_groth16::{Proof, ProvingKey, VerifyingKey};
 use ark_relations::gr1cs::SynthesisError;
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
-use cirrus_r1cs_backend::circuit::ProgramCircuit;
+use cirrus_r1cs_backend::circuit::{
+    PluginPublicStatement, ProgramCircuit, ProgramCircuitWithPlugins, ZkPluginSet,
+};
 use cirrus_recompile_core::Program;
 use core::marker::PhantomData;
 
@@ -68,7 +70,92 @@ pub fn verify<E: Pairing>(
 ) -> Result<bool, SynthesisError> {
     let public_inputs: Vec<E::ScalarField> = public_outputs
         .iter()
-        .map(|&bit| if bit { E::ScalarField::ONE } else { E::ScalarField::ZERO })
+        .map(|&bit| {
+            if bit {
+                E::ScalarField::ONE
+            } else {
+                E::ScalarField::ZERO
+            }
+        })
         .collect();
     ark_groth16::Groth16::<E>::verify(vk, &public_inputs, proof)
+}
+
+/// Derive Groth16 keys with constrained external primitive gadgets and a
+/// plugin-supplied storage commitment layout.
+///
+/// The plugin's external and layout bindings are public, constant-constrained
+/// prefix values, so this setup key is tied to that exact configuration.
+pub fn setup_with_plugins<E: Pairing, R: RngCore + CryptoRng, P: ZkPluginSet<E::ScalarField>>(
+    program: &Program,
+    plugins: &P,
+    rng: &mut R,
+) -> Result<(ProvingKey<E>, VerifyingKey<E>), SynthesisError> {
+    let circuit = ProgramCircuitWithPlugins::<E::ScalarField, P> {
+        program,
+        private_inputs: None,
+        public_outputs: None,
+        initial_storage_root: None,
+        final_storage_root: None,
+        plugins,
+        _marker: PhantomData,
+    };
+    ark_groth16::Groth16::<E>::setup(circuit, rng)
+}
+
+/// Prove a plugin-bound statement with public initial and final storage roots.
+pub fn prove_with_plugins<E: Pairing, R: RngCore + CryptoRng, P: ZkPluginSet<E::ScalarField>>(
+    pk: &ProvingKey<E>,
+    program: &Program,
+    plugins: &P,
+    private_inputs: &[bool],
+    initial_storage_root: E::ScalarField,
+    final_storage_root: E::ScalarField,
+    public_outputs: &[bool],
+    rng: &mut R,
+) -> Result<Proof<E>, SynthesisError> {
+    let circuit = ProgramCircuitWithPlugins::<E::ScalarField, P> {
+        program,
+        private_inputs: Some(private_inputs),
+        public_outputs: Some(public_outputs),
+        initial_storage_root: Some(initial_storage_root),
+        final_storage_root: Some(final_storage_root),
+        plugins,
+        _marker: PhantomData,
+    };
+    ark_groth16::Groth16::<E>::prove(pk, circuit, rng)
+}
+
+/// Construct the public plugin-bound statement in verifier input order.
+pub fn plugin_public_statement<E: Pairing, P: ZkPluginSet<E::ScalarField>>(
+    plugins: &P,
+    initial_storage_root: E::ScalarField,
+    final_storage_root: E::ScalarField,
+    public_outputs: &[bool],
+) -> PluginPublicStatement<E::ScalarField> {
+    ProgramCircuitWithPlugins::public_statement(
+        plugins,
+        initial_storage_root,
+        final_storage_root,
+        public_outputs,
+    )
+}
+
+/// Verify a proof with the exact plugin and storage-layout public prefix used
+/// for setup and proving.
+pub fn verify_with_plugins<E: Pairing, P: ZkPluginSet<E::ScalarField>>(
+    vk: &VerifyingKey<E>,
+    plugins: &P,
+    initial_storage_root: E::ScalarField,
+    final_storage_root: E::ScalarField,
+    public_outputs: &[bool],
+    proof: &Proof<E>,
+) -> Result<bool, SynthesisError> {
+    let statement = plugin_public_statement::<E, P>(
+        plugins,
+        initial_storage_root,
+        final_storage_root,
+        public_outputs,
+    );
+    ark_groth16::Groth16::<E>::verify(vk, &statement.to_field_elements(), proof)
 }

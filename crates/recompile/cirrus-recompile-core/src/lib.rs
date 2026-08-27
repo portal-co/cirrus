@@ -42,7 +42,7 @@ use core::convert::Infallible;
 
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
-    ContextWithValue, HasError,
+    ContextWithStorage, ContextWithValue, HasError, StorageAddressBit,
 };
 
 /// A slot index into a backend's scratch value buffer.
@@ -83,6 +83,36 @@ pub enum Op {
         /// The slot selected when `cond` does not hold.
         r#else: Idx,
     },
+    /// Invoke one externally supplied Boolean primitive bit. The metadata and
+    /// operand list live in [`Program::externals`] and are selected by this
+    /// stable table index.
+    External(u32),
+}
+
+/// External primitive class used by [`ExternalOp`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalKind {
+    /// Deterministic oracle bit.
+    Oracle,
+    /// Replayable RNG bit.
+    Rng,
+    /// Action result bit. Storage effects remain owned by the caller's host.
+    Action,
+}
+
+/// Stable metadata for one externally supplied recorded operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalOp {
+    /// Primitive class.
+    pub kind: ExternalKind,
+    /// Caller-resolved logical source name.
+    pub name: alloc::string::String,
+    /// Input slots in flattened bit order.
+    pub args: Vec<Idx>,
+    /// Flattened output bit index.
+    pub bit: usize,
+    /// Stable occurrence token used for replay.
+    pub occurrence: u64,
 }
 
 /// A recorded, straight-line trace of Boolean-circuit operations.
@@ -98,6 +128,8 @@ pub struct Program {
     pub inputs: Vec<Idx>,
     /// The slots a caller reads back as this trace's outputs.
     pub outputs: Vec<Idx>,
+    /// Stable external metadata referenced by [`Op::External`].
+    pub externals: Vec<ExternalOp>,
 }
 
 impl Program {
@@ -134,6 +166,15 @@ impl Program {
     /// routes through it.
     pub fn compact(&self, options: &OptimizationOptions) -> PreparedProgram {
         self.prepare(options).compact_slots()
+    }
+
+    /// Add one external bit operation and return the slot it defines.
+    pub fn push_external(&mut self, external: ExternalOp) -> Idx {
+        let id = u32::try_from(self.externals.len()).expect("external table exceeds u32");
+        let slot = Idx(self.ops.len() as u32);
+        self.externals.push(external);
+        self.ops.push(Op::External(id));
+        slot
     }
 }
 
@@ -251,6 +292,14 @@ pub enum PreparedOp {
         /// Destination slot.
         out: PreparedSlot,
     },
+    /// An external bit operation referenced through
+    /// [`PreparedProgram::externals`].
+    External {
+        /// External metadata index.
+        external: u32,
+        /// Destination slot.
+        out: PreparedSlot,
+    },
 }
 
 /// One invocation of a [`PreparedLoop`].
@@ -315,6 +364,9 @@ pub enum PreparedProgramError {
     InvalidInvocationCount,
     /// An absolute slot reference is outside the scratch-buffer width.
     InvalidSlot,
+    /// An external operation refers to missing metadata or an out-of-range
+    /// argument slot.
+    InvalidExternal,
 }
 
 const UNROLLED_OP_BYTES: usize = 20;
@@ -339,6 +391,8 @@ pub struct PreparedProgram {
     pub inputs: Vec<Idx>,
     /// Output slots in the source program's deterministic order.
     pub outputs: Vec<Idx>,
+    /// Stable external metadata referenced by prepared external operations.
+    pub externals: Vec<ExternalOp>,
     /// Root statement range executed once.
     pub entry: StatementRange,
     /// Shared pool containing the entry and all loop bodies.
@@ -367,6 +421,7 @@ impl PreparedProgram {
             slots,
             inputs,
             outputs,
+            externals: Vec::new(),
             entry,
             statements,
             estimated_unrolled_bytes: slots.saturating_mul(UNROLLED_OP_BYTES),
@@ -381,7 +436,7 @@ impl PreparedProgram {
         let statements = program
             .ops
             .iter()
-            .copied()
+            .cloned()
             .enumerate()
             .map(|(out, op)| {
                 Statement::Op(PreparedOp::from_scheduled(ScheduledOp {
@@ -394,6 +449,7 @@ impl PreparedProgram {
             slots: program.ops.len(),
             inputs: program.inputs.clone(),
             outputs: program.outputs.clone(),
+            externals: program.externals.clone(),
             entry: StatementRange::new(0, program.ops.len() as u32),
             statements,
             estimated_unrolled_bytes: program.ops.len().saturating_mul(UNROLLED_OP_BYTES),
@@ -435,7 +491,15 @@ impl PreparedProgram {
         {
             return Err(PreparedProgramError::InvalidSlot);
         }
-        self.validate_range(self.entry, 0, 1, &mut Vec::new())
+        self.validate_range(self.entry, 0, 1, &mut Vec::new())?;
+        if self
+            .externals
+            .iter()
+            .any(|external| external.args.iter().any(|slot| slot.get() >= self.slots))
+        {
+            return Err(PreparedProgramError::InvalidExternal);
+        }
+        Ok(())
     }
 
     /// Whether the prepared artifact has no operations.
@@ -530,7 +594,14 @@ impl PreparedProgram {
         active_ranges.push(range);
         for statement in statements {
             match statement {
-                Statement::Op(op) => op.validate_scopes(loop_depth, self.slots)?,
+                Statement::Op(op) => {
+                    op.validate_scopes(loop_depth, self.slots)?;
+                    if let PreparedOp::External { external, .. } = op {
+                        if *external as usize >= self.externals.len() {
+                            return Err(PreparedProgramError::InvalidExternal);
+                        }
+                    }
+                }
                 Statement::Loop(loop_step) => {
                     if loop_step.invocations.len() != expected_invocations {
                         return Err(PreparedProgramError::InvalidInvocationCount);
@@ -631,6 +702,7 @@ impl PreparedOp {
                 r#else: PreparedSlot::Static(r#else),
                 out,
             },
+            Op::External(external) => Self::External { external, out },
         }
     }
 
@@ -655,6 +727,7 @@ impl PreparedOp {
                 r#else,
                 out,
             } => [cond, then, r#else, out],
+            Self::External { out, .. } => [out, out, out, out],
         }
     }
 
@@ -689,6 +762,10 @@ impl PreparedOp {
                     then: slot(then),
                     r#else: slot(r#else),
                 },
+            },
+            Self::External { external, out } => ScheduledOp {
+                out: slot(out),
+                op: Op::External(external),
             },
         }
     }
@@ -727,6 +804,10 @@ impl PreparedOp {
                     then: static_slot(then)?,
                     r#else: static_slot(r#else)?,
                 },
+            }),
+            Self::External { external, out } => Some(ScheduledOp {
+                out: static_slot(out)?,
+                op: Op::External(external),
             }),
         }
     }
@@ -907,6 +988,7 @@ fn build_loop(ops: &[Option<ScheduledOp>], width: usize, repetitions: usize) -> 
                 r#else: operand(2, &mut fields),
                 out,
             },
+            Op::External(_) => unreachable!("external operations are never loop-abstracted"),
         };
         body.push(Statement::Op(op));
     }
@@ -1176,18 +1258,29 @@ fn append_rows(
 #[derive(Clone, Debug, Default)]
 pub struct Recorder {
     ops: Vec<Op>,
+    externals: Vec<ExternalOp>,
 }
 
 impl Recorder {
     /// Start recording an empty trace.
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            externals: Vec::new(),
+        }
     }
 
     fn push(&mut self, op: Op) -> Idx {
         let idx = Idx(self.ops.len() as u32);
         self.ops.push(op);
         idx
+    }
+
+    /// Record one externally dispatched Boolean bit.
+    pub fn external_bit(&mut self, external: ExternalOp) -> Idx {
+        let id = u32::try_from(self.externals.len()).expect("external table exceeds u32");
+        self.externals.push(external);
+        self.push(Op::External(id))
     }
 
     /// Finish recording, naming the slots a caller cares about as this
@@ -1197,6 +1290,7 @@ impl Recorder {
             ops: self.ops,
             inputs,
             outputs,
+            externals: self.externals,
         }
     }
 
@@ -1348,6 +1442,95 @@ impl ContextWithMux<bool> for Recorder {
     }
 }
 
+/// Dense symbolic storage for the recording test host.
+///
+/// Concrete addresses update/read a cell directly, preserving the compact
+/// trace shape expected from ABI setup. Secret addresses are represented by
+/// ordinary Boolean MUX/demux gates, so a recorded program remains valid for
+/// the same storage accesses on a symbolic backend.
+impl ContextWithStorage<bool> for Recorder {
+    type Storage = [Idx];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Idx>],
+    ) -> Result<Idx, Self::Error> {
+        if let Some(index) = recorded_storage_index(address) {
+            return Ok(storage[index]);
+        }
+        assert!(
+            storage.len().is_power_of_two() && (1usize << address.len()) == storage.len(),
+            "Recorder symbolic storage needs a power-of-two bank matching its address width"
+        );
+        let mut level = storage.to_vec();
+        for address_bit in address {
+            level = level
+                .chunks_exact(2)
+                .map(|pair| self.mux(address_bit.wire, pair[1], pair[0]))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        Ok(level[0])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Idx>],
+        value: Idx,
+    ) -> Result<(), Self::Error> {
+        if let Some(index) = recorded_storage_index(address) {
+            storage[index] = value;
+            return Ok(());
+        }
+        assert!(
+            storage.len().is_power_of_two() && (1usize << address.len()) == storage.len(),
+            "Recorder symbolic storage needs a power-of-two bank matching its address width"
+        );
+        for (index, cell) in storage.iter_mut().enumerate() {
+            let selected = self.recorded_storage_selector(address, index)?;
+            *cell = self.mux(selected, value, *cell)?;
+        }
+        Ok(())
+    }
+}
+
+impl Recorder {
+    fn recorded_storage_selector(
+        &mut self,
+        address: &[StorageAddressBit<Idx>],
+        index: usize,
+    ) -> Result<Idx, Infallible> {
+        let mut selected = self.create(true)?;
+        for (bit, address_bit) in address.iter().enumerate() {
+            let expected = (index >> bit) & 1 != 0;
+            let matches = match address_bit.known {
+                Some(known) if known == expected => continue,
+                Some(_) => return self.create(false),
+                None if expected => address_bit.wire,
+                None => {
+                    let one = self.create(true)?;
+                    self.bitxor(address_bit.wire, one)?
+                }
+            };
+            selected = self.bitand(selected, matches)?;
+        }
+        Ok(selected)
+    }
+}
+
+fn recorded_storage_index(address: &[StorageAddressBit<Idx>]) -> Option<usize> {
+    let mut index = 0usize;
+    for (bit, address_bit) in address.iter().enumerate() {
+        match address_bit.known {
+            Some(true) => index |= 1usize.checked_shl(bit as u32)?,
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    Some(index)
+}
+
 impl HasError for PreparedRecorder {
     type Error = Infallible;
 }
@@ -1433,6 +1616,7 @@ pub fn interpret(program: &Program, inputs: &[bool]) -> Vec<bool> {
                     slots[r#else.get()].unwrap()
                 }
             }
+            Op::External(_) => panic!("interpret: external program needs an external registry"),
         };
         slots[i] = Some(value);
     }
@@ -1546,6 +1730,9 @@ fn interpret_scheduled_op(slots: &mut [Option<bool>], is_input: &[bool], schedul
                 slots[r#else.get()].unwrap()
             }
         }
+        Op::External(_) => {
+            panic!("interpret_prepared: external program needs an external registry")
+        }
     };
     slots[scheduled.out.get()] = Some(value);
 }
@@ -1634,9 +1821,19 @@ impl PreparedProgram {
                 Statement::Op(op) => {
                     *tick += 1;
                     let scheduled = op.resolve(|slot| resolve_slot(slot, active));
-                    for operand in op_operand_slots(scheduled.op).into_iter().flatten() {
-                        liveness.last_ref[operand.get()] =
-                            liveness.last_ref[operand.get()].max(*tick);
+                    match scheduled.op {
+                        Op::External(external) => {
+                            for operand in &self.externals[external as usize].args {
+                                liveness.last_ref[operand.get()] =
+                                    liveness.last_ref[operand.get()].max(*tick);
+                            }
+                        }
+                        op => {
+                            for operand in op_operand_slots(op).into_iter().flatten() {
+                                liveness.last_ref[operand.get()] =
+                                    liveness.last_ref[operand.get()].max(*tick);
+                            }
+                        }
                     }
                     let out = scheduled.out.get();
                     if liveness.def[out].is_none() {
@@ -1668,7 +1865,13 @@ impl PreparedProgram {
 
         let mut computed = (0..self.slots)
             .filter(|&slot| map[slot] == u32::MAX)
-            .map(|slot| (slot, liveness.def[slot].unwrap_or(0), liveness.last_ref[slot]))
+            .map(|slot| {
+                (
+                    slot,
+                    liveness.def[slot].unwrap_or(0),
+                    liveness.last_ref[slot],
+                )
+            })
             .collect::<Vec<_>>();
         computed.sort_by_key(|&(_, def, _)| def);
 
@@ -1721,10 +1924,17 @@ impl PreparedProgram {
             .iter()
             .map(|idx| Idx(assignment.map[idx.get()]))
             .collect();
+        let mut externals = self.externals.clone();
+        for external in &mut externals {
+            for arg in &mut external.args {
+                *arg = Idx(assignment.map[arg.get()]);
+            }
+        }
         let mut compacted = Self {
             slots: assignment.new_slots,
             inputs,
             outputs,
+            externals,
             entry: self.entry,
             statements,
             // Compaction never changes how many operations a fully unrolled
@@ -1748,6 +1958,7 @@ fn op_operand_slots(op: Op) -> [Option<Idx>; 3] {
         Op::Create(_) => [None, None, None],
         Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => [Some(a), Some(b), None],
         Op::Mux { cond, then, r#else } => [Some(cond), Some(then), Some(r#else)],
+        Op::External(_) => [None, None, None],
     }
 }
 
@@ -1788,6 +1999,10 @@ fn remap_prepared_op(op: PreparedOp, map: &[u32]) -> PreparedOp {
             cond: remap_prepared_slot(cond, map),
             then: remap_prepared_slot(then, map),
             r#else: remap_prepared_slot(r#else, map),
+            out: remap_prepared_slot(out, map),
+        },
+        PreparedOp::External { external, out } => PreparedOp::External {
+            external,
             out: remap_prepared_slot(out, map),
         },
     }
@@ -1893,6 +2108,7 @@ mod tests {
             ],
             inputs: alloc::vec![Idx(0), Idx(1)],
             outputs: alloc::vec![Idx(2), Idx(3), Idx(4), Idx(5), Idx(6)],
+            externals: alloc::vec![],
         };
         let prepared = PreparedProgram::new(
             raw.len(),
@@ -2099,6 +2315,7 @@ mod tests {
             ops: alloc::vec![Op::Create(false)],
             inputs: alloc::vec![Idx(0)],
             outputs: alloc::vec![Idx(0)],
+            externals: alloc::vec![],
         };
         let prepared = raw.prepare(&OptimizationOptions::default());
         assert_eq!(interpret_prepared(&prepared, &[true]), [true]);
@@ -2186,12 +2403,7 @@ mod tests {
         // loops. `compact_slots_reuses_slots_inside_a_loop_body` above
         // covers the case where reuse actually happens.
         assert_eq!(compacted.slots, prepared.slots);
-        for &(a, b) in &[
-            (true, false),
-            (false, true),
-            (true, true),
-            (false, false),
-        ] {
+        for &(a, b) in &[(true, false), (false, true), (true, true), (false, false)] {
             assert_eq!(
                 interpret_prepared(&prepared, &[a, b]),
                 interpret_prepared(&compacted, &[a, b])

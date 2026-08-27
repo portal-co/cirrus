@@ -39,7 +39,7 @@ use core::{array, convert::Infallible, fmt, marker::PhantomData};
 
 use cirrus_core::{
     Bit, ContextWithAdd, ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithMul,
-    ContextWithSub, ContextWithValue, HasError, Pusher,
+    ContextWithStorage, ContextWithSub, ContextWithValue, HasError, Pusher, StorageAddressBit,
 };
 use digest::{Digest, array::Array};
 
@@ -227,6 +227,31 @@ where
     }
 }
 
+impl<I, const N: usize> ContextWithStorage<bool> for Evaluator<I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    type Storage = [[u8; N]];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<[u8; N]>],
+    ) -> Result<[u8; N], Self::Error> {
+        Ok(storage[concrete_storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<[u8; N]>],
+        value: [u8; N],
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
 impl<D: Digest, const N: usize> HasError for GC<'_, '_, D, N> {
     type Error = Infallible;
 }
@@ -293,6 +318,47 @@ impl<D: Digest, const N: usize> ContextWithBitOr<bool> for GC<'_, '_, D, N> {
         *a = self.bitor(*a, b)?;
         Ok(())
     }
+}
+
+impl<D: Digest, const N: usize> ContextWithStorage<bool> for GC<'_, '_, D, N> {
+    type Storage = [Label<N>];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Label<N>>],
+    ) -> Result<Label<N>, Self::Error> {
+        Ok(storage[concrete_storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Label<N>>],
+        value: Label<N>,
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
+fn concrete_storage_index<W>(address: &[StorageAddressBit<W>]) -> usize {
+    address
+        .iter()
+        .enumerate()
+        .fold(0usize, |index, (bit, address_bit)| {
+            if address_bit
+                .known
+                .expect("ERT storage addresses are concrete")
+            {
+                index
+                    | (1usize
+                        .checked_shl(bit as u32)
+                        .expect("ERT storage address exceeds usize width"))
+            } else {
+                index
+            }
+        })
 }
 impl<D: Digest, const N: usize> ContextWithAdd<Bit> for GC<'_, '_, D, N> {
     fn add(
@@ -389,7 +455,8 @@ mod tests {
         ert_func as arm_ert_func,
     };
     use cirrus_core::{
-        ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError, Pusher,
+        ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage,
+        ContextWithValue, HasError, Pusher, StorageAddressBit,
     };
     use cirrus_ert::{
         DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit,
@@ -534,6 +601,47 @@ mod tests {
             *left = self.bitxor(*left, right)?;
             Ok(())
         }
+    }
+
+    impl<const N: usize> ContextWithStorage<bool> for MeasuredGc<'_, '_, N> {
+        type Storage = [Label<N>];
+
+        fn storage_read(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<Label<N>>],
+        ) -> Result<Label<N>, Self::Error> {
+            Ok(storage[measured_storage_index(address)])
+        }
+
+        fn storage_write(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<Label<N>>],
+            value: Label<N>,
+        ) -> Result<(), Self::Error> {
+            storage[measured_storage_index(address)] = value;
+            Ok(())
+        }
+    }
+
+    fn measured_storage_index<const N: usize>(address: &[StorageAddressBit<Label<N>>]) -> usize {
+        address
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, address_bit)| {
+                if address_bit
+                    .known
+                    .expect("ERT storage addresses are concrete")
+                {
+                    index
+                        | (1usize
+                            .checked_shl(bit as u32)
+                            .expect("ERT storage address exceeds usize width"))
+                } else {
+                    index
+                }
+            })
     }
 
     fn context(queue: &mut RecordedTables<16>) -> GC<'_, '_, Sha256, 16> {
@@ -798,9 +906,10 @@ mod tests {
 
         let garbled = ert_emit(
             &mut handler,
+            &mut garbled_vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut garbled_rstack,
-            &mut garbled_vstack,
             0,
             &mut garbled_registers,
             &mut garbled_constants,
@@ -832,9 +941,10 @@ mod tests {
 
         let evaluated = ert_emit(
             &mut evaluator_handler,
+            &mut evaluated_vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut evaluated_rstack,
-            &mut evaluated_vstack,
             0,
             &mut evaluated_registers,
             &mut evaluated_constants,
@@ -936,9 +1046,10 @@ mod tests {
 
         let result = ert_emit(
             &mut handler,
+            &mut vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut rstack,
-            &mut vstack,
             0,
             &mut registers,
             &mut constants,
@@ -996,9 +1107,10 @@ mod tests {
 
         let result = ert_emit(
             &mut handler,
+            &mut vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut rstack,
-            &mut vstack,
             0,
             &mut registers,
             &mut constants,
@@ -1301,11 +1413,12 @@ mod tests {
             },
         };
 
-        let outcome = riscv_ert_func::<_, _, 16, 2>(
+        let outcome = riscv_ert_func::<_, _, 16, 2, _>(
             &mut handler,
+            &mut vstack,
+            STACK_SLOTS,
             memory,
             &mut rstack,
-            &mut vstack,
             entry,
             &mut registers,
             &mut constants,
@@ -1356,11 +1469,12 @@ mod tests {
             security_attribute: always_secure,
         };
 
-        let outcome = arm_ert_func::<_, _, 16, 2>(
+        let outcome = arm_ert_func::<_, _, 16, 2, _>(
             &mut handler,
+            &mut vstack,
+            STACK_SLOTS,
             memory,
             &mut rstack,
-            &mut vstack,
             entry,
             &mut registers,
             &mut constants,

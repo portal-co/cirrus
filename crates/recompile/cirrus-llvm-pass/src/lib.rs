@@ -29,12 +29,12 @@ use inkwell::llvm_sys::core::{
 use inkwell::llvm_sys::prelude::LLVMModuleRef;
 use inkwell::module::{Linkage, Module};
 use inkwell::types::{AnyTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::values::{AsValueRef, FunctionValue, PointerValue};
 use volar_llvm_constchain::{
     ConstChainError, aggregate_fields, decode_array_from_pointer, function_from_pointer,
     global_from_pointer, int_u32, int_u64, require_fields, require_zero, strip_pointer,
     usize_from_u64,
 };
-use inkwell::values::{AsValueRef, FunctionValue, PointerValue};
 
 unsafe extern "C" {
     fn cirrus_llvm_pass_link_anchor();
@@ -215,10 +215,13 @@ fn lower_module_with_pass<'ctx>(
 
     let marker_helpers = marker_calls
         .iter()
-        .filter_map(|(_, owner, _, _)| volar_llvm_pass_support::is_marker_wrapper(*owner, MARKER).then_some(*owner))
+        .filter_map(|(_, owner, _, _)| {
+            volar_llvm_pass_support::is_marker_wrapper(*owner, MARKER).then_some(*owner)
+        })
         .map(|owner| (owner.as_value_ref() as usize, owner))
         .collect::<BTreeMap<_, _>>();
-    let marker_retention_globals = volar_llvm_pass_support::retained_wrapper_globals(module, &marker_helpers);
+    let marker_retention_globals =
+        volar_llvm_pass_support::retained_wrapper_globals(module, &marker_helpers);
     let builder = context.create_builder();
     let mut changed = false;
     for (name, candidate) in &candidates {
@@ -512,7 +515,8 @@ fn find_marker_calls<'ctx>(
             .call
             .get_called_fn_value()
             .expect("find_calls_to only returns calls with a resolved callee");
-        volar_llvm_pass_support::validate_marker_declaration(callee, MARKER, 2).map_err(PassError::new)?;
+        volar_llvm_pass_support::validate_marker_declaration(callee, MARKER, 2)
+            .map_err(PassError::new)?;
         if found.call.count_arguments() != 2 {
             return Err(PassError::new(
                 "__cirrus_entry must take exactly (ptr target, ptr descriptor)",

@@ -67,18 +67,29 @@ fn decode_at(mem: &RawMemory<'_>, pc: u32) -> Option<(Op, u32)> {
 /// any other loop-body instruction, and is expected to already resolve
 /// through the interpreter's existing concrete-flags branch handling at
 /// runtime (the loop's own trip count is concrete by the idiom's contract).
-fn resolve_continue(mem: &RawMemory<'_>, start: u32, branch_pc: u32, budget: &mut u16) -> Option<u32> {
+fn resolve_continue(
+    mem: &RawMemory<'_>,
+    start: u32,
+    branch_pc: u32,
+    budget: &mut u16,
+) -> Option<u32> {
     let mut pc = start;
     loop {
         *budget = budget.checked_sub(1)?;
         let (op, len) = decode_at(mem, pc)?;
         let target = match op {
             Op::It { .. } => return None,
-            Op::Branch { target, condition: None } => {
+            Op::Branch {
+                target,
+                condition: None,
+            } => {
                 pc = target;
                 continue;
             }
-            Op::Branch { target, condition: Some(_) } => target,
+            Op::Branch {
+                target,
+                condition: Some(_),
+            } => target,
             Op::CompareBranch { target, .. } => target,
             Op::BranchRegister { .. }
             | Op::BranchExchangeNonSecure { .. }
@@ -108,13 +119,20 @@ fn resolve_continue(mem: &RawMemory<'_>, start: u32, branch_pc: u32, budget: &mu
 /// the same reason `cirrus-ert`'s equivalent does not: the natural-exit
 /// path always executes for real and must not be confused with shared
 /// epilogue code that happens to also start with a `MOV rd, #imm`.
-fn resolve_natural_landing(mem: &RawMemory<'_>, natural_exit: u32, budget: &mut u16) -> Option<u32> {
+fn resolve_natural_landing(
+    mem: &RawMemory<'_>,
+    natural_exit: u32,
+    budget: &mut u16,
+) -> Option<u32> {
     let mut pc = natural_exit;
     loop {
         *budget = budget.checked_sub(1)?;
         let (op, _len) = decode_at(mem, pc)?;
         match op {
-            Op::Branch { target, condition: None } => pc = target,
+            Op::Branch {
+                target,
+                condition: None,
+            } => pc = target,
             _ => return Some(pc),
         }
     }
@@ -132,18 +150,29 @@ struct ExitLanding {
 /// its NZ flags are an observable side effect this recognizer does not
 /// replay, so eliding it would be unsound if shared code past `merge`
 /// reads those flags.
-fn resolve_exit_landing(mem: &RawMemory<'_>, start: u32, merge: u32, budget: &mut u16) -> Option<ExitLanding> {
+fn resolve_exit_landing(
+    mem: &RawMemory<'_>,
+    start: u32,
+    merge: u32,
+    budget: &mut u16,
+) -> Option<ExitLanding> {
     let mut pc = start;
     let mut writes = [None; MAX_EXIT_WRITES];
     let mut write_count = 0usize;
     loop {
         if pc == merge {
-            return Some(ExitLanding { writes, write_count });
+            return Some(ExitLanding {
+                writes,
+                write_count,
+            });
         }
         *budget = budget.checked_sub(1)?;
         let (op, len) = decode_at(mem, pc)?;
         match op {
-            Op::Branch { target, condition: None } => pc = target,
+            Op::Branch {
+                target,
+                condition: None,
+            } => pc = target,
             Op::Move {
                 dest,
                 source: Operand::Immediate(value),
@@ -183,7 +212,9 @@ pub(crate) fn recognize(
         };
 
         let mut continue_budget = max_lookahead;
-        let Some(natural_exit) = resolve_continue(mem, continue_start, branch_pc, &mut continue_budget) else {
+        let Some(natural_exit) =
+            resolve_continue(mem, continue_start, branch_pc, &mut continue_budget)
+        else {
             continue;
         };
 
@@ -193,7 +224,8 @@ pub(crate) fn recognize(
         };
 
         let mut exit_budget = max_lookahead;
-        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget) else {
+        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget)
+        else {
             continue;
         };
 

@@ -93,6 +93,10 @@ pub fn generate_prepared_source(
     fn_name: &str,
     backend: &BackendTarget,
 ) -> String {
+    assert!(
+        program.externals.is_empty(),
+        "Rust code generation cannot capture a runtime ExternalRegistry; use cirrus-recompile-rt::execute_prepared_with_externals"
+    );
     let module = &backend.module_path;
     let generics = backend.generic_args();
     let mut out = String::new();
@@ -231,7 +235,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitAnd { out, .. }
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
-        | PreparedOp::Mux { out, .. } => out,
+        | PreparedOp::Mux { out, .. }
+        | PreparedOp::External { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -286,6 +291,9 @@ fn prepared_call_line(module: &str, op: PreparedOp, active: &[ActiveTable]) -> S
             prepared_slot(r#else, active),
             prepared_slot(out, active)
         ),
+        PreparedOp::External { .. } => {
+            unreachable!("external programs are rejected before source emission")
+        }
     }
 }
 

@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,
     ContextWithValue, HasError, StorageAddressBit,
@@ -37,6 +37,99 @@ impl<T> BoolarContext for T where
         + ContextWithBitOr<bool>
         + ContextWithBitXor<bool>
 {
+}
+
+/// Caller-supplied dispatch for Boolar external primitives.
+///
+/// The registry is passed to execution rather than embedded in the circuit,
+/// so serialized circuits retain only stable source metadata.  Every method
+/// is bit-granular and receives the occurrence token emitted by lowering.
+/// Action handlers own the conditional storage behavior: they receive both
+/// `guard` and `fallback` and must write the selected bit to `cells`.
+pub trait ExternalBitRegistry<C>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    Wire<C>: Clone,
+{
+    /// Evaluate one declared oracle result bit.
+    fn oracle_bit(
+        &mut self,
+        context: &mut C,
+        name: &str,
+        args: &[Wire<C>],
+        bit: usize,
+        occurrence: u64,
+    ) -> Result<Wire<C>, C::Error>;
+
+    /// Evaluate one declared fresh RNG bit.
+    fn rng_bit(
+        &mut self,
+        context: &mut C,
+        name: &str,
+        bit: usize,
+        occurrence: u64,
+    ) -> Result<Wire<C>, C::Error>;
+
+    /// Execute one direct action-storage effect.
+    #[allow(clippy::too_many_arguments)]
+    fn action_store_bit(
+        &mut self,
+        context: &mut C,
+        name: &str,
+        guard: Wire<C>,
+        args: &[Wire<C>],
+        fallback: Wire<C>,
+        storage: StorageId,
+        lane: LaneId,
+        address: &[StorageAddressBit<Wire<C>>],
+        bit: usize,
+        occurrence: u64,
+        cells: &mut C::Storage,
+    ) -> Result<(), C::Error>;
+}
+
+impl<C> ExternalBitRegistry<C> for ()
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    Wire<C>: Clone,
+{
+    fn oracle_bit(
+        &mut self,
+        _context: &mut C,
+        _name: &str,
+        _args: &[Wire<C>],
+        _bit: usize,
+        _occurrence: u64,
+    ) -> Result<Wire<C>, C::Error> {
+        unreachable!("external dispatch is checked before the empty registry is used")
+    }
+
+    fn rng_bit(
+        &mut self,
+        _context: &mut C,
+        _name: &str,
+        _bit: usize,
+        _occurrence: u64,
+    ) -> Result<Wire<C>, C::Error> {
+        unreachable!("external dispatch is checked before the empty registry is used")
+    }
+
+    fn action_store_bit(
+        &mut self,
+        _context: &mut C,
+        _name: &str,
+        _guard: Wire<C>,
+        _args: &[Wire<C>],
+        _fallback: Wire<C>,
+        _storage: StorageId,
+        _lane: LaneId,
+        _address: &[StorageAddressBit<Wire<C>>],
+        _bit: usize,
+        _occurrence: u64,
+        _cells: &mut C::Storage,
+    ) -> Result<(), C::Error> {
+        unreachable!("external dispatch is checked before the empty registry is used")
+    }
 }
 
 /// The ordinary dense-storage implementation of [`ContextWithStorage`].
@@ -229,6 +322,8 @@ pub enum ExecuteError<E> {
     StorageLayout(StorageLayoutError),
     /// The circuit uses a Boolar statement that has no Cirrus context meaning.
     UnsupportedStatement,
+    /// The circuit needs a source registry but none was passed to execution.
+    MissingExternalHandler { kind: &'static str, name: String },
     /// The underlying Cirrus Boolean context rejected an operation.
     Context(E),
 }
@@ -344,6 +439,12 @@ pub fn storage_requirements<P: Clone>(
                 addr,
             }
             | BIrStmt::StorageWrite {
+                storage,
+                lane,
+                addr,
+                ..
+            }
+            | BIrStmt::ActionStoreBit {
                 storage,
                 lane,
                 addr,
@@ -498,7 +599,31 @@ where
         });
     }
     initialize_storage(context, circuit, banks)?;
-    execute_impl(context, circuit, inputs, banks)
+    execute_impl::<C, P, ()>(context, circuit, inputs, banks, None)
+}
+
+/// Execute a circuit with named external primitive handlers.
+pub fn execute_with_externals<C, P, R>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, C::Storage>],
+    externals: &mut R,
+) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    P: Clone,
+    R: ExternalBitRegistry<C>,
+    Wire<C>: Clone,
+{
+    if inputs.len() != circuit.params as usize {
+        return Err(ExecuteError::InputArity {
+            expected: circuit.params as usize,
+            found: inputs.len(),
+        });
+    }
+    initialize_storage(context, circuit, banks)?;
+    execute_impl(context, circuit, inputs, banks, Some(externals))
 }
 
 /// Execute a circuit against already-initialized storage.
@@ -518,18 +643,44 @@ where
     Wire<C>: Clone,
 {
     validate_circuit_storage::<C, P>(circuit, banks)?;
-    execute_impl(context, circuit, inputs, banks)
+    execute_impl::<C, P, ()>(context, circuit, inputs, banks, None)
 }
 
-fn execute_impl<C, P>(
+/// Persistent-storage counterpart to [`execute_with_externals`].
+pub fn execute_initialized_with_externals<C, P, R>(
     context: &mut C,
     circuit: &BCircuit<P>,
     inputs: &[Wire<C>],
     banks: &mut [StorageBank<'_, C::Storage>],
+    externals: &mut R,
 ) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
 where
     C: BoolarContext + ContextWithStorage<bool>,
     P: Clone,
+    R: ExternalBitRegistry<C>,
+    Wire<C>: Clone,
+{
+    if inputs.len() != circuit.params as usize {
+        return Err(ExecuteError::InputArity {
+            expected: circuit.params as usize,
+            found: inputs.len(),
+        });
+    }
+    validate_circuit_storage::<C, P>(circuit, banks)?;
+    execute_impl(context, circuit, inputs, banks, Some(externals))
+}
+
+fn execute_impl<C, P, R>(
+    context: &mut C,
+    circuit: &BCircuit<P>,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, C::Storage>],
+    mut externals: Option<&mut R>,
+) -> Result<Vec<Wire<C>>, ExecuteError<C::Error>>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    P: Clone,
+    R: ExternalBitRegistry<C>,
     Wire<C>: Clone,
 {
     let mut values = Vec::with_capacity(circuit.params as usize + circuit.stmts.len());
@@ -620,8 +771,100 @@ where
                     known: Some(false),
                 }
             }
+            BIrStmt::OracleBit {
+                name,
+                args,
+                bit,
+                occurrence,
+            } => {
+                let args = args
+                    .iter()
+                    .map(|arg| Ok(value_at(&values, *arg)?.wire.clone()))
+                    .collect::<Result<Vec<_>, ExecuteError<C::Error>>>()?;
+                let handler = externals.as_deref_mut().ok_or_else(|| {
+                    ExecuteError::MissingExternalHandler {
+                        kind: "oracle",
+                        name: name.clone(),
+                    }
+                })?;
+                Value {
+                    wire: handler
+                        .oracle_bit(context, name, &args, *bit, *occurrence)
+                        .map_err(ExecuteError::Context)?,
+                    known: None,
+                }
+            }
+            BIrStmt::RngBit {
+                name,
+                bit,
+                occurrence,
+            } => {
+                let handler = externals.as_deref_mut().ok_or_else(|| {
+                    ExecuteError::MissingExternalHandler {
+                        kind: "rng",
+                        name: name.clone(),
+                    }
+                })?;
+                Value {
+                    wire: handler
+                        .rng_bit(context, name, *bit, *occurrence)
+                        .map_err(ExecuteError::Context)?,
+                    known: None,
+                }
+            }
+            BIrStmt::ActionStoreBit {
+                name,
+                guard,
+                args,
+                fallback,
+                storage,
+                lane,
+                addr,
+                bit,
+                occurrence,
+            } => {
+                let guard = value_at(&values, *guard)?.wire.clone();
+                let args = args
+                    .iter()
+                    .map(|arg| Ok(value_at(&values, *arg)?.wire.clone()))
+                    .collect::<Result<Vec<_>, ExecuteError<C::Error>>>()?;
+                let fallback = value_at(&values, *fallback)?.wire.clone();
+                let address = address_values(&values, addr)?;
+                let bank =
+                    find_bank(banks, *storage, *lane).ok_or(ExecuteError::MissingStorageBank {
+                        storage: *storage,
+                        lane: *lane,
+                    })?;
+                validate_address_width(*storage, *lane, address.len(), banks[bank].address_bits)?;
+                let address = storage_address(&address);
+                let handler = externals.as_deref_mut().ok_or_else(|| {
+                    ExecuteError::MissingExternalHandler {
+                        kind: "action",
+                        name: name.clone(),
+                    }
+                })?;
+                handler
+                    .action_store_bit(
+                        context,
+                        name,
+                        guard,
+                        &args,
+                        fallback,
+                        *storage,
+                        *lane,
+                        &address,
+                        *bit,
+                        *occurrence,
+                        banks[bank].value,
+                    )
+                    .map_err(ExecuteError::Context)?;
+                Value {
+                    wire: context.create(false).map_err(ExecuteError::Context)?,
+                    known: Some(false),
+                }
+            }
             BIrStmt::OracleCall { .. }
-            | BIrStmt::OracleBit { .. }
+            | BIrStmt::OracleProjectedBit { .. }
             | BIrStmt::ActionCall { .. }
             | BIrStmt::ActionBit { .. }
             | BIrStmt::Rng { .. } => return Err(ExecuteError::UnsupportedStatement),
@@ -1223,6 +1466,81 @@ where
     WireSer: LazyWireCodec<Wire<C>>,
     Wire<C>: Clone,
 {
+    execute_chunked_impl::<C, P, Source, ChunkSer, Scratch, WireSer, ()>(
+        context,
+        circuit,
+        repository,
+        chunk_codec,
+        inputs,
+        banks,
+        scratch,
+        None,
+    )
+}
+
+/// Execute a content-addressed Boolar circuit with caller-supplied external
+/// primitive handlers. This is the lazy counterpart of
+/// [`execute_with_externals`].
+#[allow(clippy::too_many_arguments)]
+pub fn execute_chunked_with_externals<C, P, Source, ChunkSer, Scratch, WireSer, R>(
+    context: &mut C,
+    circuit: &ChunkedBCircuit,
+    repository: &mut Repository<Source>,
+    chunk_codec: &ChunkSer,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, C::Storage>],
+    scratch: &mut AuthenticatedWireScratch<Scratch, WireSer>,
+    externals: &mut R,
+) -> Result<
+    Vec<Wire<C>>,
+    LazyExecuteError<C::Error, Source::Error, ChunkSer::Error, Scratch::Error, WireSer::Error>,
+>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    P: Clone,
+    Source: lazy_repo::ChunkSource,
+    ChunkSer: ChunkCodec<BStmtChunk<P>>,
+    Scratch: ScratchStore,
+    WireSer: LazyWireCodec<Wire<C>>,
+    R: ExternalBitRegistry<C>,
+    Wire<C>: Clone,
+{
+    execute_chunked_impl(
+        context,
+        circuit,
+        repository,
+        chunk_codec,
+        inputs,
+        banks,
+        scratch,
+        Some(externals),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_chunked_impl<C, P, Source, ChunkSer, Scratch, WireSer, R>(
+    context: &mut C,
+    circuit: &ChunkedBCircuit,
+    repository: &mut Repository<Source>,
+    chunk_codec: &ChunkSer,
+    inputs: &[Wire<C>],
+    banks: &mut [StorageBank<'_, C::Storage>],
+    scratch: &mut AuthenticatedWireScratch<Scratch, WireSer>,
+    mut externals: Option<&mut R>,
+) -> Result<
+    Vec<Wire<C>>,
+    LazyExecuteError<C::Error, Source::Error, ChunkSer::Error, Scratch::Error, WireSer::Error>,
+>
+where
+    C: BoolarContext + ContextWithStorage<bool>,
+    P: Clone,
+    Source: lazy_repo::ChunkSource,
+    ChunkSer: ChunkCodec<BStmtChunk<P>>,
+    Scratch: ScratchStore,
+    WireSer: LazyWireCodec<Wire<C>>,
+    R: ExternalBitRegistry<C>,
+    Wire<C>: Clone,
+{
     if inputs.len() != circuit.params as usize {
         return Err(LazyExecuteError::Execute(ExecuteError::InputArity {
             expected: circuit.params as usize,
@@ -1364,6 +1682,112 @@ where
                     .map_err(LazyExecuteError::Execute)?;
                     context
                         .storage_write(banks[bank].value, &storage_address(&address), source.wire)
+                        .map_err(|error| LazyExecuteError::Execute(ExecuteError::Context(error)))?;
+                    Value {
+                        wire: context.create(false).map_err(|error| {
+                            LazyExecuteError::Execute(ExecuteError::Context(error))
+                        })?,
+                        known: Some(false),
+                    }
+                }
+                BIrStmt::OracleBit {
+                    name,
+                    args,
+                    bit,
+                    occurrence,
+                } => {
+                    let args: Vec<_> = args
+                        .iter()
+                        .map(|id| values.get(*id).map(|value| value.wire).map_err(local))
+                        .collect::<Result<_, _>>()?;
+                    let handler = externals.as_deref_mut().ok_or_else(|| {
+                        LazyExecuteError::Execute(ExecuteError::MissingExternalHandler {
+                            kind: "oracle",
+                            name: name.clone(),
+                        })
+                    })?;
+                    Value {
+                        wire: handler
+                            .oracle_bit(context, name, &args, *bit, *occurrence)
+                            .map_err(|error| {
+                                LazyExecuteError::Execute(ExecuteError::Context(error))
+                            })?,
+                        known: None,
+                    }
+                }
+                BIrStmt::RngBit {
+                    name,
+                    bit,
+                    occurrence,
+                } => {
+                    let handler = externals.as_deref_mut().ok_or_else(|| {
+                        LazyExecuteError::Execute(ExecuteError::MissingExternalHandler {
+                            kind: "rng",
+                            name: name.clone(),
+                        })
+                    })?;
+                    Value {
+                        wire: handler.rng_bit(context, name, *bit, *occurrence).map_err(
+                            |error| LazyExecuteError::Execute(ExecuteError::Context(error)),
+                        )?,
+                        known: None,
+                    }
+                }
+                BIrStmt::ActionStoreBit {
+                    name,
+                    guard,
+                    args,
+                    fallback,
+                    storage,
+                    lane,
+                    addr,
+                    bit,
+                    occurrence,
+                } => {
+                    let guard = values.get(*guard).map_err(local)?.wire;
+                    let args: Vec<_> = args
+                        .iter()
+                        .map(|id| values.get(*id).map(|value| value.wire).map_err(local))
+                        .collect::<Result<_, _>>()?;
+                    let fallback = values.get(*fallback).map_err(local)?.wire;
+                    let address: Vec<_> = addr
+                        .iter()
+                        .map(|id| values.get(*id).map_err(local))
+                        .collect::<Result<_, _>>()?;
+                    let bank = find_bank(banks, *storage, *lane).ok_or(
+                        LazyExecuteError::Execute(ExecuteError::MissingStorageBank {
+                            storage: *storage,
+                            lane: *lane,
+                        }),
+                    )?;
+                    validate_address_width(
+                        *storage,
+                        *lane,
+                        address.len(),
+                        banks[bank].address_bits,
+                    )
+                    .map_err(LazyExecuteError::Execute)?;
+                    let address = storage_address(&address);
+                    let handler = externals.as_deref_mut().ok_or_else(|| {
+                        LazyExecuteError::Execute(ExecuteError::MissingExternalHandler {
+                            kind: "action",
+                            name: name.clone(),
+                        })
+                    })?;
+                    handler
+                        .action_store_bit(
+                            context,
+                            name,
+                            guard,
+                            &args,
+                            fallback,
+                            *storage,
+                            *lane,
+                            &address,
+                            *bit,
+                            *occurrence,
+                            banks[bank].value,
+                        )
                         .map_err(|error| LazyExecuteError::Execute(ExecuteError::Context(error)))?;
                     Value {
                         wire: context.create(false).map_err(|error| {
@@ -1899,6 +2323,159 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestExternalRegistry {
+        calls: Vec<(&'static str, usize, u64)>,
+    }
+
+    impl ExternalBitRegistry<CountingContext> for TestExternalRegistry {
+        fn oracle_bit(
+            &mut self,
+            _context: &mut CountingContext,
+            name: &str,
+            args: &[bool],
+            bit: usize,
+            occurrence: u64,
+        ) -> Result<bool, Infallible> {
+            assert_eq!(name, "lookup");
+            self.calls.push(("oracle", bit, occurrence));
+            Ok(args[0] ^ (bit & 1 != 0))
+        }
+
+        fn rng_bit(
+            &mut self,
+            _context: &mut CountingContext,
+            name: &str,
+            bit: usize,
+            occurrence: u64,
+        ) -> Result<bool, Infallible> {
+            assert_eq!(name, "nonce");
+            self.calls.push(("rng", bit, occurrence));
+            Ok((bit as u64 ^ occurrence) & 1 != 0)
+        }
+
+        fn action_store_bit(
+            &mut self,
+            _context: &mut CountingContext,
+            name: &str,
+            guard: bool,
+            args: &[bool],
+            fallback: bool,
+            _storage: StorageId,
+            _lane: LaneId,
+            address: &[StorageAddressBit<bool>],
+            bit: usize,
+            occurrence: u64,
+            cells: &mut DirectStorage,
+        ) -> Result<(), Infallible> {
+            assert_eq!(name, "commit");
+            self.calls.push(("action", bit, occurrence));
+            let index = address
+                .iter()
+                .enumerate()
+                .fold(0usize, |index, (place, value)| {
+                    index | ((value.wire as usize) << place)
+                });
+            cells.cells[index] = if guard {
+                args[bit % args.len()]
+            } else {
+                fallback
+            };
+            cells.writes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dispatches_external_bits_and_actions_store_the_guarded_value() {
+        let circuit = circuit(
+            5,
+            vec![
+                BIrStmt::OracleBit {
+                    name: "lookup".into(),
+                    args: vec![IRVarId(1)],
+                    bit: 0,
+                    occurrence: 11,
+                },
+                BIrStmt::RngBit {
+                    name: "nonce".into(),
+                    bit: 1,
+                    occurrence: 12,
+                },
+                BIrStmt::ActionStoreBit {
+                    name: "commit".into(),
+                    guard: IRVarId(0),
+                    args: vec![IRVarId(5), IRVarId(6)],
+                    fallback: IRVarId(4),
+                    storage: STORAGE,
+                    lane: LANE,
+                    addr: vec![IRVarId(2), IRVarId(3)],
+                    bit: 0,
+                    occurrence: 13,
+                },
+            ],
+            vec![IRVarId(5), IRVarId(6)],
+        );
+        assert_eq!(
+            storage_requirements(&circuit).unwrap(),
+            vec![StorageRequirement {
+                storage: STORAGE,
+                lane: LANE,
+                address_bits: 2,
+                cells: 4,
+            }]
+        );
+
+        let mut storage = DirectStorage {
+            cells: [false; 4],
+            reads: 0,
+            writes: 0,
+        };
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 2,
+            value: &mut storage,
+        }];
+        let mut registry = TestExternalRegistry::default();
+        let outputs = execute_with_externals(
+            &mut CountingContext::default(),
+            &circuit,
+            &[false, true, true, false, true],
+            &mut banks,
+            &mut registry,
+        )
+        .unwrap();
+        assert_eq!(outputs, [true, true]);
+        assert_eq!(storage.cells, [false, true, false, false]);
+        assert_eq!(storage.writes, 1);
+        assert_eq!(
+            registry.calls,
+            vec![("oracle", 0, 11), ("rng", 1, 12), ("action", 0, 13)]
+        );
+    }
+
+    #[test]
+    fn external_bits_fail_closed_without_a_registry() {
+        let circuit = circuit(
+            0,
+            vec![BIrStmt::OracleBit {
+                name: "lookup".into(),
+                args: vec![],
+                bit: 0,
+                occurrence: 0,
+            }],
+            vec![IRVarId(0)],
+        );
+        assert_eq!(
+            execute(&mut CountingContext::default(), &circuit, &[], &mut []).unwrap_err(),
+            ExecuteError::MissingExternalHandler {
+                kind: "oracle",
+                name: "lookup".into(),
+            }
+        );
+    }
+
     #[test]
     fn delegates_storage_to_a_direct_context() {
         let circuit = circuit(
@@ -2046,5 +2623,85 @@ mod tests {
         .unwrap();
         assert_eq!(output, [false]);
         assert_eq!(repository.cache().resident_bytes(), 1);
+    }
+
+    #[test]
+    fn chunked_runner_dispatches_external_bits_and_storage_effects() {
+        let circuit = circuit(
+            5,
+            vec![
+                BIrStmt::OracleBit {
+                    name: "lookup".into(),
+                    args: vec![IRVarId(1)],
+                    bit: 0,
+                    occurrence: 11,
+                },
+                BIrStmt::RngBit {
+                    name: "nonce".into(),
+                    bit: 1,
+                    occurrence: 12,
+                },
+                BIrStmt::ActionStoreBit {
+                    name: "commit".into(),
+                    guard: IRVarId(0),
+                    args: vec![IRVarId(5), IRVarId(6)],
+                    fallback: IRVarId(4),
+                    storage: STORAGE,
+                    lane: LANE,
+                    addr: vec![IRVarId(2), IRVarId(3)],
+                    bit: 0,
+                    occurrence: 13,
+                },
+            ],
+            vec![IRVarId(5), IRVarId(6)],
+        );
+        let codec = TestChunkCodec::default();
+        let mut source = MemorySource::default();
+        let lazy = chunk_b_circuit(&circuit, 1, 8, &codec, &mut source).unwrap();
+        let mut repository = Repository::new(
+            source,
+            CacheConfig {
+                max_resident_bytes: 64,
+                max_chunk_bytes: 64,
+            },
+        );
+        let encrypted = EncryptedScratch::new(
+            TestScratch::default(),
+            [7; 32],
+            [3; 16],
+            ContentId::of(b"boolar-external-test"),
+            1,
+        )
+        .unwrap();
+        let mut scratch = AuthenticatedWireScratch::new(encrypted, BoolWireCodec);
+        let mut storage = DirectStorage {
+            cells: [false; 4],
+            reads: 0,
+            writes: 0,
+        };
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 2,
+            value: &mut storage,
+        }];
+        let mut registry = TestExternalRegistry::default();
+        let output = execute_chunked_with_externals::<_, (), _, _, _, _, _>(
+            &mut CountingContext::default(),
+            &lazy,
+            &mut repository,
+            &codec,
+            &[false, true, true, false, true],
+            &mut banks,
+            &mut scratch,
+            &mut registry,
+        )
+        .unwrap();
+        assert_eq!(output, [true, true]);
+        assert_eq!(storage.cells, [false, true, false, false]);
+        assert_eq!(
+            registry.calls,
+            vec![("oracle", 0, 11), ("rng", 1, 12), ("action", 0, 13)]
+        );
     }
 }

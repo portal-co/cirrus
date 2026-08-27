@@ -7,13 +7,13 @@
 use cipher::consts::U16;
 use cirrus_core::ContextWithCreate;
 use cirrus_recompile_core::Recorder;
-use cirrus_volar_boolar::execute as execute_boolar;
+use cirrus_volar_boolar::{MuxTreeContext, execute as execute_boolar};
 use cirrus_volar_garble::{VolarEvalBackend, VolarGarbleBackend};
 use hybrid_array::Array;
 use sha2::Sha256;
-use volar_spec::garble::{Garble, GlobalSecret};
 use volar_ir::circuit::BCircuit;
 use volar_lir_test_corpus::make_biir_half_adder;
+use volar_spec::garble::{Garble, GlobalSecret};
 
 const CASES: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
 
@@ -31,11 +31,15 @@ impl<T> cirrus_core::Pusher<T> for VecPusher<T> {
 
 fn sample_program() -> cirrus_recompile_core::Program {
     let circuit = BCircuit::try_from_ir(&make_biir_half_adder()).expect("corpus fixture is fused");
-    let mut recorder = Recorder::new();
+    // Boolar's test host uses the ordinary MUX-tree storage adapter even
+    // though this circuit happens not to access storage. This keeps the
+    // recorder host aligned with circuits that do contain direct action
+    // stores or storage reads.
+    let mut recorder = MuxTreeContext::new(Recorder::new());
     let a = recorder.create(false).unwrap();
     let b = recorder.create(false).unwrap();
     let outputs = execute_boolar(&mut recorder, &circuit, &[a, b], &mut []).unwrap();
-    recorder.finish(vec![a, b], outputs)
+    recorder.into_inner().finish(vec![a, b], outputs)
 }
 
 #[test]

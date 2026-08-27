@@ -149,6 +149,10 @@ pub fn compile_aarch64_with_options(
 /// `u32` data.  Each loop uses `ADR` to obtain its table base and executes one
 /// copy of the operation template per row, preserving the pinned-call ABI.
 pub fn compile_prepared_aarch64(program: &PreparedProgram, pinned: &PinnedAddresses) -> Vec<u8> {
+    assert!(
+        program.externals.is_empty(),
+        "AArch64 code generation cannot capture a runtime ExternalRegistry; use cirrus-recompile-rt::execute_prepared_with_externals"
+    );
     program
         .validate()
         .expect("prepared program must satisfy structural invariants");
@@ -354,7 +358,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitAnd { out, .. }
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
-        | PreparedOp::Mux { out, .. } => out,
+        | PreparedOp::Mux { out, .. }
+        | PreparedOp::External { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -625,11 +630,17 @@ fn emit_prepared_call(
                 PreparedArgument::Slot(out),
             ],
         ),
+        PreparedOp::External { .. } => {
+            unreachable!("external programs are rejected before AArch64 emission")
+        }
     };
     let count = match op {
         PreparedOp::Create { .. } => 2,
         PreparedOp::BitAnd { .. } | PreparedOp::BitOr { .. } | PreparedOp::BitXor { .. } => 3,
         PreparedOp::Mux { .. } => 4,
+        PreparedOp::External { .. } => {
+            unreachable!("external programs are rejected before AArch64 emission")
+        }
     };
     emit_pinned_arguments(w, address, &arguments[..count], active_depth);
 }
@@ -807,6 +818,7 @@ mod tests {
             ],
             inputs: Vec::new(),
             outputs: alloc::vec![Idx(2)],
+            externals: Vec::new(),
         };
         let pinned = PinnedAddresses {
             create: 0x1000,
@@ -830,6 +842,7 @@ mod tests {
             ops,
             inputs: Vec::new(),
             outputs: alloc::vec![Idx(32)],
+            externals: Vec::new(),
         };
         let pinned = PinnedAddresses {
             create: 0x1000,

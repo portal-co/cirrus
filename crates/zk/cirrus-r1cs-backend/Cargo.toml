@@ -11,3 +11,6 @@ ark-relations.workspace = true
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
 cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recompile-rt" }
+cirrus-volar-boolar = { version = "0.1.0", path = "../../volar/cirrus-volar-boolar" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }

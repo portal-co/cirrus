@@ -23,8 +23,11 @@
 //! and evaluation steps themselves performed by compiled code instead of by
 //! directly calling `GC`/`Evaluator`.
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux, Pusher};
-use cirrus_garbled_circuit::{GarblingRecord, Label, GC};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
+    Pusher,
+};
+use cirrus_garbled_circuit::{GC, GarblingRecord, Label};
 use cirrus_recompile_core::Program;
 use cirrus_recompile_tests::{EvalBackend, GcBackend, LABEL_BYTES, LabelDigest};
 use cirrus_rust_codegen::{BackendTarget, CompiledProgram};
@@ -70,21 +73,32 @@ fn rust_backend_runs_the_same_program_against_plaintext_and_garbled_circuit_back
         lifetimes: vec!["'a".to_string(), "'b".to_string()],
         extra_crates: vec!["cirrus_recompile_tests".to_string()],
     };
-    let gc_compiled = CompiledProgram::compile(&program, "cirrus_recompile_tests_multi_backend_gc", &gc_target);
+    let gc_compiled = CompiledProgram::compile(
+        &program,
+        "cirrus_recompile_tests_multi_backend_gc",
+        &gc_target,
+    );
 
     let eval_target = BackendTarget {
         module_path: "cirrus_recompile_tests::eval_backend".to_string(),
         lifetimes: vec!["'a".to_string()],
         extra_crates: vec!["cirrus_recompile_tests".to_string()],
     };
-    let eval_compiled = CompiledProgram::compile(&program, "cirrus_recompile_tests_multi_backend_eval", &eval_target);
+    let eval_compiled = CompiledProgram::compile(
+        &program,
+        "cirrus_recompile_tests_multi_backend_eval",
+        &eval_target,
+    );
 
     for &(av, bv) in &[(false, false), (false, true), (true, false), (true, true)] {
         let plaintext = cirrus_recompile_core::interpret(&program, &[false, true, av, bv]);
 
         // --- plaintext backend: the always-available `Context = ()` path ---
         let plaintext_actual = plaintext_compiled.run_plaintext(&program, &[false, true, av, bv]);
-        assert_eq!(plaintext_actual, plaintext, "plaintext backend mismatch for ({av}, {bv})");
+        assert_eq!(
+            plaintext_actual, plaintext,
+            "plaintext backend mismatch for ({av}, {bv})"
+        );
 
         // --- garble: run the "gc"-targeted compiled artifact for real ---
         let mut tables = VecPusher(Vec::new());
@@ -103,16 +117,28 @@ fn rust_backend_runs_the_same_program_against_plaintext_and_garbled_circuit_back
         let garbler_a = Label::new([0x33; LABEL_BYTES]);
         let garbler_b = Label::new([0x44; LABEL_BYTES]);
         let mut garble_buf = vec![Label::new([0u8; LABEL_BYTES]); program.ops.len()];
-        for (&idx, label) in program.inputs.iter().zip([garbler_zero, garbler_one, garbler_a, garbler_b]) {
+        for (&idx, label) in
+            program
+                .inputs
+                .iter()
+                .zip([garbler_zero, garbler_one, garbler_a, garbler_b])
+        {
             garble_buf[idx.get()] = label;
         }
         // SAFETY: `gc_backend`/`garble_buf` are exactly `gc_target`'s
         // `Backend`/`Wrapped` types, and `garble_buf` has `program.ops.len()`
         // elements.
         unsafe {
-            gc_compiled.run_raw(&mut gc_backend as *mut GcBackend<'_, '_, LabelDigest, LABEL_BYTES>, garble_buf.as_mut_ptr());
+            gc_compiled.run_raw(
+                &mut gc_backend as *mut GcBackend<'_, '_, LabelDigest, LABEL_BYTES>,
+                garble_buf.as_mut_ptr(),
+            );
         }
-        let garbled: Vec<Label<LABEL_BYTES>> = program.outputs.iter().map(|idx| garble_buf[idx.get()]).collect();
+        let garbled: Vec<Label<LABEL_BYTES>> = program
+            .outputs
+            .iter()
+            .map(|idx| garble_buf[idx.get()])
+            .collect();
 
         let selected = |zero_label: Label<LABEL_BYTES>, bit: bool| -> [u8; LABEL_BYTES] {
             if bit {
@@ -139,9 +165,16 @@ fn rust_backend_runs_the_same_program_against_plaintext_and_garbled_circuit_back
         // `Backend`/`Wrapped` types, and `eval_buf` has `program.ops.len()`
         // elements.
         unsafe {
-            eval_compiled.run_raw(&mut eval_backend as *mut EvalBackend<'_, LABEL_BYTES>, eval_buf.as_mut_ptr());
+            eval_compiled.run_raw(
+                &mut eval_backend as *mut EvalBackend<'_, LABEL_BYTES>,
+                eval_buf.as_mut_ptr(),
+            );
         }
-        let evaluated: Vec<[u8; LABEL_BYTES]> = program.outputs.iter().map(|idx| eval_buf[idx.get()]).collect();
+        let evaluated: Vec<[u8; LABEL_BYTES]> = program
+            .outputs
+            .iter()
+            .map(|idx| eval_buf[idx.get()])
+            .collect();
 
         for (i, &plaintext_bit) in plaintext.iter().enumerate() {
             assert_eq!(

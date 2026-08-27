@@ -1,7 +1,9 @@
 use std::env;
 use std::path::PathBuf;
 
-use volar_llvm_pass_build::{AutoRegister, PluginPass, ShimConfig, compile_and_link_shim, generate_shim_source, probe};
+use volar_llvm_pass_build::{
+    AutoRegister, PluginPass, ShimConfig, compile_and_link_shim, generate_shim_source, probe,
+};
 
 fn main() {
     let llvm = probe("CIRRUS_LLVM_CONFIG", "LLVM_SYS_221_PREFIX", "22");
@@ -20,7 +22,9 @@ fn main() {
                 // module hook (the FullLinkTimeOptimizationEarlyEP
                 // registration every `AutoRegister` also gets) is the only
                 // phase allowed to resolve cross-module selectors.
-                auto_register: Some(AutoRegister { skip_full_lto_prelink: true }),
+                auto_register: Some(AutoRegister {
+                    skip_full_lto_prelink: true,
+                }),
             },
             PluginPass {
                 pipeline_name: "cirrus-deloopify".into(),

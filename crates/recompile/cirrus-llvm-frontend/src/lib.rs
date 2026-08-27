@@ -199,7 +199,9 @@ pub fn lower_module_prepared_with_options<'module, 'ctx>(
 ) -> Result<PreparedProgram, FrontendError> {
     let mut recorder = RecorderBackend(Recorder::new());
     let execution = execute_module(module, request, &mut recorder)?;
-    Ok(recorder.0.finish_with::<CountdownPreparation>(execution.inputs, execution.outputs, options))
+    Ok(recorder
+        .0
+        .finish_with::<CountdownPreparation>(execution.inputs, execution.outputs, options))
 }
 
 #[cfg(test)]

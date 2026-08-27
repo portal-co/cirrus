@@ -65,7 +65,12 @@ fn decode_at(mem: &RawMemory<'_>, address: u32) -> Option<Inst> {
 /// enclosing loop's latch) that encloses `branch_pc`, without passing
 /// through any other conditional branch or indirect jump. Returns that
 /// latch's not-taken (natural exit) successor address.
-fn resolve_continue(mem: &RawMemory<'_>, start: u32, branch_pc: u32, budget: &mut u16) -> Option<u32> {
+fn resolve_continue(
+    mem: &RawMemory<'_>,
+    start: u32,
+    branch_pc: u32,
+    budget: &mut u16,
+) -> Option<u32> {
     let mut pc = start;
     loop {
         *budget = budget.checked_sub(1)?;
@@ -105,7 +110,11 @@ fn resolve_continue(mem: &RawMemory<'_>, start: u32, branch_pc: u32, budget: &mu
 /// writes, since the natural-exit path never needs eliding (it always
 /// executes for real) and must not be confused with common/shared epilogue
 /// code that happens to also start with an `addi rd, x0, imm`.
-fn resolve_natural_landing(mem: &RawMemory<'_>, natural_exit: u32, budget: &mut u16) -> Option<u32> {
+fn resolve_natural_landing(
+    mem: &RawMemory<'_>,
+    natural_exit: u32,
+    budget: &mut u16,
+) -> Option<u32> {
     let mut pc = natural_exit;
     loop {
         *budget = budget.checked_sub(1)?;
@@ -130,13 +139,21 @@ struct ExitLanding {
 /// instruction at or past it. Reaching anything else — a non-whitelisted
 /// instruction before `merge`, or overshooting past it — is a rejection:
 /// this early-exit path doesn't provably reconverge with the natural exit.
-fn resolve_exit_landing(mem: &RawMemory<'_>, start: u32, merge: u32, budget: &mut u16) -> Option<ExitLanding> {
+fn resolve_exit_landing(
+    mem: &RawMemory<'_>,
+    start: u32,
+    merge: u32,
+    budget: &mut u16,
+) -> Option<ExitLanding> {
     let mut pc = start;
     let mut writes = [None; MAX_EXIT_WRITES];
     let mut write_count = 0usize;
     loop {
         if pc == merge {
-            return Some(ExitLanding { writes, write_count });
+            return Some(ExitLanding {
+                writes,
+                write_count,
+            });
         }
         *budget = budget.checked_sub(1)?;
         match decode_at(mem, pc)? {
@@ -177,7 +194,9 @@ pub(crate) fn recognize(
         };
 
         let mut continue_budget = max_lookahead;
-        let Some(natural_exit) = resolve_continue(mem, continue_start, branch_pc, &mut continue_budget) else {
+        let Some(natural_exit) =
+            resolve_continue(mem, continue_start, branch_pc, &mut continue_budget)
+        else {
             continue;
         };
 
@@ -187,7 +206,8 @@ pub(crate) fn recognize(
         };
 
         let mut exit_budget = max_lookahead;
-        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget) else {
+        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget)
+        else {
             continue;
         };
 

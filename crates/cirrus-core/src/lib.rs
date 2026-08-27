@@ -102,6 +102,49 @@ impl<Val> ContextWithCreate<Val> for () {
         Ok(val)
     }
 }
+
+/// Plaintext dense storage for the native Boolean test host.
+///
+/// Symbolic addresses are concrete `bool`s in this host, so they resolve to
+/// an ordinary little-endian slice index. Bounds are a caller/layout error
+/// and therefore panic just like ordinary slice indexing.
+impl ContextWithStorage<bool> for () {
+    type Storage = [bool];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+    ) -> Result<bool, Self::Error> {
+        Ok(storage[concrete_storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+        value: bool,
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
+fn concrete_storage_index(address: &[StorageAddressBit<bool>]) -> usize {
+    address
+        .iter()
+        .enumerate()
+        .fold(0usize, |index, (bit, address_bit)| {
+            if address_bit.wire {
+                index
+                    | (1usize
+                        .checked_shl(bit as u32)
+                        .expect("plaintext storage address exceeds usize width"))
+            } else {
+                index
+            }
+        })
+}
 #[macro_export]
 macro_rules! context_with_binop {
     ($name:ident, $method:ident, $orig:ident) => {

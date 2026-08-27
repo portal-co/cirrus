@@ -6,7 +6,8 @@
 use core::{array, fmt, marker::PhantomData};
 
 use cirrus_core::{
-    Bit, ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithValue, HasError, Pusher,
+    Bit, ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithStorage,
+    ContextWithValue, HasError, Pusher, StorageAddressBit,
 };
 use digest::{Digest, array::Array};
 
@@ -226,6 +227,28 @@ impl<D: Digest, const N: usize> ContextWithBitOr<bool> for GC<'_, '_, D, N> {
     }
 }
 
+impl<D: Digest, const N: usize> ContextWithStorage<bool> for GC<'_, '_, D, N> {
+    type Storage = [Label<N>];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Label<N>>],
+    ) -> Result<Label<N>, Self::Error> {
+        Ok(storage[concrete_storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Label<N>>],
+        value: Label<N>,
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
 /// A pull-based evaluator for the first-row-fixed garbling format.
 ///
 /// It derives row zero locally and still pulls one three-row record for every
@@ -363,6 +386,50 @@ where
         *left = self.bitor(*left, right)?;
         Ok(())
     }
+}
+
+impl<D: Digest, I, const N: usize> ContextWithStorage<bool> for Evaluator<D, I, N>
+where
+    I: Iterator<Item = GarblingRecord<N>>,
+{
+    type Storage = [[u8; N]];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<[u8; N]>],
+    ) -> Result<[u8; N], Self::Error> {
+        Ok(storage[concrete_storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<[u8; N]>],
+        value: [u8; N],
+    ) -> Result<(), Self::Error> {
+        storage[concrete_storage_index(address)] = value;
+        Ok(())
+    }
+}
+
+fn concrete_storage_index<W>(address: &[StorageAddressBit<W>]) -> usize {
+    address
+        .iter()
+        .enumerate()
+        .fold(0usize, |index, (bit, address_bit)| {
+            if address_bit
+                .known
+                .expect("ERT storage addresses are concrete")
+            {
+                index
+                    | (1usize
+                        .checked_shl(bit as u32)
+                        .expect("ERT storage address exceeds usize width"))
+            } else {
+                index
+            }
+        })
 }
 
 #[cfg(test)]
@@ -506,9 +573,10 @@ mod tests {
 
         let garbled = ert_emit(
             &mut handler,
+            &mut garbled_vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut garbled_rstack,
-            &mut garbled_vstack,
             0,
             &mut garbled_registers,
             &mut garbled_constants,
@@ -541,9 +609,10 @@ mod tests {
 
         let evaluated = ert_emit(
             &mut handler,
+            &mut evaluated_vstack,
+            64,
             RawMemory::from(instructions.as_slice()),
             &mut evaluated_rstack,
-            &mut evaluated_vstack,
             0,
             &mut evaluated_registers,
             &mut evaluated_constants,

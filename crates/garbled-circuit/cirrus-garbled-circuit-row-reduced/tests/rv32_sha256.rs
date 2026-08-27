@@ -303,11 +303,12 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
             hash: bool_no_hash,
         },
     };
-    let bool_result = ert_func::<_, _, 16, 2>(
+    let bool_result = ert_func::<_, _, 16, 2, _>(
         &mut bool_handler,
+        &mut bool_vstack,
+        STACK_SLOTS,
         memory,
         &mut bool_rstack,
-        &mut bool_vstack,
         entry,
         &mut bool_registers,
         &mut bool_constants,
@@ -340,11 +341,12 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
     };
 
     let started = Instant::now();
-    let garbled = ert_func::<_, _, 16, 2>(
+    let garbled = ert_func::<_, _, 16, 2, _>(
         &mut handler,
+        &mut garbled_vstack,
+        STACK_SLOTS,
         memory,
         &mut garbled_rstack,
-        &mut garbled_vstack,
         entry,
         &mut garbled_registers,
         &mut garbled_constants,
@@ -391,11 +393,12 @@ fn rv32_sha256_replays_the_three_row_stream_and_reports_traffic() {
         },
     };
     let started = Instant::now();
-    let evaluated = ert_func::<_, _, 16, 2>(
+    let evaluated = ert_func::<_, _, 16, 2, _>(
         &mut handler,
+        &mut evaluated_vstack,
+        STACK_SLOTS,
         memory,
         &mut evaluated_rstack,
-        &mut evaluated_vstack,
         entry,
         &mut evaluated_registers,
         &mut evaluated_constants,
