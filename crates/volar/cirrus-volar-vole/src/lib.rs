@@ -26,8 +26,14 @@
 
 extern crate alloc;
 
+mod locked;
 mod typed;
 
+pub use locked::{
+    LockedVoleProverContext, LockedVoleProverStorage, LockedVoleProverStorageContext,
+    LockedVoleVerifierContext, LockedVoleVerifierStorage, LockedVoleVerifierStorageContext,
+    MutexPuller, MutexPusher, PullerByRef,
+};
 pub use typed::TypedVoleValue;
 
 use alloc::vec::Vec;
@@ -46,13 +52,13 @@ use hybrid_array::{Array, ArraySize};
 use volar_spec::{
     field::Invert,
     vole::{
-        Delta, Q, VoleArray, Vope,
         bridge::{
             mem_acc_absorb_q, mem_acc_absorb_vope, mem_drain_check, mem_drain_open, q_scale_const,
             vope_scale_const,
         },
         prove::vole_and_prover_step,
         setup::derive_and_q,
+        Delta, VoleArray, Vope, Q,
     },
 };
 
@@ -229,10 +235,10 @@ impl<N: ArraySize, T: Clone + Add<Output = T>, I: Iterator<Item = Array<T, N>>>
     }
 }
 impl<
-    N: ArraySize,
-    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-    I: Iterator<Item = Array<T, N>>,
-> ContextWithBitAnd<bool> for VoleVerifierContext<N, T, I>
+        N: ArraySize,
+        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+        I: Iterator<Item = Array<T, N>>,
+    > ContextWithBitAnd<bool> for VoleVerifierContext<N, T, I>
 {
     fn bitand(&mut self, a: Q<N, T>, b: Q<N, T>) -> Result<Q<N, T>, VoleVerifyError> {
         let hat = self.hats.next().ok_or(VoleVerifyError::HatExhausted)?;
@@ -1147,10 +1153,10 @@ mod tests {
     }
 }
 impl<
-    N: ArraySize,
-    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-    I: Iterator<Item = Array<T, N>>,
-> ContextWithBitOr<bool> for VoleVerifierContext<N, T, I>
+        N: ArraySize,
+        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+        I: Iterator<Item = Array<T, N>>,
+    > ContextWithBitOr<bool> for VoleVerifierContext<N, T, I>
 {
     fn bitor(&mut self, a: Q<N, T>, b: Q<N, T>) -> Result<Q<N, T>, VoleVerifyError> {
         let either = self.bitxor(a.clone(), b.clone())?;
@@ -1163,10 +1169,10 @@ impl<
     }
 }
 impl<
-    N: ArraySize,
-    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-    I: Iterator<Item = Array<T, N>>,
-> ContextWithMux<bool> for VoleVerifierContext<N, T, I>
+        N: ArraySize,
+        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+        I: Iterator<Item = Array<T, N>>,
+    > ContextWithMux<bool> for VoleVerifierContext<N, T, I>
 {
     fn mux(
         &mut self,

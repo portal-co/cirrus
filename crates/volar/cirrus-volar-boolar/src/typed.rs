@@ -13,7 +13,7 @@ use cirrus_recompile_core::{
 use volar_ir::ir::{IRBlockTargetId, IRBlocks, IRStmt, IRTerminator, IRTypeId, IRTypes, IRVarId};
 use volar_ir_common::Constant;
 
-use crate::{VolarTypeMapError, lower_volar_types};
+use crate::{lower_volar_types, VolarTypeMapError};
 
 /// Why a Volar circuit could not be represented by [`TypedProgram`].
 #[derive(Clone, Debug, Eq, PartialEq)]

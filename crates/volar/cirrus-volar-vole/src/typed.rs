@@ -19,7 +19,7 @@ use cirrus_recompile_core::{
 use hybrid_array::ArraySize;
 use volar_spec::{
     field::Invert,
-    vole::{Q, VoleArray, Vope},
+    vole::{VoleArray, Vope, Q},
 };
 
 use crate::{VoleProverContext, VoleVerifierContext};

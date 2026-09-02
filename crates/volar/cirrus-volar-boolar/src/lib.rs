@@ -11,13 +11,14 @@ extern crate alloc;
 mod typed;
 mod types;
 
-pub use typed::{TypedLowerError, lower_volar_circuit};
-pub use types::{VolarTypeMap, VolarTypeMapError, lower_volar_types};
+pub use typed::{lower_volar_circuit, TypedLowerError};
+pub use types::{lower_volar_types, VolarTypeMap, VolarTypeMapError};
 
 use alloc::{string::String, vec::Vec};
 use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,
-    ContextWithValue, HasError, StorageAddressBit,
+    ContextWithBitAnd, ContextWithBitAndByRef, ContextWithBitOr, ContextWithBitOrByRef,
+    ContextWithBitXor, ContextWithBitXorByRef, ContextWithCreate, ContextWithCreateByRef,
+    ContextWithStorage, ContextWithValue, HasError, StorageAddressBit,
 };
 use lazy_repo::{ChunkCodec, Repository};
 use lazy_repo_crypto::{EncryptedScratch, ScratchSlot, ScratchStore};
@@ -185,6 +186,15 @@ where
     }
 }
 
+impl<C> ContextWithCreateByRef<bool> for MuxTreeContext<C>
+where
+    C: ContextWithCreateByRef<bool>,
+{
+    fn create_by_ref(&self, value: bool) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.create_by_ref(value)
+    }
+}
+
 impl<C> ContextWithBitAnd<bool> for MuxTreeContext<C>
 where
     C: ContextWithBitAnd<bool>,
@@ -203,6 +213,27 @@ where
         right: Self::Wrapped,
     ) -> Result<(), Self::Error> {
         self.inner.bitand_assign(left, right)
+    }
+}
+
+impl<C> ContextWithBitAndByRef<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitAndByRef<bool>,
+{
+    fn bitand_by_ref(
+        &self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitand_by_ref(left, right)
+    }
+
+    fn bitand_assign_by_ref(
+        &self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitand_assign_by_ref(left, right)
     }
 }
 
@@ -227,6 +258,27 @@ where
     }
 }
 
+impl<C> ContextWithBitOrByRef<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitOrByRef<bool>,
+{
+    fn bitor_by_ref(
+        &self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitor_by_ref(left, right)
+    }
+
+    fn bitor_assign_by_ref(
+        &self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitor_assign_by_ref(left, right)
+    }
+}
+
 impl<C> ContextWithBitXor<bool> for MuxTreeContext<C>
 where
     C: ContextWithBitXor<bool>,
@@ -245,6 +297,27 @@ where
         right: Self::Wrapped,
     ) -> Result<(), Self::Error> {
         self.inner.bitxor_assign(left, right)
+    }
+}
+
+impl<C> ContextWithBitXorByRef<bool> for MuxTreeContext<C>
+where
+    C: ContextWithBitXorByRef<bool>,
+{
+    fn bitxor_by_ref(
+        &self,
+        left: Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<Self::Wrapped, Self::Error> {
+        self.inner.bitxor_by_ref(left, right)
+    }
+
+    fn bitxor_assign_by_ref(
+        &self,
+        left: &mut Self::Wrapped,
+        right: Self::Wrapped,
+    ) -> Result<(), Self::Error> {
+        self.inner.bitxor_assign_by_ref(left, right)
     }
 }
 
@@ -1848,19 +1921,19 @@ mod tests {
     use cirrus_core::{
         ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, HasError,
     };
-    use cirrus_recompile_core::{Recorder, interpret};
+    use cirrus_recompile_core::{interpret, Recorder};
     use core::convert::Infallible;
     use lazy_repo::{CacheConfig, ContentId, MemorySource};
     use std::{cell::RefCell, collections::BTreeMap};
     use volar_ir::boolar::BIrPreInitSegment;
-    use volar_ir::lazy::{BStmtChunk, chunk_b_circuit};
+    use volar_ir::lazy::{chunk_b_circuit, BStmtChunk};
     use volar_ir_common::Node;
 
     #[test]
     fn bounded_riscv_fixture_lowers_to_initialized_five_bit_memory() {
         use volar_riscv_test_programs::{parse_and_expand, wat_gen::test_program_wat};
         use volar_vaffle_target::{
-            VaffleTarget, import_config::WaffleImportConfig, waffle_lower::lower_waffle_module,
+            import_config::WaffleImportConfig, waffle_lower::lower_waffle_module, VaffleTarget,
         };
 
         let wasm = wat::parse_str(test_program_wat()).expect("RISC fixture WAT should assemble");
