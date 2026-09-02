@@ -10,7 +10,7 @@ Dense [`StorageBank`](src/lib.rs) is `&mut [Wire]` of `2^address_bits` cells. WA
 
 1. Add a `Storage` (or `SparseBank`) that materializes a cell on first read/write, keyed by the integer address. **Done when** a 34-bit lane with two live cells allocates two cells, not `2^34`.
 2. Keep the `known_storage_address` fast path. **Done when** constant addresses still skip the MUX tree.
-3. Symbolic addresses MUX over the *live* set, or fail closed with a named error if that set is unbounded. **Done when** a symbolic 24-bit (`2^24` cell) read over two live cells does not build a 16-million-way tree (site `wasm-loop` currently allocates the 16 MiB image but only *interprets* an 8-bit further trim).
+3. Symbolic addresses MUX over the *live* set, or fail closed with a named error if that set is unbounded. **Done when** a symbolic 24-bit (`2^24` cell) read over two live cells does not build a 16-million-way tree. Site `wasm-loop` now interprets the trimmed 24-bit guest through native VOLE storage (`VoleProverStorage` / `VoleVerifierStorage`) rather than a MUX tree; this handoff is the MuxTree/sparse-cell path for unauthenticated dense/sparse banks.
 4. `storage_requirements` grows a sparse mode that reports `address_bits` without `cells = 2^address_bits`. **Done when** `execute` accepts an untrimmed fused WASM guest.
 5. Site `wasm-loop` (`site/crates/proofs/src/wasm_loop.rs`) drops the trim once `wasm_looped_circuit_cirrus_prove_verify` passes on the untrimmed 34-bit guest. **Done when** that test no longer calls `trim_storage_element_bits`.
 
