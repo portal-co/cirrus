@@ -21,7 +21,8 @@
 //! slice) and calls [`ert_func`] in-process; extra ABI words live in the
 //! virtual stack, and results come back in `a0`–`a7` (then stacked words).
 //! QEMU / on-device firmware is the same instruction subset, not a different
-//! interpreter. See this workspace's `crates/ert/frontend-choice.md`.
+//! interpreter. WASM and LLVM ingest are sibling paths; this crate does not
+//! rank them. See this workspace's `crates/ert/frontend-choice.md`.
 //!
 //! [`RawMemory::from_slice`] maps guest address zero to a borrowed host buffer
 //! and safely bounds every access. The unsafe [`RawMemory::new`] constructor is

@@ -998,11 +998,15 @@ where
 }
 
 fn cells_for_address_bits(bits: usize) -> Result<usize, StorageLayoutError> {
-    let shift =
-        u32::try_from(bits).map_err(|_| StorageLayoutError::AddressWidthOverflow { bits })?;
-    1usize
-        .checked_shl(shift)
-        .ok_or(StorageLayoutError::AddressWidthOverflow { bits })
+    // Dense `StorageBank` is `2^bits` cells. LLVM fused guests emit 64-bit
+    // STACK / VAFFLE_SSA_SPILL addresses (`2^64` does not fit `usize`).
+    // Native VOLE / `SparseBank` ignore `cells`; report 0 so layout still
+    // names the lane. `AddressWidthOverflow` stays for API consumers that
+    // refuse an unrepresentable dense image.
+    let Ok(shift) = u32::try_from(bits) else {
+        return Ok(0);
+    };
+    Ok(1usize.checked_shl(shift).unwrap_or(0))
 }
 
 fn validate_banks<S: ?Sized, E>(banks: &[StorageBank<'_, S>]) -> Result<(), ExecuteError<E>> {
@@ -2108,6 +2112,29 @@ mod tests {
             vec![true]
         );
         assert_eq!(cells, [false, true, true, false]);
+    }
+
+    #[test]
+    fn sixty_four_bit_lane_reports_zero_dense_cells() {
+        let addr: Vec<IRVarId> = (0..64).map(IRVarId).collect();
+        let circuit = circuit(
+            64,
+            vec![BIrStmt::StorageRead {
+                storage: STORAGE,
+                lane: LANE,
+                addr,
+            }],
+            vec![IRVarId(64)],
+        );
+        assert_eq!(
+            storage_requirements(&circuit),
+            Ok(vec![StorageRequirement {
+                storage: STORAGE,
+                lane: LANE,
+                address_bits: 64,
+                cells: 0,
+            }])
+        );
     }
 
     #[test]
