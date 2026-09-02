@@ -8,9 +8,13 @@
 
 extern crate alloc;
 
+mod address_trim;
 mod typed;
 mod types;
 
+pub use address_trim::{
+    trim_storage_addr_width, trim_storage_element_bits, AddressTrimError, WASM_BYTE_ADDRESS_BITS,
+};
 pub use typed::{lower_volar_circuit, TypedLowerError};
 pub use types::{lower_volar_types, VolarTypeMap, VolarTypeMapError};
 
@@ -321,7 +325,13 @@ where
     }
 }
 
-/// Caller-owned storage for one Boolar storage lane.
+/// Caller-owned **dense** storage for one Boolar storage lane.
+///
+/// `value` is `2^address_bits` cells. WASM/spill lowering emits 32-bit element
+/// pointers; Boolar appends bit-index high bits (e.g. 34 wires). Dense fit is
+/// [`trim_storage_element_bits`] plus [`trim_storage_addr_width`] at
+/// [`WASM_BYTE_ADDRESS_BITS`] (16 MiB). Sparse cell backing (no `2^n`
+/// allocation) is the handoff in `sparse-banks.md`.
 ///
 /// The namespace routing is intentionally kept here rather than in
 /// [`ContextWithStorage`]: an implementation can therefore use the same
