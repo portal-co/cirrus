@@ -9,12 +9,14 @@
 extern crate alloc;
 
 mod address_trim;
+mod sparse;
 mod typed;
 mod types;
 
 pub use address_trim::{
     trim_storage_addr_width, trim_storage_element_bits, AddressTrimError, WASM_BYTE_ADDRESS_BITS,
 };
+pub use sparse::{SparseBank, SparseMuxTreeContext, SparseStorageError};
 pub use typed::{lower_volar_circuit, TypedLowerError};
 pub use types::{lower_volar_types, VolarTypeMap, VolarTypeMapError};
 
@@ -34,7 +36,7 @@ use volar_ir::{
 };
 use volar_ir_common::StorageId;
 
-type Wire<C> = <C as ContextWithValue<bool>>::Wrapped;
+pub(crate) type Wire<C> = <C as ContextWithValue<bool>>::Wrapped;
 
 /// The Boolean operations required by [`execute`].
 pub trait BoolarContext:
@@ -418,9 +420,9 @@ pub enum ExecuteError<E> {
 }
 
 #[derive(Clone)]
-struct Value<W> {
-    wire: W,
-    known: Option<bool>,
+pub(crate) struct Value<W> {
+    pub(crate) wire: W,
+    pub(crate) known: Option<bool>,
 }
 
 impl<C> ContextWithStorage<bool> for MuxTreeContext<C>
@@ -497,7 +499,7 @@ where
     }
 }
 
-fn known_storage_address<W>(address: &[StorageAddressBit<W>]) -> Option<usize> {
+pub(crate) fn known_storage_address<W>(address: &[StorageAddressBit<W>]) -> Option<usize> {
     let mut index = 0usize;
     for (bit, value) in address.iter().enumerate() {
         let value = value.known?;
@@ -1098,7 +1100,7 @@ fn validate_address_width<E>(
     Ok(())
 }
 
-fn apply_and<C>(
+pub(crate) fn apply_and<C>(
     context: &mut C,
     left: Value<Wire<C>>,
     right: Value<Wire<C>>,
@@ -1163,7 +1165,7 @@ where
     })
 }
 
-fn one<C>(
+pub(crate) fn one<C>(
     context: &mut C,
     canonical_one: &mut Option<Wire<C>>,
 ) -> Result<Wire<C>, ExecuteError<C::Error>>
@@ -1179,7 +1181,7 @@ where
     Ok(value)
 }
 
-fn apply_not<C>(
+pub(crate) fn apply_not<C>(
     context: &mut C,
     input: Value<Wire<C>>,
     canonical_one: &mut Option<Wire<C>>,
@@ -1198,7 +1200,7 @@ where
     })
 }
 
-fn apply_mux<C>(
+pub(crate) fn apply_mux<C>(
     context: &mut C,
     select: Value<Wire<C>>,
     when_zero: Value<Wire<C>>,
@@ -1221,18 +1223,39 @@ where
     Ok(result)
 }
 
-fn candidates<W>(address: &[Value<W>], cells: usize) -> (Vec<usize>, Vec<usize>) {
-    let unknown_bits: Vec<usize> = address
+/// Bit positions of `address` that are not statically known.
+pub(crate) fn unknown_bits<W>(address: &[Value<W>]) -> Vec<usize> {
+    address
         .iter()
         .enumerate()
         .filter_map(|(bit, value)| value.known.is_none().then_some(bit))
-        .collect();
-    if unknown_bits.is_empty() {
+        .collect()
+}
+
+/// Whether the concrete cell `index` is consistent with `address`'s known
+/// bits (an unknown bit is always consistent; a known bit must match).
+///
+/// Shared by the dense [`candidates`] (which checks every `0..cells`) and
+/// [`sparse`]'s live-set scan (which checks only materialized keys).
+pub(crate) fn index_matches_known_bits<W>(index: usize, address: &[Value<W>]) -> bool {
+    address.iter().enumerate().all(|(bit, value)| {
+        if bit >= usize::BITS as usize {
+            return value.known != Some(true);
+        }
+        value
+            .known
+            .is_none_or(|expected| ((index >> bit) & 1 != 0) == expected)
+    })
+}
+
+fn candidates<W>(address: &[Value<W>], cells: usize) -> (Vec<usize>, Vec<usize>) {
+    let unknown = unknown_bits(address);
+    if unknown.is_empty() {
         let mut index = 0usize;
         for (bit, value) in address.iter().enumerate() {
             if value.known == Some(true) {
                 if bit >= usize::BITS as usize {
-                    return (Vec::new(), unknown_bits);
+                    return (Vec::new(), unknown);
                 }
                 index |= 1usize << bit;
             }
@@ -1243,22 +1266,13 @@ fn candidates<W>(address: &[Value<W>], cells: usize) -> (Vec<usize>, Vec<usize>)
             } else {
                 Vec::new()
             },
-            unknown_bits,
+            unknown,
         );
     }
     let cells = (0..cells)
-        .filter(|cell| {
-            address.iter().enumerate().all(|(bit, value)| {
-                if bit >= usize::BITS as usize {
-                    return value.known != Some(true);
-                }
-                value
-                    .known
-                    .is_none_or(|expected| ((cell >> bit) & 1 != 0) == expected)
-            })
-        })
+        .filter(|&cell| index_matches_known_bits(cell, address))
         .collect();
-    (cells, unknown_bits)
+    (cells, unknown)
 }
 
 fn read_mux_storage<C>(
@@ -2260,6 +2274,198 @@ mod tests {
         assert_eq!(pruned_context.inner().xors, 5);
         assert_eq!(full_context.inner().ands, 10);
         assert_eq!(full_context.inner().xors, 10);
+    }
+
+    fn sparse_known_address(bits: usize, index: u64) -> Vec<StorageAddressBit<bool>> {
+        (0..bits)
+            .map(|bit| {
+                let value = (index >> bit) & 1 == 1;
+                StorageAddressBit {
+                    wire: value,
+                    known: Some(value),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sparse_bank_only_materializes_touched_cells_for_a_34_bit_lane() {
+        let mut context = SparseMuxTreeContext::new(());
+        let mut bank = SparseBank::<bool>::new();
+
+        context
+            .storage_write(&mut bank, &sparse_known_address(34, 5), true)
+            .unwrap();
+        context
+            .storage_write(&mut bank, &sparse_known_address(34, 1 << 30), false)
+            .unwrap();
+        assert_eq!(bank.live_len(), 2, "only the two touched cells exist");
+
+        assert!(context
+            .storage_read(&mut bank, &sparse_known_address(34, 5))
+            .unwrap());
+        assert!(!context
+            .storage_read(&mut bank, &sparse_known_address(34, 1 << 30))
+            .unwrap());
+        // An untouched address defaults to false and materializes on read.
+        assert!(!context
+            .storage_read(&mut bank, &sparse_known_address(34, 42))
+            .unwrap());
+        assert_eq!(bank.live_len(), 3);
+    }
+
+    #[test]
+    fn sparse_known_address_access_never_touches_the_mux_tree() {
+        let mut context = SparseMuxTreeContext::new(CountingContext::default());
+        let mut bank = SparseBank::<bool>::new();
+
+        context
+            .storage_write(&mut bank, &sparse_known_address(34, 5), true)
+            .unwrap();
+        let value = context
+            .storage_read(&mut bank, &sparse_known_address(34, 5))
+            .unwrap();
+        assert!(value);
+        assert_eq!(context.inner().ands, 0);
+        assert_eq!(context.inner().ors, 0);
+        assert_eq!(context.inner().xors, 0);
+    }
+
+    #[test]
+    fn symbolic_read_over_two_live_cells_uses_a_small_gate_count() {
+        let mut context = SparseMuxTreeContext::new(CountingContext::default());
+        let mut bank = SparseBank::<bool>::new();
+
+        context
+            .storage_write(&mut bank, &sparse_known_address(24, 3), true)
+            .unwrap();
+        context
+            .storage_write(&mut bank, &sparse_known_address(24, 9), false)
+            .unwrap();
+        assert_eq!(bank.live_len(), 2);
+
+        let unknown_address: Vec<StorageAddressBit<bool>> = (0..24)
+            .map(|_| StorageAddressBit {
+                wire: false,
+                known: None,
+            })
+            .collect();
+        context.storage_read(&mut bank, &unknown_address).unwrap();
+
+        // Two live cells over 24 unknown bits: a handful of gates, nowhere
+        // near a 16-million-way dense tree.
+        assert!(context.inner().ands < 100, "ands = {}", context.inner().ands);
+        assert!(context.inner().xors < 100, "xors = {}", context.inner().xors);
+    }
+
+    #[test]
+    fn symbolic_write_succeeds_when_every_candidate_is_already_live() {
+        let mut context = SparseMuxTreeContext::new(());
+        let mut bank = SparseBank::<bool>::new();
+
+        // Both 2-bit addresses consistent with bit1 == false are pre-touched.
+        context
+            .storage_write(&mut bank, &sparse_known_address(2, 0), false)
+            .unwrap();
+        context
+            .storage_write(&mut bank, &sparse_known_address(2, 1), false)
+            .unwrap();
+
+        let symbolic_address = vec![
+            StorageAddressBit {
+                wire: true,
+                known: None,
+            },
+            StorageAddressBit {
+                wire: false,
+                known: Some(false),
+            },
+        ];
+        context
+            .storage_write(&mut bank, &symbolic_address, true)
+            .unwrap();
+
+        assert!(!context
+            .storage_read(&mut bank, &sparse_known_address(2, 0))
+            .unwrap());
+        assert!(context
+            .storage_read(&mut bank, &sparse_known_address(2, 1))
+            .unwrap());
+    }
+
+    #[test]
+    fn symbolic_write_to_a_not_fully_live_candidate_set_fails_closed() {
+        let mut context = SparseMuxTreeContext::new(());
+        let mut bank = SparseBank::<bool>::new();
+
+        // Only index 0 is live; index 1 (the other candidate for bit0
+        // unknown, bit1 known false) has never been touched.
+        context
+            .storage_write(&mut bank, &sparse_known_address(2, 0), false)
+            .unwrap();
+
+        let symbolic_address = vec![
+            StorageAddressBit {
+                wire: true,
+                known: None,
+            },
+            StorageAddressBit {
+                wire: false,
+                known: Some(false),
+            },
+        ];
+        let error = context
+            .storage_write(&mut bank, &symbolic_address, true)
+            .unwrap_err();
+        assert_eq!(error, SparseStorageError::UnboundedWrite);
+    }
+
+    #[test]
+    fn sparse_bank_composes_with_execute() {
+        let write_known = circuit(
+            1,
+            vec![
+                BIrStmt::Zero,
+                BIrStmt::StorageWrite {
+                    storage: STORAGE,
+                    lane: LANE,
+                    src: IRVarId(0),
+                    addr: vec![IRVarId(1)],
+                },
+            ],
+            vec![],
+        );
+        let read_symbolic = circuit(
+            1,
+            vec![BIrStmt::StorageRead {
+                storage: STORAGE,
+                lane: LANE,
+                addr: vec![IRVarId(0)],
+            }],
+            vec![IRVarId(1)],
+        );
+        let mut bank = SparseBank::<bool>::new();
+        let mut context = SparseMuxTreeContext::new(());
+
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 1,
+            value: &mut bank,
+        }];
+        execute(&mut context, &write_known, &[true], &mut banks).unwrap();
+        assert_eq!(bank.live_len(), 1);
+
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 1,
+            value: &mut bank,
+        }];
+        // The input param (false) matches the written index (0), exercising
+        // the genuinely symbolic (unknown-bit) read path end to end.
+        let outputs = execute(&mut context, &read_symbolic, &[false], &mut banks).unwrap();
+        assert_eq!(outputs, vec![true]);
     }
 
     #[test]
