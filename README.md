@@ -65,15 +65,25 @@ An unknown shift amount emits five symbolic selection stages and an unknown
 multiplicand emits fixed long-multiplication rounds; concrete metadata routes
 both operations through smaller specialized circuits.
 
+The same interpreter is the host path and the embedded path. `ert_func` runs
+a mapped RV32 image on a desktop or server (caller-owned virtual stack,
+instruction bytes in `RawMemory::from_slice`). Bare-metal QEMU is a
+compatibility gate for the same firmware, not the only supported venue. Site
+`site-proofs-guest` uses the host `ert_func` loop: one call per event, event
+words in the virtual stack, output in a result register.
+
 It is intended for circuit-oriented execution, not as a general RISC-V
 emulator. Programs must use the documented supported instruction subset,
 aligned non-compressed control flow, concrete branch decisions, conventional
 calls and returns, and caller-provided stacks with sufficient capacity. The
 [crate documentation](crates/ert/cirrus-ert/src/lib.rs) describes the supported
-instructions, buffers, ECALLs, and public entry points.
+instructions, buffers, ECALLs, and public entry points. When to use ERT versus
+WASM/LLVM → VAFFLE → Boolar: [frontend-choice.md](crates/ert/frontend-choice.md).
 
 Instruction images are supplied through `RawMemory`. `RawMemory::from(&slice)`
 safely creates a bounded mapping for a host buffer; its lifetime keeps the
 buffer borrowed. `unsafe RawMemory::new(...)` is reserved for an unbounded
 bare-metal mapping at native RV32 addresses, without claiming that address zero
-is the start of a valid 4 GiB slice.
+is the start of a valid 4 GiB slice. Host tests that relocate a QEMU-linked
+ELF (workload at `0x8000_0000`) use the unbounded constructor with a pointer
+adjusted so guest addresses land in the mapped buffer.
