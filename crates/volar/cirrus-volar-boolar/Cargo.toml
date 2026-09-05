@@ -4,11 +4,15 @@ edition = "2024"
 version.workspace = true
 description = "Execute Volar Boolar circuits through Cirrus Boolean contexts"
 
+[features]
+llvm-smoke = ["dep:volar-ir-build"]
+
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
 volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git", features = ["lazy"] }
 volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-build = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git", features = ["llvm"], optional = true }
 lazy-repo = { path = "../../../../lazy-repo/crates/lazy-repo", default-features = false }
 lazy-repo-crypto = { path = "../../../../lazy-repo/crates/lazy-repo-crypto", default-features = false }
 
@@ -16,3 +20,7 @@ lazy-repo-crypto = { path = "../../../../lazy-repo/crates/lazy-repo-crypto", def
 volar-vaffle-target = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 volar-riscv-test-programs = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 wat = "1.212.0"
+
+[[test]]
+name = "llvm_pipeline"
+required-features = ["llvm-smoke"]

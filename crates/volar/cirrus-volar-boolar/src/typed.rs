@@ -11,9 +11,9 @@ use cirrus_recompile_core::{
     TypedProgram, TypedProgramError,
 };
 use volar_ir::ir::{IRBlockTargetId, IRBlocks, IRStmt, IRTerminator, IRTypeId, IRTypes, IRVarId};
-use volar_ir_common::Constant;
+use volar_ir_common::{Constant, PolyCoeffs};
 
-use crate::{lower_volar_types, VolarTypeMapError};
+use crate::{VolarTypeMapError, lower_volar_types};
 
 /// Why a Volar circuit could not be represented by [`TypedProgram`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,13 +118,13 @@ impl Builder {
         &mut self,
         values: &[ValueRef],
         ty: TypeId,
-        coeffs: &alloc::collections::BTreeMap<Vec<IRVarId>, u8>,
+        coeffs: &PolyCoeffs<IRVarId>,
         constant: Constant,
     ) -> Result<Idx, TypedLowerError> {
         let is_bit = self.program.types.is_bit(ty);
         let mut acc = self.constant(ty, constant)?;
-        for (monomial, coefficient) in coeffs {
-            if coefficient & 1 == 0 {
+        for (monomial, coefficient) in coeffs.iter() {
+            if *coefficient & 1 == 0 {
                 continue;
             }
             let product = if is_bit {
@@ -592,7 +592,7 @@ pub fn lower_volar_circuit<P: Clone>(
 mod tests {
     use super::*;
     use volar_ir::ir::{IRBlock, IRBranchTarget, IRType};
-    use volar_ir_common::{ActionTarget, StorageId, Type};
+    use volar_ir_common::{ActionTarget, PolyCoeffs, StorageId, Type};
 
     #[test]
     fn lowers_typed_externals_without_erasing_wide_values() {
@@ -715,5 +715,72 @@ mod tests {
                 .bits
                 == 8
         }));
+    }
+
+    #[test]
+    fn lowers_poly_coeffs_for_bit_and_wide_values() {
+        let mut types = IRTypes::new();
+        let bit = types.bit();
+        let byte = types.primitive(Type::_8);
+
+        let mut bit_block = IRBlock {
+            params: alloc::vec![bit, bit],
+            stmts: Vec::new(),
+            terminator: IRTerminator::Jmp {
+                target: IRBranchTarget::new(IRBlockTargetId::Return, alloc::vec![IRVarId(2)]),
+            },
+        };
+        bit_block.push_stmt(
+            IRStmt::Poly {
+                ty: bit,
+                coeffs: [(alloc::vec![IRVarId(0)], 1), (alloc::vec![IRVarId(1)], 1)]
+                    .into_iter()
+                    .collect::<PolyCoeffs<_>>(),
+                constant: Constant { hi: 0, lo: 1 },
+            },
+            (),
+        );
+        let bit_program =
+            lower_volar_circuit(&IRBlocks::new(alloc::vec![bit_block]), &types).unwrap();
+        assert_eq!(
+            bit_program
+                .ops
+                .iter()
+                .filter(|op| matches!(
+                    op,
+                    TypedOp::Binary {
+                        op: TypedBinaryOp::Xor,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+
+        let mut wide_block = IRBlock {
+            params: alloc::vec![bit, byte],
+            stmts: Vec::new(),
+            terminator: IRTerminator::Jmp {
+                target: IRBranchTarget::new(IRBlockTargetId::Return, alloc::vec![IRVarId(2)]),
+            },
+        };
+        wide_block.push_stmt(
+            IRStmt::Poly {
+                ty: byte,
+                coeffs: [(alloc::vec![IRVarId(0), IRVarId(1)], 1)]
+                    .into_iter()
+                    .collect::<PolyCoeffs<_>>(),
+                constant: Constant { hi: 0, lo: 0 },
+            },
+            (),
+        );
+        let wide_program =
+            lower_volar_circuit(&IRBlocks::new(alloc::vec![wide_block]), &types).unwrap();
+        assert!(
+            wide_program
+                .ops
+                .iter()
+                .any(|op| matches!(op, TypedOp::Mux { .. }))
+        );
     }
 }

@@ -352,10 +352,11 @@ pub struct StorageBank<'a, S: ?Sized> {
 
 /// The dense storage allocation required for one Boolar storage lane.
 ///
-/// `cells` is always a non-zero power of two and is suitable for directly
-/// constructing a [`StorageBank`].  Requirements include lanes referenced
-/// only by [`BCircuit::pre_init`], so callers can allocate storage before the
-/// first execution rather than discovering a missing bank midway through it.
+/// `cells` is a non-zero power of two when a dense image fits in `usize`; it
+/// is zero for an address width that requires sparse backing. Requirements
+/// include lanes referenced only by [`BCircuit::pre_init`], so callers can
+/// allocate storage before the first execution rather than discovering a
+/// missing bank midway through it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageRequirement {
     pub storage: StorageId,
@@ -376,15 +377,14 @@ pub enum StorageLayoutError {
         first: usize,
         second: usize,
     },
-    /// A pre-initialisation segment cannot be represented in a `usize` bank.
-    PreInitOffsetOverflow { storage: StorageId, lane: LaneId },
-    /// Static data extends beyond the lane capacity implied by its addresses.
+    /// Static data extends beyond the lane's declared address width.
     PreInitOutOfBounds {
         storage: StorageId,
         lane: LaneId,
-        offset: u64,
+        /// LSB-first address at which this segment starts.
+        addr: Vec<bool>,
         data_len: usize,
-        cells: usize,
+        address_bits: usize,
     },
 }
 
@@ -516,7 +516,7 @@ pub(crate) fn known_storage_address<W>(address: &[StorageAddressBit<W>]) -> Opti
 /// Derive the dense storage banks needed by `circuit`.
 ///
 /// Every storage statement for one `(storage, lane)` pair must use the same
-/// address width. Static initialization is checked against that capacity.
+/// address width. Static initialization is checked against that width.
 pub fn storage_requirements<P: Clone>(
     circuit: &BCircuit<P>,
 ) -> Result<Vec<StorageRequirement>, StorageLayoutError> {
@@ -573,49 +573,42 @@ pub fn storage_requirements<P: Clone>(
     }
 
     for segment in &circuit.pre_init {
-        let data_len = u64::try_from(segment.data.len()).map_err(|_| {
-            StorageLayoutError::PreInitOffsetOverflow {
-                storage: segment.storage,
-                lane: segment.lane,
-            }
-        })?;
-        let end = segment.offset.checked_add(data_len).ok_or(
-            StorageLayoutError::PreInitOffsetOverflow {
-                storage: segment.storage,
-                lane: segment.lane,
-            },
-        )?;
+        let Some(last_addr) = segment
+            .data
+            .len()
+            .checked_sub(1)
+            .map(|offset| add_static_address(&segment.addr, offset))
+        else {
+            continue;
+        };
         if let Some((requirement, has_access)) = requirements.iter_mut().find(|(requirement, _)| {
             requirement.storage == segment.storage && requirement.lane == segment.lane
         }) {
-            if end > requirement.cells as u64 {
-                return Err(StorageLayoutError::PreInitOutOfBounds {
-                    storage: segment.storage,
-                    lane: segment.lane,
-                    offset: segment.offset,
-                    data_len: segment.data.len(),
-                    cells: requirement.cells,
-                });
+            if *has_access {
+                if !static_address_fits(&last_addr, requirement.address_bits) {
+                    return Err(StorageLayoutError::PreInitOutOfBounds {
+                        storage: segment.storage,
+                        lane: segment.lane,
+                        addr: segment.addr.clone(),
+                        data_len: segment.data.len(),
+                        address_bits: requirement.address_bits,
+                    });
+                }
+            } else {
+                let address_bits = requirement
+                    .address_bits
+                    .max(address_bits_required(&last_addr));
+                requirement.address_bits = address_bits;
+                requirement.cells = cells_for_address_bits(address_bits)?;
             }
-            debug_assert!(*has_access);
         } else {
-            let minimum_cells =
-                usize::try_from(end).map_err(|_| StorageLayoutError::PreInitOffsetOverflow {
-                    storage: segment.storage,
-                    lane: segment.lane,
-                })?;
-            let cells = minimum_cells.max(1).checked_next_power_of_two().ok_or(
-                StorageLayoutError::PreInitOffsetOverflow {
-                    storage: segment.storage,
-                    lane: segment.lane,
-                },
-            )?;
+            let address_bits = address_bits_required(&last_addr);
             requirements.push((
                 StorageRequirement {
                     storage: segment.storage,
                     lane: segment.lane,
-                    address_bits: cells.trailing_zeros() as usize,
-                    cells,
+                    address_bits,
+                    cells: cells_for_address_bits(address_bits)?,
                 },
                 false,
             ));
@@ -647,14 +640,9 @@ where
     for segment in &circuit.pre_init {
         let bank = find_bank(banks, segment.storage, segment.lane)
             .expect("validated pre-init storage bank");
-        let start = usize::try_from(segment.offset).map_err(|_| {
-            ExecuteError::StorageLayout(StorageLayoutError::PreInitOffsetOverflow {
-                storage: segment.storage,
-                lane: segment.lane,
-            })
-        })?;
         for (offset, bit) in segment.data.iter().copied().enumerate() {
-            let address = constant_address(context, start + offset, banks[bank].address_bits)?;
+            let static_address = add_static_address(&segment.addr, offset);
+            let address = constant_address(context, &static_address, banks[bank].address_bits)?;
             let value = context.create(bit).map_err(ExecuteError::Context)?;
             context
                 .storage_write(banks[bank].value, &address, value)
@@ -1057,18 +1045,62 @@ fn storage_address<W: Clone>(address: &[Value<W>]) -> Vec<StorageAddressBit<W>> 
         .collect()
 }
 
+/// Add a host-side offset to a static LSB-first Boolean address.
+///
+/// Boolar addresses are not platform integers: high bits are significant even
+/// when they exceed `usize`, so carry is propagated in the bit vector itself.
+fn add_static_address(address: &[bool], mut offset: usize) -> Vec<bool> {
+    let mut result = address.to_vec();
+    let mut bit = 0;
+    while offset != 0 {
+        if bit == result.len() {
+            result.push(false);
+        }
+        if offset & 1 != 0 {
+            let mut carry = true;
+            let mut at = bit;
+            while carry {
+                if at == result.len() {
+                    result.push(false);
+                }
+                let next = result[at] ^ carry;
+                carry &= result[at];
+                result[at] = next;
+                at += 1;
+            }
+        }
+        offset >>= 1;
+        bit += 1;
+    }
+    result
+}
+
+fn address_bits_required(address: &[bool]) -> usize {
+    address
+        .iter()
+        .rposition(|bit| *bit)
+        .map_or(0, |bit| bit + 1)
+}
+
+fn static_address_fits(address: &[bool], address_bits: usize) -> bool {
+    address[address_bits.min(address.len())..]
+        .iter()
+        .all(|bit| !*bit)
+}
+
 fn constant_address<C>(
     context: &mut C,
-    address: usize,
+    address: &[bool],
     address_bits: usize,
 ) -> Result<Vec<StorageAddressBit<Wire<C>>>, ExecuteError<C::Error>>
 where
     C: BoolarContext,
     Wire<C>: Clone,
 {
+    debug_assert!(static_address_fits(address, address_bits));
     (0..address_bits)
         .map(|bit| {
-            let value = (address >> bit) & 1 != 0;
+            let value = address.get(bit).copied().unwrap_or(false);
             Ok(StorageAddressBit {
                 wire: context.create(value).map_err(ExecuteError::Context)?,
                 known: Some(value),
@@ -2091,7 +2123,7 @@ mod tests {
         circuit.pre_init = vec![BIrPreInitSegment {
             storage: STORAGE,
             lane: LANE,
-            offset: 0,
+            addr: vec![false, false],
             data: vec![false, true, true, false],
         }];
         assert_eq!(
@@ -2115,9 +2147,45 @@ mod tests {
     }
 
     #[test]
-    fn sixty_four_bit_lane_reports_zero_dense_cells() {
+    fn preinitialization_uses_lsb_first_addresses_and_carry() {
+        let mut circuit = circuit(
+            3,
+            vec![BIrStmt::StorageRead {
+                storage: STORAGE,
+                lane: LANE,
+                addr: vec![IRVarId(0), IRVarId(1), IRVarId(2)],
+            }],
+            vec![IRVarId(3)],
+        );
+        // 0b011 followed by the next address, 0b100.
+        circuit.pre_init = vec![BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            addr: vec![true, true, false],
+            data: vec![true, false],
+        }];
+        let mut cells = [false; 8];
+        let mut banks = [mux_bank(&mut cells, 3)];
+        let mut context = MuxTreeContext::new(());
+
+        assert_eq!(
+            execute(&mut context, &circuit, &[true, true, false], &mut banks).unwrap(),
+            vec![true]
+        );
+        assert_eq!(
+            execute(&mut context, &circuit, &[false, false, true], &mut banks).unwrap(),
+            vec![false]
+        );
+        assert_eq!(
+            cells,
+            [false, false, false, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn preinitializes_a_sixty_four_bit_sparse_lane() {
         let addr: Vec<IRVarId> = (0..64).map(IRVarId).collect();
-        let circuit = circuit(
+        let mut circuit = circuit(
             64,
             vec![BIrStmt::StorageRead {
                 storage: STORAGE,
@@ -2135,6 +2203,25 @@ mod tests {
                 cells: 0,
             }])
         );
+        circuit.pre_init = vec![BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            addr: vec![false; 64],
+            data: vec![true],
+        }];
+        let mut bank = SparseBank::<bool>::new();
+        let mut banks = [StorageBank {
+            storage: STORAGE,
+            lane: LANE,
+            address_bits: 64,
+            value: &mut bank,
+        }];
+        let mut context = SparseMuxTreeContext::new(());
+        assert_eq!(
+            execute(&mut context, &circuit, &vec![false; 64], &mut banks).unwrap(),
+            vec![true]
+        );
+        assert_eq!(bank.live_len(), 1);
     }
 
     #[test]
@@ -2151,7 +2238,7 @@ mod tests {
         circuit.pre_init = vec![BIrPreInitSegment {
             storage: STORAGE,
             lane: LANE,
-            offset: 3,
+            addr: vec![true, true],
             data: vec![true, false],
         }];
         assert_eq!(
@@ -2159,9 +2246,9 @@ mod tests {
             Err(StorageLayoutError::PreInitOutOfBounds {
                 storage: STORAGE,
                 lane: LANE,
-                offset: 3,
+                addr: vec![true, true],
                 data_len: 2,
-                cells: 4,
+                address_bits: 2,
             })
         );
     }
@@ -2188,7 +2275,7 @@ mod tests {
         circuit.pre_init = vec![BIrPreInitSegment {
             storage: STORAGE,
             lane: LANE,
-            offset: 0,
+            addr: vec![false],
             data: vec![false, false],
         }];
         let mut cells = [true; 2];

@@ -64,11 +64,23 @@ LLVM IR
 
 Same shape strategy as WASM: calls preserved, then unroll (concrete CF) or
 movfuscate (symbolic CF). Distinct from LLVM-direct above.
-`volar-ir-build` feature `llvm`. Constant-size scalar `alloca` and `switch`
-import are landed ([`llvm-alloca.md`](../../../volar-ir/docs/llvm-alloca.md));
-entry-param unpacking + Boolar fuse too
-([`llvm-stack-spill-boolar.md`](../../../volar-ir/docs/llvm-stack-spill-boolar.md)).
-Array/struct `alloca` is the rustc `-O0` / SLH-DSA ingest blocker
-([`llvm-array-alloca.md`](../../../volar-ir/docs/llvm-array-alloca.md)).
+Use the `volar-ir-build` `llvm` feature. Scalar and array-of-integer `alloca`,
+typed-view GEPs, `switch`, and normal calls now preserve correct stack/frame
+layout ([`llvm-alloca.md`](../../../volar-ir/docs/llvm-alloca.md),
+[`llvm-array-alloca.md`](../../../volar-ir/docs/llvm-array-alloca.md),
+[`llvm-cross-function-calls.md`](../../../volar-ir/docs/llvm-cross-function-calls.md)).
+Symbolic single-index stack/global GEP, pointer-identity dispatch, and
+nonvolatile symbolic `memcpy`/`memset` lower to circuits for movfuscation
+([`llvm-dynamic-stack-gep.md`](../../../volar-ir/docs/llvm-dynamic-stack-gep.md),
+[`llvm-dynamic-global-gep.md`](../../../volar-ir/docs/llvm-dynamic-global-gep.md),
+[`llvm-ptr-runtime-dispatch.md`](../../../volar-ir/docs/llvm-ptr-runtime-dispatch.md),
+[`llvm-memset-symbolic.md`](../../../volar-ir/docs/llvm-memset-symbolic.md)).
+The lowering also carries the newer polynomial and fusion optimizations through
+Boolar ([`llvm-boolar-poly.md`](../../../volar-ir/docs/llvm-boolar-poly.md),
+[`llvm-fuse-unroll.md`](../../../volar-ir/docs/llvm-fuse-unroll.md)). Actual
+limits remain `invoke`/unwind, structs and general aggregate values,
+multi-index GEPs, symbolic `memmove`, heap allocation, and deliberately
+unbounded expansion. Dead `landingpad` blocks are skipped; reachable exception
+handling is not ([`llvm-landingpad.md`](../../../volar-ir/docs/llvm-landingpad.md)).
 Fused STACK addresses are 64-bit; `storage_requirements` reports `cells = 0`
 (dense `2^64` does not fit). Needs the same LLVM 22 toolchain.
