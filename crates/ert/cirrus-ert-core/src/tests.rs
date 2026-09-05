@@ -1,6 +1,10 @@
 extern crate std;
 
-use crate::{ComparePredicate, RawMemory, compare_word};
+use crate::{
+    add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
+    arm_runtime_shift_with_carry, compare_word, subtract_overflow, subtract_word_with_carry_out,
+    zero_word, ComparePredicate, RawMemory, Shift,
+};
 
 fn word(value: u32) -> [bool; 32] {
     core::array::from_fn(|bit| (value >> bit) & 1 != 0)
@@ -53,6 +57,119 @@ fn signed_comparisons_match_i32_ordering() {
             );
         }
     }
+}
+
+#[test]
+fn arithmetic_status_primitives_report_carry_and_zero() {
+    let (sum, carry) = add_bits_with_carry_out(&mut (), &word(u32::MAX), &word(1), false)
+        .expect("native Boolean addition cannot fail");
+    assert_eq!(sum, word(0));
+    assert!(carry);
+    assert!(zero_word(&mut (), &sum, &true).unwrap());
+
+    let (difference, no_borrow) =
+        subtract_word_with_carry_out(&mut (), &word(0), &word(1), &true).unwrap();
+    assert_eq!(difference, word(u32::MAX));
+    assert!(!no_borrow);
+
+    let (_, no_borrow) =
+        subtract_word_with_carry_out(&mut (), &word(u32::MAX), &word(1), &true).unwrap();
+    assert!(no_borrow);
+}
+
+#[test]
+fn overflow_and_arm_conditions_match_the_nzcv_truth_table() {
+    assert!(add_overflow(&mut (), false, false, true).unwrap());
+    assert!(subtract_overflow(&mut (), false, true, true).unwrap());
+    assert!(!add_overflow(&mut (), false, true, true).unwrap());
+    assert!(!subtract_overflow(&mut (), true, true, false).unwrap());
+
+    for bits in 0..16u8 {
+        let n = bits & 8 != 0;
+        let z = bits & 4 != 0;
+        let c = bits & 2 != 0;
+        let v = bits & 1 != 0;
+        for condition in 0..=14 {
+            let expected = match condition {
+                0 => z,
+                1 => !z,
+                2 => c,
+                3 => !c,
+                4 => n,
+                5 => !n,
+                6 => v,
+                7 => !v,
+                8 => c && !z,
+                9 => !c || z,
+                10 => n == v,
+                11 => n != v,
+                12 => !z && n == v,
+                13 => z || n != v,
+                14 => true,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                arm_condition_value(Some(n), Some(z), Some(c), Some(v), condition),
+                Some(Some(expected)),
+                "NZCV={n}{z}{c}{v}, condition={condition}"
+            );
+            assert_eq!(
+                arm_condition(&mut (), n, z, c, v, condition, &true).unwrap(),
+                Some(expected),
+                "NZCV={n}{z}{c}{v}, condition={condition}"
+            );
+        }
+    }
+    assert_eq!(
+        arm_condition_value(Some(false), None, None, None, 0),
+        Some(None)
+    );
+    assert_eq!(
+        arm_condition_value(None, None, None, None, 14),
+        Some(Some(true))
+    );
+    assert_eq!(arm_condition_value(None, None, None, None, 15), None);
+}
+
+#[test]
+fn arm_shift_carry_uses_register_count_rules() {
+    let (result, carry) = arm_runtime_shift_with_carry(
+        &mut (),
+        &word(0x8000_0000),
+        &word(1),
+        Shift::Left,
+        &false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result, word(0));
+    assert!(carry);
+
+    // A nonzero rotate count that is a multiple of 32 leaves the data in
+    // place but still writes C from the top output bit.
+    let (result, carry) = arm_runtime_shift_with_carry(
+        &mut (),
+        &word(0x4000_0001),
+        &word(32),
+        Shift::RotateRight,
+        &false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(result, word(0x4000_0001));
+    assert!(!carry);
+
+    let (result, carry) = arm_runtime_shift_with_carry(
+        &mut (),
+        &word(0x8000_0000),
+        &word(33),
+        Shift::ArithmeticRight,
+        &false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result, word(u32::MAX));
+    assert!(carry);
 }
 
 #[test]

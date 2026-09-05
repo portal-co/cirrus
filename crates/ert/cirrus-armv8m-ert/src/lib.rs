@@ -6,8 +6,8 @@
 //!
 //! The interpreter represents every architectural word as 32 little-endian
 //! Boolean wires and keeps an optional concrete word beside it. Concrete data
-//! resolves branches, IT conditions, addresses outside the symbolic stack, and
-//! the small host-call ABI; symbolic data is emitted through
+//! resolves branches, addresses outside the symbolic stack, and the small
+//! host-call ABI; symbolic data is emitted through
 //! [`ContextWithArmv8mOps`]. The data-flow circuits, stack model, raw-memory
 //! handling, selectors, shifts, and multipliers are shared with `cirrus-ert`.
 //! For constrained streaming-garbled deployments, this Thumb facade is the
@@ -23,14 +23,16 @@
 //! Supported compiler-oriented forms include scalar moves and constants,
 //! arithmetic and logical instructions, immediate and register shifts/rotates,
 //! scalar and long multiplication, stack and concrete loads/stores, Thumb
-//! branches/calls/returns, IT blocks, `SVC #0`, and the Secure/Non-secure
+//! branches/calls/returns, APSR NZCVQ transfers, and a one-instruction
+//! register-value IT materializer, `SVC #0`, and the Secure/Non-secure
 //! interworking instructions `SG`, `BXNS`, and `BLXNS`. ARM uses its architectural
 //! register-shift count rules rather than RV32's low-five-bit rule. Symbolic
 //! shifts and multiplications synthesize selection circuits; a known shift
 //! count or multiplicand takes the smaller constant path.
 //!
-//! Control decisions, non-stack symbolic addresses, unsupported encodings,
-//! Arm-state targets, and malformed Thumb images are rejected. `SVC #0` with
+//! Control decisions, non-stack symbolic addresses, multi-instruction or
+//! non-register symbolic IT blocks, unsupported encodings, Arm-state targets,
+//! and malformed Thumb images are rejected. `SVC #0` with
 //! concrete `r0 = 0` calls the eight-word hash callback with `r1` through `r8`;
 //! `r0 = u32::MAX` exits once `sp` is restored. [`ert_func`] applies the
 //! AAPCS32 word ABI: `r0` through `r3`, then a full-descending stack aligned to
@@ -66,8 +68,10 @@ use cirrus_core::{
     HasError, StorageAddressBit,
 };
 use cirrus_ert_core::{
-    BitOp, Product, Shift, add_bits, bitwise_word, concrete_product, constant_word, fixed_shift,
-    invert_word, partial_and_not_word, partial_bitwise_word, select_word,
+    add_bits, add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
+    arm_runtime_shift_with_carry, bitwise_word, concrete_product, constant_word, fixed_shift,
+    invert_word, partial_and_not_word, partial_bitwise_word, select_word, subtract_overflow,
+    zero_word, BitOp, Product, Shift,
 };
 #[cfg(feature = "prepared-recording")]
 use cirrus_recompile_core::{Idx, PreparedRecorder};
@@ -889,6 +893,7 @@ enum Op {
         right: u8,
         add: Option<u8>,
         subtract: bool,
+        set_flags: bool,
     },
     LongMultiply {
         dest_low: u8,
@@ -954,6 +959,12 @@ enum Op {
         nonzero: bool,
         target: u32,
     },
+    ReadApsr {
+        dest: u8,
+    },
+    WriteApsr {
+        source: u8,
+    },
     Call {
         target: u32,
     },
@@ -972,6 +983,54 @@ enum Op {
     },
     Svc(u8),
 }
+
+#[derive(Clone)]
+struct Flag<W> {
+    wire: FlagWire<W>,
+    value: Option<bool>,
+}
+
+/// A symbolic status bit which is lowered only when an instruction observes it.
+///
+/// Arithmetic already has a carry wire, but Z and V otherwise require a
+/// reduction or a small Boolean circuit.  Keeping their inputs here means
+/// ordinary flag-setting data instructions retain their previous gate shape.
+#[derive(Clone)]
+enum FlagWire<W> {
+    Direct(W),
+    Zero([W; 32]),
+    AddOverflow {
+        left: W,
+        right: W,
+        result: W,
+    },
+    SubOverflow {
+        left: W,
+        right: W,
+        result: W,
+    },
+    ShiftCarry {
+        source: [W; 32],
+        amount: [W; 32],
+        direction: Shift,
+        old: W,
+    },
+}
+
+impl<W: Clone> Flag<W> {
+    fn concrete(wire: W, value: bool) -> Self {
+        Self {
+            wire: FlagWire::Direct(wire),
+            value: Some(value),
+        }
+    }
+}
+
+const FLAG_N: usize = 0;
+const FLAG_Z: usize = 1;
+const FLAG_C: usize = 2;
+const FLAG_V: usize = 3;
+const FLAG_Q: usize = 4;
 
 struct Decoded {
     operation: Op,
@@ -992,7 +1051,7 @@ struct Machine<'a, W, E> {
     stack_top: u32,
     rsp: usize,
     offsets: [Option<i32>; REG_COUNT],
-    flags: [Option<bool>; 4],
+    flags: [Flag<W>; 5],
     itstate: u8,
     security_state: SecurityState,
     #[cfg(feature = "early-exit-loops")]
@@ -1021,13 +1080,13 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             pc,
             regs,
             constants,
-            zero,
+            zero: zero.clone(),
             one,
             sp,
             stack_top: sp,
             rsp: 0,
             offsets: [None; REG_COUNT],
-            flags: [Some(false); 4],
+            flags: array::from_fn(|_| Flag::concrete(zero.clone(), false)),
             itstate: 0,
             security_state: SecurityState::Secure,
             #[cfg(feature = "early-exit-loops")]
@@ -1046,15 +1105,18 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             if is_it && self.itstate != 0 {
                 return Err(ErtError::Unexpected);
             }
-            let execute = if is_it {
-                true
-            } else {
-                self.condition_passed()?
-            };
-            let flow = if execute {
+            let flow = if is_it {
                 self.execute(decoded.operation, decoded.len)?
+            } else if self.itstate == 0 {
+                self.execute(decoded.operation, decoded.len)?
+            } else if let Some(execute) = self.condition_value((self.itstate >> 4) & 15)? {
+                if execute {
+                    self.execute(decoded.operation, decoded.len)?
+                } else {
+                    Flow::Next(self.pc.wrapping_add(decoded.len))
+                }
             } else {
-                Flow::Next(self.pc.wrapping_add(decoded.len))
+                self.execute_symbolic_it(decoded.operation, decoded.len)?
             };
             if !is_it && self.itstate != 0 {
                 self.advance_it();
@@ -1081,34 +1143,22 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn condition_passed(&self) -> Result<bool, ErtError<E>> {
-        if self.itstate == 0 {
-            return Ok(true);
-        }
-        self.condition((self.itstate >> 4) & 15)
+    fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
+        let n = self.flags[FLAG_N].value;
+        let z = self.flags[FLAG_Z].value;
+        let c = self.flags[FLAG_C].value;
+        let v = self.flags[FLAG_V].value;
+        arm_condition_value(n, z, c, v, condition).ok_or(ErtError::Unexpected)
     }
 
-    fn condition(&self, condition: u8) -> Result<bool, ErtError<E>> {
-        let [n, z, c, v] = self.flags;
-        let required = |flag: Option<bool>| flag.ok_or(ErtError::Unexpected);
-        match condition {
-            0 => Ok(required(z)?),
-            1 => Ok(!required(z)?),
-            2 => Ok(required(c)?),
-            3 => Ok(!required(c)?),
-            4 => Ok(required(n)?),
-            5 => Ok(!required(n)?),
-            6 => Ok(required(v)?),
-            7 => Ok(!required(v)?),
-            8 => Ok(required(c)? && !required(z)?),
-            9 => Ok(!required(c)? || required(z)?),
-            10 => Ok(required(n)? == required(v)?),
-            11 => Ok(required(n)? != required(v)?),
-            12 => Ok(!required(z)? && required(n)? == required(v)?),
-            13 => Ok(required(z)? || required(n)? != required(v)?),
-            14 => Ok(true),
-            _ => Err(ErtError::Unexpected),
-        }
+    fn condition_wire(&mut self, condition: u8) -> Result<W, ErtError<E>> {
+        let n = self.materialize_flag(FLAG_N)?;
+        let z = self.materialize_flag(FLAG_Z)?;
+        let c = self.materialize_flag(FLAG_C)?;
+        let v = self.materialize_flag(FLAG_V)?;
+        arm_condition(self.t, n, z, c, v, condition, &self.one)
+            .map_err(ErtError::Emitted)?
+            .ok_or(ErtError::Unexpected)
     }
 
     fn advance_it(&mut self) {
@@ -1117,6 +1167,66 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         } else {
             self.itstate = (self.itstate & 0xe0) | ((self.itstate << 1) & 0x1f);
         }
+    }
+
+    fn execute_symbolic_it(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+        // A symbolic condition may only materialize a value. Multi-instruction
+        // IT blocks and every non-register effect would otherwise require
+        // symbolic control flow.
+        if self.itstate & 7 != 0 {
+            return Err(ErtError::Unexpected);
+        }
+        let condition = self.condition_wire((self.itstate >> 4) & 15)?;
+        let (dest, candidate, value, set_flags) = match operation {
+            Op::Move {
+                dest,
+                source,
+                set_flags,
+            } if dest < SP => {
+                let (word, value) = self.operand(source)?;
+                (dest, word, value, set_flags)
+            }
+            Op::MoveNot {
+                dest,
+                source,
+                set_flags,
+            } if dest < SP => {
+                let (word, value) = self.operand(source)?;
+                (
+                    dest,
+                    invert_word(self.t, &word, self.one.clone()).map_err(ErtError::Emitted)?,
+                    value.map(|value| !value),
+                    set_flags,
+                )
+            }
+            _ => return Err(ErtError::Unexpected),
+        };
+        let old_word = self.regs[dest as usize].clone();
+        let old_flags = self.flags.clone();
+        let selected = select_word(self.t, condition.clone(), &candidate, &old_word)
+            .map_err(ErtError::Emitted)?;
+        self.write(dest, selected, None);
+        if set_flags {
+            self.set_nz(&candidate, value)?;
+            let candidate_flags = self.flags.clone();
+            self.flags = old_flags;
+            // MOVS/MVNS only write N and Z. C, V, and the unsupported-DSP Q
+            // bit retain their old architectural state on both paths.
+            for index in [FLAG_N, FLAG_Z] {
+                let old = self.materialize_flag(index)?;
+                let new = self.materialize_wire(candidate_flags[index].wire.clone())?;
+                let difference = self.t.bitxor(new, old.clone()).map_err(ErtError::Emitted)?;
+                let gated = self
+                    .t
+                    .bitand(condition.clone(), difference)
+                    .map_err(ErtError::Emitted)?;
+                self.flags[index] = Flag {
+                    wire: FlagWire::Direct(self.t.bitxor(old, gated).map_err(ErtError::Emitted)?),
+                    value: None,
+                };
+            }
+        }
+        self.next(len)
     }
 
     fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
@@ -1148,7 +1258,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                     self.offsets[dest as usize] = self.offsets[source as usize];
                 }
                 if set_flags {
-                    self.set_nz(value);
+                    let result = self.regs[dest as usize].clone();
+                    self.set_nz(&result, value)?;
                 }
                 self.next(len)
             }
@@ -1177,7 +1288,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 let value = value.map(|value| !value);
                 self.write(dest, word, value);
                 if set_flags {
-                    self.set_nz(value);
+                    let result = self.regs[dest as usize].clone();
+                    self.set_nz(&result, value)?;
                 }
                 self.next(len)
             }
@@ -1226,7 +1338,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 };
                 self.write(dest, word, value);
                 if set_flags {
-                    self.set_nz(value);
+                    let result = self.regs[dest as usize].clone();
+                    self.set_nz(&result, value)?;
                 }
                 self.next(len)
             }
@@ -1279,28 +1392,24 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 };
                 self.write(dest, word, value);
                 if set_flags {
-                    self.set_nz(value);
+                    let result = self.regs[dest as usize].clone();
+                    self.set_nz(&result, value)?;
                 }
                 self.next(len)
             }
-            Op::Compare { left, right, add } => {
-                let (_, left_value) = self.operand(left)?;
-                let (_, right_value) = self.operand(right)?;
-                if add {
-                    self.set_add_flags(left_value, right_value, false);
-                } else {
-                    self.set_sub_flags(left_value, right_value, true);
-                }
-                self.next(len)
-            }
+            Op::Compare { left, right, add } => self.compare(left, right, add, len),
             Op::Test { left, right } => {
-                let (_, left_value) = self.operand(left)?;
-                let (_, right_value) = self.operand(right)?;
-                self.set_nz(
-                    left_value
-                        .zip(right_value)
-                        .map(|(left, right)| left & right),
-                );
+                let (left_word, left_value) = self.operand(left)?;
+                let (right_word, right_value) = self.operand(right)?;
+                let value = left_value
+                    .zip(right_value)
+                    .map(|(left, right)| left & right);
+                let word = match value {
+                    Some(value) => self.word_from_constant(value),
+                    None => bitwise_word(self.t, &left_word, &right_word, BitOp::And)
+                        .map_err(ErtError::Emitted)?,
+                };
+                self.set_nz(&word, value)?;
                 self.next(len)
             }
             Op::Shift {
@@ -1310,10 +1419,14 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 amount,
                 set_flags,
             } => {
+                let source_word = self.regs[source as usize].clone();
+                let source_value = self.constants[source as usize];
                 let (word, value) = self.shift_word(source, direction, amount)?;
                 self.write(dest, word, value);
                 if set_flags {
-                    self.set_nz(value);
+                    let result = self.regs[dest as usize].clone();
+                    self.set_nz(&result, value)?;
+                    self.set_shift_carry(&source_word, source_value, direction, amount)?;
                 }
                 self.next(len)
             }
@@ -1323,7 +1436,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 right,
                 add,
                 subtract,
-            } => self.multiply(dest, left, right, add, subtract, len),
+                set_flags,
+            } => self.multiply(dest, left, right, add, subtract, set_flags, len),
             Op::LongMultiply {
                 dest_low,
                 dest_high,
@@ -1385,7 +1499,9 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 write_back,
             } => self.store_multiple(base, list, write_back, len),
             Op::Branch { target, condition } => {
-                let taken = condition.map_or(Ok(true), |condition| self.condition(condition))?;
+                let taken = condition.map_or(Ok(true), |condition| {
+                    self.condition_value(condition)?.ok_or(ErtError::Unexpected)
+                })?;
                 Ok(Flow::Next(if taken {
                     target
                 } else {
@@ -1414,6 +1530,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
                 Err(ErtError::Unexpected)
             }
+            Op::ReadApsr { dest } => self.read_apsr(dest, len),
+            Op::WriteApsr { source } => self.write_apsr(source, len),
             Op::Call { target } => self.call(target, len),
             Op::CallRegister { register } => {
                 let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
@@ -1466,6 +1584,41 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     fn write_constant(&mut self, register: u8, value: u32) {
         self.write(register, self.word_from_constant(value), Some(value));
+    }
+
+    fn read_apsr(&mut self, dest: u8, len: u32) -> Result<Flow, ErtError<E>> {
+        if dest >= SP {
+            return Err(ErtError::Unexpected);
+        }
+        let mut word = self.word_from_constant(0);
+        for offset in 0..=FLAG_Q {
+            word[31 - offset] = self.materialize_flag(offset)?;
+        }
+        let value = self
+            .flags
+            .iter()
+            .enumerate()
+            .try_fold(0u32, |value, (offset, flag)| {
+                flag.value
+                    .map(|set| value | ((set as u32) << (31 - offset)))
+            });
+        self.write(dest, word, value);
+        self.next(len)
+    }
+
+    fn write_apsr(&mut self, source: u8, len: u32) -> Result<Flow, ErtError<E>> {
+        if source >= SP {
+            return Err(ErtError::Unexpected);
+        }
+        let word = self.regs[source as usize].clone();
+        let value = self.constants[source as usize];
+        for offset in 0..=FLAG_Q {
+            self.flags[offset] = Flag {
+                wire: FlagWire::Direct(word[31 - offset].clone()),
+                value: value.map(|value| (value >> (31 - offset)) & 1 != 0),
+            };
+        }
+        self.next(len)
     }
 
     /// Attempt the opt-in "deoptimize secret-dependent early-exit loops"
@@ -1547,38 +1700,138 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         Ok(Some(Flow::Next(site.continue_target)))
     }
 
-    fn set_nz(&mut self, value: Option<u32>) {
-        self.flags[0] = value.map(|value| value >> 31 != 0);
-        self.flags[1] = value.map(|value| value == 0);
+    fn flag(&self, wire: W, value: Option<bool>) -> Flag<W> {
+        Flag {
+            wire: FlagWire::Direct(wire),
+            value,
+        }
     }
 
-    fn set_add_flags(&mut self, left: Option<u32>, right: Option<u32>, carry: bool) {
-        let value = left
-            .zip(right)
-            .map(|(left, right)| left.wrapping_add(right).wrapping_add(carry as u32));
-        self.set_nz(value);
-        self.flags[2] = left
-            .zip(right)
-            .map(|(left, right)| (left as u64 + right as u64 + carry as u64) >> 32 != 0);
-        self.flags[3] = left.zip(right).map(|(left, right)| {
-            let result = left.wrapping_add(right).wrapping_add(carry as u32);
-            ((left ^ result) & (right ^ result) & 0x8000_0000) != 0
-        });
+    fn materialize_wire(&mut self, wire: FlagWire<W>) -> Result<W, ErtError<E>> {
+        match wire {
+            FlagWire::Direct(wire) => Ok(wire),
+            FlagWire::Zero(word) => zero_word(self.t, &word, &self.one).map_err(ErtError::Emitted),
+            FlagWire::AddOverflow {
+                left,
+                right,
+                result,
+            } => add_overflow(self.t, left, right, result).map_err(ErtError::Emitted),
+            FlagWire::SubOverflow {
+                left,
+                right,
+                result,
+            } => subtract_overflow(self.t, left, right, result).map_err(ErtError::Emitted),
+            FlagWire::ShiftCarry {
+                source,
+                amount,
+                direction,
+                old,
+            } => arm_runtime_shift_with_carry(self.t, &source, &amount, direction, &self.zero, old)
+                .map(|(_, carry)| carry)
+                .map_err(ErtError::Emitted),
+        }
     }
 
-    fn set_sub_flags(&mut self, left: Option<u32>, right: Option<u32>, carry: bool) {
-        let borrow = !carry;
-        let value = left
-            .zip(right)
-            .map(|(left, right)| left.wrapping_sub(right).wrapping_sub(borrow as u32));
-        self.set_nz(value);
-        self.flags[2] = left
-            .zip(right)
-            .map(|(left, right)| left >= right.wrapping_add(borrow as u32));
-        self.flags[3] = left.zip(right).map(|(left, right)| {
-            let result = left.wrapping_sub(right).wrapping_sub(borrow as u32);
-            ((left ^ right) & (left ^ result) & 0x8000_0000) != 0
-        });
+    fn materialize_flag(&mut self, index: usize) -> Result<W, ErtError<E>> {
+        let wire = self.materialize_wire(self.flags[index].wire.clone())?;
+        self.flags[index].wire = FlagWire::Direct(wire.clone());
+        Ok(wire)
+    }
+
+    fn set_nz(&mut self, word: &[W; 32], value: Option<u32>) -> Result<(), ErtError<E>> {
+        self.flags[FLAG_N] = self.flag(word[31].clone(), value.map(|value| value >> 31 != 0));
+        let zero = match value {
+            Some(value) => Flag::concrete(
+                if value == 0 {
+                    self.one.clone()
+                } else {
+                    self.zero.clone()
+                },
+                value == 0,
+            ),
+            None => Flag {
+                wire: FlagWire::Zero(word.clone()),
+                value: None,
+            },
+        };
+        self.flags[FLAG_Z] = zero;
+        Ok(())
+    }
+
+    fn set_add_flags(
+        &mut self,
+        left: &[W; 32],
+        right: &[W; 32],
+        result: &[W; 32],
+        carry_out: W,
+        left_value: Option<u32>,
+        right_value: Option<u32>,
+        carry_in: Option<bool>,
+    ) -> Result<(), ErtError<E>> {
+        let value = left_value
+            .zip(right_value)
+            .zip(carry_in)
+            .map(|((left, right), carry)| left.wrapping_add(right).wrapping_add(carry as u32));
+        self.set_nz(result, value)?;
+        self.flags[FLAG_C] = self.flag(
+            carry_out,
+            left_value
+                .zip(right_value)
+                .zip(carry_in)
+                .map(|((left, right), carry)| {
+                    (left as u64 + right as u64 + carry as u64) >> 32 != 0
+                }),
+        );
+        self.flags[FLAG_V] = Flag {
+            wire: FlagWire::AddOverflow {
+                left: left[31].clone(),
+                right: right[31].clone(),
+                result: result[31].clone(),
+            },
+            value: value.map(|result| {
+                let left = left_value.expect("concrete result requires concrete left");
+                let right = right_value.expect("concrete result requires concrete right");
+                ((left ^ result) & (right ^ result) & 0x8000_0000) != 0
+            }),
+        };
+        Ok(())
+    }
+
+    fn set_sub_flags(
+        &mut self,
+        left: &[W; 32],
+        right: &[W; 32],
+        result: &[W; 32],
+        carry_out: W,
+        left_value: Option<u32>,
+        right_value: Option<u32>,
+        carry_in: Option<bool>,
+    ) -> Result<(), ErtError<E>> {
+        let value = left_value
+            .zip(right_value)
+            .zip(carry_in)
+            .map(|((left, right), carry)| left.wrapping_sub(right).wrapping_sub((!carry) as u32));
+        self.set_nz(result, value)?;
+        self.flags[FLAG_C] = self.flag(
+            carry_out,
+            left_value
+                .zip(right_value)
+                .zip(carry_in)
+                .map(|((left, right), carry)| (left as u64) >= right as u64 + (!carry) as u64),
+        );
+        self.flags[FLAG_V] = Flag {
+            wire: FlagWire::SubOverflow {
+                left: left[31].clone(),
+                right: right[31].clone(),
+                result: result[31].clone(),
+            },
+            value: value.map(|result| {
+                let left = left_value.expect("concrete result requires concrete left");
+                let right = right_value.expect("concrete result requires concrete right");
+                ((left ^ right) & (left ^ result) & 0x8000_0000) != 0
+            }),
+        };
+        Ok(())
     }
 
     fn operand(&mut self, operand: Operand) -> Result<([W; 32], Option<u32>), ErtError<E>> {
@@ -1631,6 +1884,68 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
+    fn set_shift_carry(
+        &mut self,
+        source: &[W; 32],
+        source_value: Option<u32>,
+        direction: Shift,
+        amount: ShiftAmount,
+    ) -> Result<(), ErtError<E>> {
+        let count = match amount {
+            ShiftAmount::Immediate(amount) => Some(amount),
+            ShiftAmount::Register(register) => self.constants[register as usize],
+        };
+        let Some(count) = count else {
+            let ShiftAmount::Register(register) = amount else {
+                unreachable!("only register shifts have unknown counts")
+            };
+            let old = self.materialize_flag(FLAG_C)?;
+            self.flags[FLAG_C] = Flag {
+                wire: FlagWire::ShiftCarry {
+                    source: source.clone(),
+                    amount: self.regs[register as usize].clone(),
+                    direction,
+                    old,
+                },
+                value: None,
+            };
+            return Ok(());
+        };
+        let raw_count = count & 0xff;
+        let bit = match direction {
+            Shift::Left if raw_count == 0 => None,
+            Shift::Left if raw_count <= 32 => Some(32 - raw_count as usize),
+            Shift::Left => Some(usize::MAX),
+            Shift::LogicalRight if raw_count == 0 => None,
+            Shift::LogicalRight if raw_count <= 32 => Some(raw_count as usize - 1),
+            Shift::LogicalRight => Some(usize::MAX),
+            Shift::ArithmeticRight if raw_count == 0 => None,
+            Shift::ArithmeticRight if raw_count <= 32 => Some(raw_count as usize - 1),
+            Shift::ArithmeticRight => Some(31),
+            Shift::RotateRight if raw_count == 0 => None,
+            Shift::RotateRight => Some((raw_count as usize - 1) & 31),
+        };
+        let Some(bit) = bit else {
+            return Ok(());
+        };
+        let concrete = source_value.map(|value| {
+            if bit == usize::MAX {
+                false
+            } else {
+                (value >> bit) & 1 != 0
+            }
+        });
+        self.flags[FLAG_C] = self.flag(
+            if bit == usize::MAX {
+                self.zero.clone()
+            } else {
+                source[bit].clone()
+            },
+            concrete,
+        );
+        Ok(())
+    }
+
     fn arithmetic(
         &mut self,
         kind: Arithmetic,
@@ -1640,30 +1955,35 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         set_flags: bool,
         len: u32,
     ) -> Result<Flow, ErtError<E>> {
-        let (left_word, left_value) = self.operand(left)?;
-        let (right_word, right_value) = self.operand(right)?;
-        let carry = match kind {
-            Arithmetic::Add | Arithmetic::Sub | Arithmetic::ReverseSub => self.zero.clone(),
-            Arithmetic::AddCarry | Arithmetic::SubCarry => match self.flags[2] {
-                Some(true) => self.one.clone(),
-                Some(false) => self.zero.clone(),
-                None => return Err(ErtError::Unexpected),
-            },
+        let (original_left, left_value) = self.operand(left)?;
+        let (original_right, right_value) = self.operand(right)?;
+        let (carry, carry_value) = match kind {
+            Arithmetic::Add | Arithmetic::Sub | Arithmetic::ReverseSub => {
+                (self.zero.clone(), Some(false))
+            }
+            Arithmetic::AddCarry | Arithmetic::SubCarry => {
+                (self.materialize_flag(FLAG_C)?, self.flags[FLAG_C].value)
+            }
         };
-        let (left_word, right_word, left_value, right_value, subtraction) = match kind {
+        let (adder_left, adder_right, adder_carry) = match kind {
             Arithmetic::Add | Arithmetic::AddCarry => {
-                (left_word, right_word, left_value, right_value, false)
+                (original_left.clone(), original_right.clone(), carry.clone())
             }
-            Arithmetic::Sub | Arithmetic::SubCarry => {
-                let inverted = invert_word(self.t, &right_word, self.one.clone())
-                    .map_err(ErtError::Emitted)?;
-                (left_word, inverted, left_value, right_value, true)
-            }
-            Arithmetic::ReverseSub => {
-                let inverted =
-                    invert_word(self.t, &left_word, self.one.clone()).map_err(ErtError::Emitted)?;
-                (right_word, inverted, right_value, left_value, true)
-            }
+            Arithmetic::Sub | Arithmetic::SubCarry => (
+                original_left.clone(),
+                invert_word(self.t, &original_right, self.one.clone())
+                    .map_err(ErtError::Emitted)?,
+                if matches!(kind, Arithmetic::Sub) {
+                    self.one.clone()
+                } else {
+                    carry.clone()
+                },
+            ),
+            Arithmetic::ReverseSub => (
+                original_right.clone(),
+                invert_word(self.t, &original_left, self.one.clone()).map_err(ErtError::Emitted)?,
+                self.one.clone(),
+            ),
         };
         let value = match kind {
             Arithmetic::Add => left_value
@@ -1671,7 +1991,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 .map(|(left, right)| left.wrapping_add(right)),
             Arithmetic::AddCarry => left_value
                 .zip(right_value)
-                .zip(self.flags[2])
+                .zip(carry_value)
                 .map(|((left, right), carry)| left.wrapping_add(right).wrapping_add(carry as u32)),
             Arithmetic::Sub => left_value
                 .zip(right_value)
@@ -1679,7 +1999,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             Arithmetic::SubCarry => {
                 left_value
                     .zip(right_value)
-                    .zip(self.flags[2])
+                    .zip(carry_value)
                     .map(|((left, right), carry)| {
                         left.wrapping_sub(right).wrapping_sub((!carry) as u32)
                     })
@@ -1688,16 +2008,41 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 .zip(right_value)
                 .map(|(left, right)| right.wrapping_sub(left)),
         };
-        let word = if let Some(value) = value {
-            self.word_from_constant(value)
+        let (word, carry_out) = if let Some(value) = value {
+            let carry_out =
+                match kind {
+                    Arithmetic::Add => left_value
+                        .zip(right_value)
+                        .map(|(left, right)| (left as u64 + right as u64) >> 32 != 0),
+                    Arithmetic::AddCarry => left_value.zip(right_value).zip(carry_value).map(
+                        |((left, right), carry)| {
+                            (left as u64 + right as u64 + carry as u64) >> 32 != 0
+                        },
+                    ),
+                    Arithmetic::Sub => left_value
+                        .zip(right_value)
+                        .map(|(left, right)| left >= right),
+                    Arithmetic::SubCarry => left_value.zip(right_value).zip(carry_value).map(
+                        |((left, right), carry)| (left as u64) >= right as u64 + (!carry) as u64,
+                    ),
+                    Arithmetic::ReverseSub => left_value
+                        .zip(right_value)
+                        .map(|(left, right)| right >= left),
+                }
+                .expect("a concrete arithmetic result has concrete operands");
+            (
+                self.word_from_constant(value),
+                if carry_out {
+                    self.one.clone()
+                } else {
+                    self.zero.clone()
+                },
+            )
         } else {
-            let carry = if subtraction && matches!(kind, Arithmetic::Sub | Arithmetic::ReverseSub) {
-                self.one.clone()
-            } else {
-                carry
-            };
-            add_bits(self.t, &left_word, &right_word, carry).map_err(ErtError::Emitted)?
+            add_bits_with_carry_out(self.t, &adder_left, &adder_right, adder_carry)
+                .map_err(ErtError::Emitted)?
         };
+        let result = word.clone();
         if dest == SP {
             let new_sp = match (kind, left, right) {
                 (Arithmetic::Add, Operand::Register(SP), Operand::Immediate(amount)) => {
@@ -1723,16 +2068,106 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
         if set_flags {
             match kind {
-                Arithmetic::Add => self.set_add_flags(left_value, right_value, false),
-                Arithmetic::AddCarry => {
-                    self.set_add_flags(left_value, right_value, self.flags[2].unwrap_or(false))
-                }
-                Arithmetic::Sub => self.set_sub_flags(left_value, right_value, true),
-                Arithmetic::SubCarry => {
-                    self.set_sub_flags(left_value, right_value, self.flags[2].unwrap_or(false))
-                }
-                Arithmetic::ReverseSub => self.set_sub_flags(right_value, left_value, true),
+                Arithmetic::Add | Arithmetic::AddCarry => self.set_add_flags(
+                    &original_left,
+                    &original_right,
+                    &result,
+                    carry_out,
+                    left_value,
+                    right_value,
+                    carry_value,
+                )?,
+                Arithmetic::Sub | Arithmetic::SubCarry => self.set_sub_flags(
+                    &original_left,
+                    &original_right,
+                    &result,
+                    carry_out,
+                    left_value,
+                    right_value,
+                    if matches!(kind, Arithmetic::Sub) {
+                        Some(true)
+                    } else {
+                        carry_value
+                    },
+                )?,
+                Arithmetic::ReverseSub => self.set_sub_flags(
+                    &original_right,
+                    &original_left,
+                    &result,
+                    carry_out,
+                    right_value,
+                    left_value,
+                    Some(true),
+                )?,
             }
+        }
+        self.next(len)
+    }
+
+    fn compare(
+        &mut self,
+        left: Operand,
+        right: Operand,
+        add: bool,
+        len: u32,
+    ) -> Result<Flow, ErtError<E>> {
+        let (left_word, left_value) = self.operand(left)?;
+        let (right_word, right_value) = self.operand(right)?;
+        let value = left_value.zip(right_value).map(|(left, right)| {
+            if add {
+                left.wrapping_add(right)
+            } else {
+                left.wrapping_sub(right)
+            }
+        });
+        let (result, carry_out) = if let Some(value) = value {
+            let carry = left_value
+                .zip(right_value)
+                .map(|(left, right)| {
+                    if add {
+                        (left as u64 + right as u64) >> 32 != 0
+                    } else {
+                        left >= right
+                    }
+                })
+                .expect("concrete compare result has concrete operands");
+            (
+                self.word_from_constant(value),
+                if carry {
+                    self.one.clone()
+                } else {
+                    self.zero.clone()
+                },
+            )
+        } else if add {
+            add_bits_with_carry_out(self.t, &left_word, &right_word, self.zero.clone())
+                .map_err(ErtError::Emitted)?
+        } else {
+            let inverted =
+                invert_word(self.t, &right_word, self.one.clone()).map_err(ErtError::Emitted)?;
+            add_bits_with_carry_out(self.t, &left_word, &inverted, self.one.clone())
+                .map_err(ErtError::Emitted)?
+        };
+        if add {
+            self.set_add_flags(
+                &left_word,
+                &right_word,
+                &result,
+                carry_out,
+                left_value,
+                right_value,
+                Some(false),
+            )?;
+        } else {
+            self.set_sub_flags(
+                &left_word,
+                &right_word,
+                &result,
+                carry_out,
+                left_value,
+                right_value,
+                Some(true),
+            )?;
         }
         self.next(len)
     }
@@ -1756,6 +2191,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         right: u8,
         add: Option<u8>,
         subtract: bool,
+        set_flags: bool,
         len: u32,
     ) -> Result<Flow, ErtError<E>> {
         let left_word = self.regs[left as usize].clone();
@@ -1809,6 +2245,10 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             word
         };
         self.write(dest, word, value);
+        if set_flags {
+            let result = self.regs[dest as usize].clone();
+            self.set_nz(&result, value)?;
+        }
         self.next(len)
     }
 
@@ -2676,6 +3116,7 @@ fn decode16_data(instruction: u16) -> Result<Decoded, DecodeError> {
             right: source,
             add: None,
             subtract: false,
+            set_flags: true,
         },
         14 => Op::BitClear {
             dest,
@@ -2841,6 +3282,26 @@ fn decode32(pc: u32, first: u16, second: u16) -> Result<Decoded, DecodeError> {
         return decoded(Op::SecureGateway);
     }
 
+    // MRS/MSR APSR_nzcvq. This facade intentionally exposes only the
+    // application status view; exception and execution PSR views remain out
+    // of scope with the rest of its no-exceptions model.
+    if first == 0xf3ef && second & 0xf0ff == 0x8000 {
+        let dest = ((second >> 8) & 15) as u8;
+        return if dest < SP {
+            decoded(Op::ReadApsr { dest })
+        } else {
+            Err(DecodeError::Malformed(full))
+        };
+    }
+    if first & 0xfff0 == 0xf380 && second == 0x8800 {
+        let source = (first & 15) as u8;
+        return if source < SP {
+            decoded(Op::WriteApsr { source })
+        } else {
+            Err(DecodeError::Malformed(full))
+        };
+    }
+
     // Load/store multiple and the wide PUSH/POP forms used by compiler
     // prologues. The shared stack handlers retain their usual static model.
     if first == 0xe92d {
@@ -2997,6 +3458,7 @@ fn decode32(pc: u32, first: u16, second: u16) -> Result<Decoded, DecodeError> {
             right: source,
             add: (accumulate != PC).then_some(accumulate),
             subtract: second & 0x10 != 0,
+            set_flags: false,
         });
     }
     if first & 0xfff0 == 0xfba0 || first & 0xfff0 == 0xfb80 {
@@ -3156,7 +3618,11 @@ fn thumb_expand_imm(first: u16, second: u16) -> u32 {
 }
 
 fn nonzero_shift(value: u16) -> u32 {
-    if value == 0 { 32 } else { value as u32 }
+    if value == 0 {
+        32
+    } else {
+        value as u32
+    }
 }
 
 fn sign_extend(value: u32, bits: u32) -> u32 {

@@ -3,15 +3,14 @@ extern crate std;
 use core::{array, convert::Infallible};
 
 use cirrus_core::{
-    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithValue,
-    HasError,
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithStorage,
+    ContextWithValue, HasError, StorageAddressBit,
 };
-use cirrus_volar_boolar::MuxTreeContext;
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
 use crate::{
-    DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_emit, ert_func, simple_add,
+    ert_emit, ert_func, simple_add, DefaultHandler, ErtError, RawMemory, RvDefaultHandler,
 };
 
 fn word(value: u32) -> [bool; 32] {
@@ -44,7 +43,10 @@ fn run(
 ) -> Result<(), ErtError<Infallible>> {
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: MuxTreeContext::new(()),
+            // The native Boolean context is the identity backend. Keeping the
+            // facade tests here avoids coupling instruction semantics to the
+            // Volar IR builder.
+            context: (),
             hash: no_hash,
         },
     };
@@ -187,6 +189,37 @@ impl ContextWithBitXor<bool> for CountingContext {
     }
 }
 
+impl ContextWithStorage<bool> for CountingContext {
+    type Storage = [bool];
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+    ) -> Result<bool, Self::Error> {
+        Ok(storage[storage_index(address)])
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<bool>],
+        value: bool,
+    ) -> Result<(), Self::Error> {
+        storage[storage_index(address)] = value;
+        Ok(())
+    }
+}
+
+fn storage_index(address: &[StorageAddressBit<bool>]) -> usize {
+    address
+        .iter()
+        .enumerate()
+        .fold(0usize, |index, (bit, address)| {
+            index | ((address.wire as usize) << bit)
+        })
+}
+
 fn run_counting(
     instructions: impl IntoIterator<Item = Inst>,
     regs: &mut [[bool; 32]; 32],
@@ -197,7 +230,7 @@ fn run_counting(
     let mut vstack = [false; 64];
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: MuxTreeContext::new(CountingContext::default()),
+            context: CountingContext::default(),
             hash: no_hash,
         },
     };
@@ -214,7 +247,7 @@ fn run_counting(
         false,
         true,
     ));
-    handler.inner.context.into_inner()
+    handler.inner.context
 }
 
 fn exit_register(regs: &mut [[bool; 32]; 32], constants: &mut [Option<u32>; 32]) {
@@ -329,6 +362,96 @@ fn arithmetic_immediates_and_shifts_preserve_concrete_tracking() {
     assert_eq!(value(&regs[Reg::T2.0 as usize]), 10);
     assert_eq!(value(&regs[Reg::T1.0 as usize]), 0x4000_0001);
     assert_eq!(value(&regs[Reg::T6.0 as usize]), u32::MAX);
+}
+
+#[test]
+fn slt_forms_materialize_signed_and_unsigned_booleans() {
+    let instructions = [
+        Inst::Slt {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Sltu {
+            dest: Reg::T3,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Slti {
+            imm: Imm::new_i32(0),
+            dest: Reg::T4,
+            src1: Reg::T1,
+        },
+        Inst::Sltiu {
+            imm: Imm::new_i32(-1),
+            dest: Reg::T5,
+            src1: Reg::T1,
+        },
+        Inst::Sltiu {
+            imm: Imm::new_i32(-1),
+            dest: Reg::T6,
+            src1: Reg::T2,
+        },
+        Inst::Ecall,
+    ];
+
+    let mut concrete_regs = [[false; 32]; 32];
+    let mut concrete_constants = [None; 32];
+    concrete_regs[Reg::T1.0 as usize] = word(0x8000_0000);
+    concrete_regs[Reg::T2.0 as usize] = word(0);
+    concrete_constants[Reg::T1.0 as usize] = Some(0x8000_0000);
+    concrete_constants[Reg::T2.0 as usize] = Some(0);
+    exit_register(&mut concrete_regs, &mut concrete_constants);
+    let concrete_mem = program(instructions);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    assert_success(run(
+        &concrete_mem,
+        &mut concrete_regs,
+        &mut concrete_constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+    for (register, expected) in [
+        (Reg::T0, 1),
+        (Reg::T3, 0),
+        (Reg::T4, 1),
+        (Reg::T5, 1),
+        (Reg::T6, 1),
+    ] {
+        assert_eq!(concrete_constants[register.0 as usize], Some(expected));
+        assert_eq!(value(&concrete_regs[register.0 as usize]), expected);
+    }
+
+    let mut symbolic_regs = [[false; 32]; 32];
+    let mut symbolic_constants = [None; 32];
+    symbolic_regs[Reg::T1.0 as usize] = word(0x8000_0000);
+    symbolic_regs[Reg::T2.0 as usize] = word(0);
+    exit_register(&mut symbolic_regs, &mut symbolic_constants);
+    let symbolic_mem = program(instructions);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    assert_success(run(
+        &symbolic_mem,
+        &mut symbolic_regs,
+        &mut symbolic_constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+    for (register, expected) in [
+        (Reg::T0, 1),
+        (Reg::T3, 0),
+        (Reg::T4, 1),
+        (Reg::T5, 1),
+        (Reg::T6, 1),
+    ] {
+        assert_eq!(value(&symbolic_regs[register.0 as usize]), expected);
+        assert_eq!(symbolic_constants[register.0 as usize], None);
+        assert_eq!(symbolic_regs[register.0 as usize][0], expected != 0);
+        assert!(symbolic_regs[register.0 as usize][1..]
+            .iter()
+            .all(|bit| !bit));
+    }
 }
 
 #[test]
@@ -1063,15 +1186,12 @@ fn hash_ecall_exchanges_eight_words_with_the_callback() {
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
     let mut observed = [[false; 32]; 8];
-    let hash = |_: &mut MuxTreeContext<()>, words: &[[bool; 32]]| {
+    let hash = |_: &mut (), words: &[[bool; 32]]| {
         observed.copy_from_slice(words);
         Ok::<_, Infallible>(array::from_fn(|byte| byte as u8))
     };
     let mut handler = RvDefaultHandler {
-        inner: DefaultHandler {
-            context: MuxTreeContext::new(()),
-            hash,
-        },
+        inner: DefaultHandler { context: (), hash },
     };
 
     let storage_bits = vstack.len();
@@ -1123,7 +1243,7 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let mut vstack = [false; 64];
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: MuxTreeContext::new(()),
+            context: (),
             hash: no_hash,
         },
     };
@@ -1158,7 +1278,7 @@ fn ert_func_moves_register_and_stack_abi_values() {
     });
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: MuxTreeContext::new(()),
+            context: (),
             hash: no_hash,
         },
     };
@@ -1202,7 +1322,7 @@ fn ert_func_rejects_a_symbolic_stack_too_small_for_abi_words() {
     });
     let mut handler = RvDefaultHandler {
         inner: DefaultHandler {
-            context: MuxTreeContext::new(()),
+            context: (),
             hash: no_hash,
         },
     };

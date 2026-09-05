@@ -1,10 +1,10 @@
 use core::array;
 
-use cirrus_ert_core::{BitOp, partial_bitwise_word};
+use cirrus_ert_core::{compare_word, partial_bitwise_word, BitOp, ComparePredicate};
 use rv_asm::{Imm, Inst, Reg};
 
-use crate::machine::{Machine, add_bits};
-use crate::{EcallOutcome, ErtError, machine::LoadAddress};
+use crate::machine::{add_bits, Machine};
+use crate::{machine::LoadAddress, EcallOutcome, ErtError};
 
 pub(crate) enum Flow {
     Next(u32),
@@ -59,8 +59,20 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
         ),
 
         Inst::Addi { imm, dest, src1 } => add_immediate(machine, imm, dest, src1),
+        Inst::Slti { imm, dest, src1 } => {
+            set_less_than_immediate(machine, dest, src1, imm, ComparePredicate::LtS)
+        }
+        Inst::Sltiu { imm, dest, src1 } => {
+            set_less_than_immediate(machine, dest, src1, imm, ComparePredicate::LtU)
+        }
         Inst::Add { dest, src1, src2 } => add(machine, dest, src1, src2),
         Inst::Sub { dest, src1, src2 } => subtract(machine, dest, src1, src2),
+        Inst::Slt { dest, src1, src2 } => {
+            set_less_than(machine, dest, src1, src2, ComparePredicate::LtS)
+        }
+        Inst::Sltu { dest, src1, src2 } => {
+            set_less_than(machine, dest, src1, src2, ComparePredicate::LtU)
+        }
         Inst::And { dest, src1, src2 } => bitwise(machine, dest, src1, src2, BitOp::And),
         Inst::Or { dest, src1, src2 } => bitwise(machine, dest, src1, src2, BitOp::Or),
         Inst::Xor { dest, src1, src2 } => bitwise(machine, dest, src1, src2, BitOp::Xor),
@@ -129,6 +141,77 @@ pub(crate) fn execute<W: Clone, E: core::error::Error>(
             Err(e) => Err(ErtError::Emitted(e)),
         },
         _ => Err(ErtError::Unexpected),
+    }
+}
+
+fn set_less_than<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    dest: Reg,
+    src1: Reg,
+    src2: Reg,
+    predicate: ComparePredicate,
+) -> Result<Flow, ErtError<E>> {
+    machine.offs[dest.0 as usize] = None;
+    if let (Some(left), Some(right)) = (
+        machine.reg_consts[src1.0 as usize],
+        machine.reg_consts[src2.0 as usize],
+    ) {
+        let result = compare_concrete(left, right, predicate) as u32;
+        machine.write_constant(dest, result);
+        return next(machine);
+    }
+    let comparison = compare_word(
+        machine.t,
+        &machine.regs[src1.0 as usize],
+        &machine.regs[src2.0 as usize],
+        predicate,
+        &machine.one,
+    )
+    .map_err(ErtError::Emitted)?;
+    let mut word = machine.word_from_constant(0);
+    word[0] = comparison;
+    machine.regs[dest.0 as usize] = word;
+    machine.reg_consts[dest.0 as usize] = None;
+    next(machine)
+}
+
+fn set_less_than_immediate<W: Clone, E: core::error::Error>(
+    machine: &mut Machine<'_, W, E>,
+    dest: Reg,
+    src1: Reg,
+    imm: Imm,
+    predicate: ComparePredicate,
+) -> Result<Flow, ErtError<E>> {
+    let immediate = imm.as_i32() as u32;
+    machine.offs[dest.0 as usize] = None;
+    if let Some(left) = machine.reg_consts[src1.0 as usize] {
+        machine.write_constant(dest, compare_concrete(left, immediate, predicate) as u32);
+        return next(machine);
+    }
+    let right = machine.word_from_constant(immediate);
+    let comparison = compare_word(
+        machine.t,
+        &machine.regs[src1.0 as usize],
+        &right,
+        predicate,
+        &machine.one,
+    )
+    .map_err(ErtError::Emitted)?;
+    let mut word = machine.word_from_constant(0);
+    word[0] = comparison;
+    machine.regs[dest.0 as usize] = word;
+    machine.reg_consts[dest.0 as usize] = None;
+    next(machine)
+}
+
+fn compare_concrete(left: u32, right: u32, predicate: ComparePredicate) -> bool {
+    match predicate {
+        ComparePredicate::Eq => left == right,
+        ComparePredicate::Ne => left != right,
+        ComparePredicate::GeU => left >= right,
+        ComparePredicate::LtU => left < right,
+        ComparePredicate::GeS => (left as i32) >= (right as i32),
+        ComparePredicate::LtS => (left as i32) < (right as i32),
     }
 }
 

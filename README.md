@@ -16,11 +16,15 @@ raw-memory mapping, and host-call convention through the internal
   AAPCS32; it accepts an odd Thumb entry address and sixteen core registers.
 
 Both interpret a deliberately well-behaved compiler-oriented subset, not an
-entire machine: control flow, flags, and non-stack addresses must stay
-concrete; stacks and return stacks are caller supplied; unsupported encodings
-and violations report `Unexpected`. ARM additionally excludes exception and
-interrupt entry, TrustZone transitions, MPU state, floating point, DSP/MVE,
-atomics, and semihosting.
+entire machine: control flow and non-stack addresses must stay concrete;
+stacks and return stacks are caller supplied; unsupported encodings and
+violations report `Unexpected`. RV32 `slt`/`slti` signed and unsigned forms
+may materialize symbolic Boolean data. Arm retains symbolic NZCVQ status,
+supports APSR NZCVQ transfers and symbolic `ADC`/`SBC` carry, and permits a
+single-instruction IT block only to materialize a register value; symbolic
+branches, calls, returns, memory effects, and general IT predication remain
+rejected. ARM additionally excludes exception and interrupt entry, TrustZone
+transitions, MPU state, floating point, DSP/MVE, atomics, and semihosting.
 
 Each facade has a bare-metal QEMU SHA-256 compression compatibility gate. The
 same no-std workload is compiled for RV32IM and `thumbv8m.main-none-eabi`; the

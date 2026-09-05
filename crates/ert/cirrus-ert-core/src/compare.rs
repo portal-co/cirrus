@@ -1,15 +1,11 @@
 //! A symbolic 32-bit word comparison, materialized as a single Boolean wire.
 //!
-//! No facade needed this before: branches always required both operands to
-//! already be concrete (see each facade's `branch`/`condition` handling), so
-//! there was never a reason to turn a comparison into circuit output. The
-//! early-exit-loop deoptimization changes that — it needs to fold a
-//! secret-dependent comparison into an accumulator via [`select_word`]
-//! instead of branching on it.
+//! Control-flow decisions still require concrete values, but RV32 `slt*`,
+//! Arm status flags, and the early-exit-loop deoptimization all need a
+//! comparison as circuit data. This module supplies that result without
+//! weakening either facade's concrete-only branch discipline.
 
-use core::mem::MaybeUninit;
-
-use crate::{BitOp, ContextWithErtOps, bitwise_word, invert_word};
+use crate::{add_bits_with_carry_out, bitwise_word, invert_word, BitOp, ContextWithErtOps};
 
 /// The six RV32/Armv8-M branch/compare conditions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +24,121 @@ pub enum ComparePredicate {
     LtS,
 }
 
+/// Derive the signed-overflow flag for `left + right = result`.
+pub fn add_overflow<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    left: W,
+    right: W,
+    result: W,
+) -> Result<W, E> {
+    let left_differs = t.bitxor(left, result.clone())?;
+    let right_differs = t.bitxor(right, result)?;
+    t.bitand(left_differs, right_differs)
+}
+
+/// Derive the signed-overflow flag for `left - right = result`.
+pub fn subtract_overflow<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    left: W,
+    right: W,
+    result: W,
+) -> Result<W, E> {
+    let operands_differ = t.bitxor(left.clone(), right)?;
+    let result_differs = t.bitxor(left, result)?;
+    t.bitand(operands_differ, result_differs)
+}
+
+/// Evaluate an Arm NZCV condition from symbolic flag wires.
+///
+/// Returns `None` for the reserved condition encoding 15. Condition 14 is
+/// the unconditional `AL` form and returns `one` without emitting a gate.
+pub fn arm_condition<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    n: W,
+    z: W,
+    c: W,
+    v: W,
+    condition: u8,
+    one: &W,
+) -> Result<Option<W>, E> {
+    let result = match condition {
+        0 => z,
+        1 => invert_boolean(t, z, one)?,
+        2 => c,
+        3 => invert_boolean(t, c, one)?,
+        4 => n,
+        5 => invert_boolean(t, n, one)?,
+        6 => v,
+        7 => invert_boolean(t, v, one)?,
+        8 => {
+            let not_z = invert_boolean(t, z, one)?;
+            t.bitand(c, not_z)?
+        }
+        9 => {
+            let not_c = invert_boolean(t, c, one)?;
+            t.bitor(not_c, z)?
+        }
+        10 => {
+            let differs = t.bitxor(n, v)?;
+            invert_boolean(t, differs, one)?
+        }
+        11 => t.bitxor(n, v)?,
+        12 => {
+            let not_z = invert_boolean(t, z, one)?;
+            let differs = t.bitxor(n, v)?;
+            let equal = invert_boolean(t, differs, one)?;
+            t.bitand(not_z, equal)?
+        }
+        13 => {
+            let differs = t.bitxor(n, v)?;
+            t.bitor(z, differs)?
+        }
+        14 => one.clone(),
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
+fn invert_boolean<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    wire: W,
+    one: &W,
+) -> Result<W, E> {
+    t.bitxor(wire, one.clone())
+}
+
+/// Evaluate an Arm NZCV condition using optional concrete flag facts.
+///
+/// The outer `None` denotes the reserved condition encoding 15. For a valid
+/// condition, the inner value is `None` until every flag it observes is known.
+pub fn arm_condition_value(
+    n: Option<bool>,
+    z: Option<bool>,
+    c: Option<bool>,
+    v: Option<bool>,
+    condition: u8,
+) -> Option<Option<bool>> {
+    let value = match condition {
+        0 => z,
+        1 => z.map(|value| !value),
+        2 => c,
+        3 => c.map(|value| !value),
+        4 => n,
+        5 => n.map(|value| !value),
+        6 => v,
+        7 => v.map(|value| !value),
+        8 => c.zip(z).map(|(c, z)| c && !z),
+        9 => c.zip(z).map(|(c, z)| !c || z),
+        10 => n.zip(v).map(|(n, v)| n == v),
+        11 => n.zip(v).map(|(n, v)| n != v),
+        12 => z.zip(n.zip(v)).map(|(z, (n, v))| !z && n == v),
+        13 => z.zip(n.zip(v)).map(|(z, (n, v))| z || n != v),
+        14 => Some(true),
+        _ => return None,
+    };
+    Some(value)
+}
+
 /// Evaluate `predicate` between two symbolic words, returning a single
 /// Boolean wire (`one` if the predicate holds, `zero` otherwise).
 ///
@@ -43,21 +154,22 @@ pub fn compare_word<W: Clone, E>(
     match predicate {
         ComparePredicate::Eq | ComparePredicate::Ne => {
             let xor = bitwise_word(t, left, right, BitOp::Xor)?;
-            let differs = or_reduce(t, &xor)?;
+            let equal = zero_word(t, &xor, one)?;
             match predicate {
-                ComparePredicate::Ne => Ok(differs),
-                _ => t.bitxor(differs, one.clone()),
+                ComparePredicate::Eq => Ok(equal),
+                ComparePredicate::Ne => t.bitxor(equal, one.clone()),
+                _ => unreachable!("the outer match limits equality predicates"),
             }
         }
         ComparePredicate::GeU | ComparePredicate::LtU => {
-            let (_, carry_out) = subtract_with_carry_out(t, left, right, one)?;
+            let (_, carry_out) = subtract_word_with_carry_out(t, left, right, one)?;
             match predicate {
                 ComparePredicate::GeU => Ok(carry_out),
                 _ => t.bitxor(carry_out, one.clone()),
             }
         }
         ComparePredicate::GeS | ComparePredicate::LtS => {
-            let (diff, _) = subtract_with_carry_out(t, left, right, one)?;
+            let (diff, _) = subtract_word_with_carry_out(t, left, right, one)?;
             let sign_l = left[31].clone();
             let sign_r = right[31].clone();
             let sign_d = diff[31].clone();
@@ -77,35 +189,25 @@ pub fn compare_word<W: Clone, E>(
 /// (unsigned "no borrow occurred" flag) that [`crate::add_bits_with`] doesn't
 /// expose. Mirrors each facade's own subtract handler, just also keeping the
 /// carry rather than discarding it.
-fn subtract_with_carry_out<W: Clone, E>(
+pub fn subtract_word_with_carry_out<W: Clone, E>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     left: &[W; 32],
     right: &[W; 32],
     one: &W,
 ) -> Result<([W; 32], W), E> {
     let inverted_right = invert_word(t, right, one.clone())?;
-    let mut carry = one.clone();
-    let mut output: [MaybeUninit<W>; 32] = [const { MaybeUninit::uninit() }; 32];
-    for i in 0..32 {
-        let without_carry = t.bitxor(left[i].clone(), inverted_right[i].clone())?;
-        output[i] = MaybeUninit::new(t.bitxor(without_carry, carry.clone())?);
-        let a = t.bitand(left[i].clone(), inverted_right[i].clone())?;
-        let b = t.bitand(left[i].clone(), carry.clone())?;
-        let c = t.bitand(inverted_right[i].clone(), carry.clone())?;
-        let remaining_pairs = t.bitor(b, c)?;
-        carry = t.bitor(a, remaining_pairs)?;
-    }
-    // SAFETY: every element was initialized by the loop above.
-    Ok((output.map(|value| unsafe { value.assume_init() }), carry))
+    add_bits_with_carry_out(t, left, &inverted_right, one.clone())
 }
 
-fn or_reduce<W: Clone, E>(
+/// Return a Boolean wire that is one exactly when `word` is zero.
+pub fn zero_word<W: Clone, E>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    bits: &[W; 32],
+    word: &[W; 32],
+    one: &W,
 ) -> Result<W, E> {
-    let mut acc = bits[0].clone();
-    for bit in &bits[1..] {
+    let mut acc = word[0].clone();
+    for bit in &word[1..] {
         acc = t.bitor(acc, bit.clone())?;
     }
-    Ok(acc)
+    t.bitxor(acc, one.clone())
 }

@@ -13,9 +13,13 @@ compatibility gate, on-device firmware the same subset.
 
 Cost is explicit: stack bits + 32×32 register wires + mapped text.
 Constraints: concrete control flow and stack-form addresses; no compressed
-instructions; documented opcode subset only (no `slt*` family). Less
-expressive than a WASM linear-memory guest. Fits microcontrollers; SHA-256
-compression is the locked garbling workload.
+instructions; documented opcode subset only. RV32 `slt`/`slti` forms may
+materialize symbolic Boolean data. Thumb additionally supports symbolic
+NZCVQ APSR transfers, carry-consuming `ADC`/`SBC`, and a one-instruction IT
+value materializer; symbolic branches, general predication, calls, returns,
+and memory effects remain rejected. Less expressive than a WASM linear-memory
+guest. Fits microcontrollers; SHA-256 compression is the locked garbling
+workload.
 
 ## WASM → VAFFLE → Volar IR → Boolar → Cirrus
 

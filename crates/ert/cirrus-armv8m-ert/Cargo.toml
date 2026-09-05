@@ -8,6 +8,9 @@ description = "Symbolic Armv8-M Thumb-2 interpreter facade"
 # Prepared artifacts allocate their table pool; keep that capability out of
 # allocator-free bare-metal users unless explicitly requested.
 prepared-recording = ["dep:cirrus-recompile-core", "dep:cirrus-volar-boolar"]
+# Exercises the Volar recording adapter in the heavyweight bare-metal suite.
+# Keep it opt-in while Volar IR evolves independently of ERT semantics.
+volar-tests = ["dep:cirrus-volar-boolar"]
 # Opt-in recognizer that deoptimizes secret-dependent early-exit loops
 # instead of hard-erroring on the branch. Off by default: it adds a small
 # fixed-capacity per-execution cache to `Machine` that unaffected callers
@@ -21,5 +24,8 @@ cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-reco
 cirrus-volar-boolar = { version = "0.1.0", path = "../../volar/cirrus-volar-boolar", optional = true }
 
 [dev-dependencies]
-cirrus-volar-boolar = { version = "0.1.0", path = "../../volar/cirrus-volar-boolar" }
 cirrus-ert-sha256-fixture = { version = "0.1.0", path = "../cirrus-ert-sha256-fixture" }
+
+[[test]]
+name = "bare_metal"
+required-features = ["volar-tests"]

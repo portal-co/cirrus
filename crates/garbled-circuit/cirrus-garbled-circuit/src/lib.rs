@@ -1067,6 +1067,74 @@ mod tests {
         assert_eq!(counts.free_xors(), 192);
     }
 
+    #[test]
+    fn riscv_ert_garbles_all_slt_forms_without_a_volar_recording() {
+        let instructions = program([
+            Inst::Slt {
+                dest: Reg::T0,
+                src1: Reg::A1,
+                src2: Reg::A2,
+            },
+            Inst::Sltu {
+                dest: Reg::T1,
+                src1: Reg::A1,
+                src2: Reg::A2,
+            },
+            Inst::Slti {
+                imm: rv_asm::Imm::new_i32(-1),
+                dest: Reg::T2,
+                src1: Reg::A1,
+            },
+            Inst::Sltiu {
+                imm: rv_asm::Imm::new_i32(-1),
+                dest: Reg::T3,
+                src1: Reg::A1,
+            },
+            Inst::Ecall,
+        ]);
+        let zero = [0; 16];
+        let garbling_zero = garbler_label(zero);
+        let garbling_one = garbling_zero.not();
+        let mut registers = [[garbling_zero; 32]; 32];
+        registers[Reg::A1.0 as usize] = [garbler_label([0x22; 16]); 32];
+        registers[Reg::A2.0 as usize] = [garbler_label([0x44; 16]); 32];
+        registers[Reg::A0.0 as usize] = [garbling_one; 32];
+        let mut constants = [None; 32];
+        constants[Reg::A0.0 as usize] = Some(u32::MAX);
+        let mut rstack = [0; 8];
+        let mut vstack = [garbling_zero; 64];
+        let mut tables = RecordedTables::default();
+        let gc = MeasuredGc::new(context(&mut tables));
+        let mut handler = RvDefaultHandler {
+            inner: RvHashHandler {
+                context: gc,
+                hash: no_hash,
+            },
+        };
+
+        assert!(ert_emit(
+            &mut handler,
+            &mut vstack,
+            64,
+            RawMemory::from(instructions.as_slice()),
+            &mut rstack,
+            0,
+            &mut registers,
+            &mut constants,
+            garbling_zero,
+            garbling_one,
+        )
+        .is_ok());
+        let counts = handler.inner.context.counts;
+        drop(handler);
+
+        for register in [Reg::T0, Reg::T1, Reg::T2, Reg::T3] {
+            assert_eq!(constants[register.0 as usize], None);
+        }
+        assert!(!tables.tables.is_empty());
+        assert_eq!(counts.and_tables(), tables.tables.len());
+    }
+
     fn garbled_riscv_mul_tables(
         right_constant: Option<u32>,
     ) -> (usize, CircuitCounts, Option<u32>) {

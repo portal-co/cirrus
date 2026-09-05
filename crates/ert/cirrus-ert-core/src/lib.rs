@@ -11,13 +11,16 @@
 use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
-use volar_circuit_exec_core::{SelectEmitter, select as emit_select};
+use volar_circuit_exec_core::{select as emit_select, SelectEmitter};
 
 mod compare;
 #[cfg(test)]
 mod tests;
 
-pub use compare::{ComparePredicate, compare_word};
+pub use compare::{
+    add_overflow, arm_condition, arm_condition_value, compare_word, subtract_overflow,
+    subtract_word_with_carry_out, zero_word, ComparePredicate,
+};
 
 /// The Boolean operations needed by the shared symbolic-word machinery.
 pub trait ContextWithErtOps<Val>:
@@ -283,12 +286,12 @@ pub fn constant_word<W: Clone>(zero: &W, one: &W, value: u32) -> [W; 32] {
 /// it through a [`ContextWithErtOps`] implementation below, while frontends
 /// that retain concrete-bit metadata can use it with a simplifying gate
 /// constructor and still share the exact carry circuit.
-pub fn add_bits_with<W: Clone, E, const N: usize>(
+pub fn add_bits_with_carry<W: Clone, E, const N: usize>(
     v: &[W; N],
     w: &[W; N],
     mut carry: W,
     mut gate: impl FnMut(BitOp, W, W) -> Result<W, E>,
-) -> Result<[W; N], E> {
+) -> Result<([W; N], W), E> {
     let mut output: [MaybeUninit<W>; N] = [const { MaybeUninit::uninit() }; N];
     for i in 0..N {
         let without_carry = gate(BitOp::Xor, v[i].clone(), w[i].clone())?;
@@ -299,7 +302,18 @@ pub fn add_bits_with<W: Clone, E, const N: usize>(
         let remaining_pairs = gate(BitOp::Or, b, c)?;
         carry = gate(BitOp::Or, a, remaining_pairs)?;
     }
-    Ok(output.map(|value| unsafe { value.assume_init() }))
+    Ok((output.map(|value| unsafe { value.assume_init() }), carry))
+}
+
+/// Add fixed-width little-endian words with an initial carry through a
+/// caller-supplied Boolean gate constructor, discarding the final carry-out.
+pub fn add_bits_with<W: Clone, E, const N: usize>(
+    v: &[W; N],
+    w: &[W; N],
+    carry: W,
+    gate: impl FnMut(BitOp, W, W) -> Result<W, E>,
+) -> Result<[W; N], E> {
+    add_bits_with_carry(v, w, carry, gate).map(|(sum, _)| sum)
 }
 
 /// Add fixed-width little-endian words with an initial carry.
@@ -310,6 +324,21 @@ pub fn add_bits<W: Clone, E, const N: usize>(
     carry: W,
 ) -> Result<[W; N], E> {
     add_bits_with(v, w, carry, |operation, left, right| match operation {
+        BitOp::And => t.bitand(left, right),
+        BitOp::Or => t.bitor(left, right),
+        BitOp::Xor => t.bitxor(left, right),
+    })
+}
+
+/// Add fixed-width little-endian words with an initial carry, retaining the
+/// final carry-out.
+pub fn add_bits_with_carry_out<W: Clone, E, const N: usize>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    v: &[W; N],
+    w: &[W; N],
+    carry: W,
+) -> Result<([W; N], W), E> {
+    add_bits_with_carry(v, w, carry, |operation, left, right| match operation {
         BitOp::And => t.bitand(left, right),
         BitOp::Or => t.bitor(left, right),
         BitOp::Xor => t.bitxor(left, right),
@@ -450,6 +479,76 @@ pub fn rv32_runtime_shift<W: Clone, E>(
         output = select_word(t, amount[stage].clone(), &candidate, &output)?;
     }
     Ok(output)
+}
+
+/// Compute an Arm register-counted shift and its APSR C result.
+///
+/// The register count observes its low eight bits. Logical shifts saturate at
+/// zero after 32, arithmetic right shifts saturate at the sign bit, and ROR
+/// uses its low five bits for data while a nonzero multiple of 32 still
+/// updates C from the result's top bit. `old_carry` is retained for a zero
+/// count. Callers may defer this circuit until C is consumed.
+pub fn arm_runtime_shift_with_carry<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    source: &[W; 32],
+    amount: &[W; 32],
+    direction: Shift,
+    zero: &W,
+    old_carry: W,
+) -> Result<([W; 32], W), E> {
+    let mut output = source.clone();
+    let mut carry = old_carry;
+    for stage in 0..5 {
+        let count = 1usize << stage;
+        let candidate = fixed_shift(&output, count as u32, direction, zero);
+        if matches!(direction, Shift::RotateRight) {
+            output = select_word(t, amount[stage].clone(), &candidate, &output)?;
+        } else {
+            let candidate_carry = match direction {
+                Shift::Left => output[32 - count].clone(),
+                Shift::LogicalRight | Shift::ArithmeticRight => output[count - 1].clone(),
+                Shift::RotateRight => unreachable!("rotate handled above"),
+            };
+            carry = select_status_bit(t, amount[stage].clone(), candidate_carry, carry)?;
+            output = select_word(t, amount[stage].clone(), &candidate, &output)?;
+        }
+    }
+    if matches!(direction, Shift::RotateRight) {
+        let mut nonzero = amount[0].clone();
+        for bit in &amount[1..8] {
+            nonzero = t.bitor(nonzero, bit.clone())?;
+        }
+        carry = select_status_bit(t, nonzero, output[31].clone(), carry)?;
+        return Ok((output, carry));
+    }
+    let mut saturated = zero.clone();
+    for bit in 5..8 {
+        saturated = t.bitor(saturated, amount[bit].clone())?;
+    }
+    let fill = match direction {
+        Shift::ArithmeticRight => array::from_fn(|_| source[31].clone()),
+        Shift::Left | Shift::LogicalRight => array::from_fn(|_| zero.clone()),
+        Shift::RotateRight => unreachable!("rotate returned above"),
+    };
+    let saturated_carry = match direction {
+        Shift::ArithmeticRight => source[31].clone(),
+        Shift::Left | Shift::LogicalRight => zero.clone(),
+        Shift::RotateRight => unreachable!("rotate returned above"),
+    };
+    output = select_word(t, saturated.clone(), &fill, &output)?;
+    carry = select_status_bit(t, saturated, saturated_carry, carry)?;
+    Ok((output, carry))
+}
+
+fn select_status_bit<W: Clone, E>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    condition: W,
+    selected: W,
+    otherwise: W,
+) -> Result<W, E> {
+    let difference = t.bitxor(selected, otherwise.clone())?;
+    let gated = t.bitand(condition, difference)?;
+    t.bitxor(otherwise, gated)
 }
 
 /// Compute a host-known 32-bit product view.
