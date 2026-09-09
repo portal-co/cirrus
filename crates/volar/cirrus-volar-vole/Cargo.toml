@@ -4,6 +4,9 @@ edition = "2024"
 version.workspace = true
 description.workspace = true
 
+[features]
+iop-accumulator = ["dep:volar-iop"]
+
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
@@ -11,6 +14,7 @@ volar-spec.workspace = true
 hybrid-array.workspace = true
 cipher.workspace = true
 spin = { version = "0.10.1", default-features = false, features = ["mutex", "spin_mutex", "portable-atomic"] }
+volar-iop = { version = "0.1.0", git = "https://github.com/portal-co/volar.git", optional = true }
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "arm"))'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }

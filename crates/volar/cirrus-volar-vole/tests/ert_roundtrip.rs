@@ -16,7 +16,9 @@ use cipher::consts::U1;
 use cirrus_core::ContextWithCreate;
 use cirrus_ert::{DefaultHandler as RvHashHandler, RawMemory, RvDefaultHandler, ert_emit};
 use cirrus_volar_boolar::MuxTreeContext;
-use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext, VoleVerifyError};
+use cirrus_volar_vole::{
+    NoopVoleVerifierHook, VoleProverContext, VoleVerifierContext, VoleVerifyError,
+};
 use hybrid_array::Array;
 use rv_asm::{Inst, Reg, Xlen};
 use volar_spec::{
@@ -172,6 +174,8 @@ fn ert_add_prover_and_verifier_agree_with_the_native_sum() {
     let mut verifier_ctx = MuxTreeContext::new(VoleVerifierContext {
         delta: delta.clone(),
         hats: hats.0.clone().into_iter(),
+        hook: NoopVoleVerifierHook,
+        gate_index: 0,
     });
     let all_one_verifier: [Q<U1, Galois128>; 32] =
         core::array::from_fn(|_| verifier_ctx.create(true).unwrap());

@@ -9,7 +9,7 @@ use std::thread;
 use cipher::consts::U1;
 use cirrus_core::{ContextWithBitAnd, ContextWithBitXor, ContextWithCreate, Pusher};
 use cirrus_recompile_core::Recorder;
-use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext};
+use cirrus_volar_vole::{NoopVoleVerifierHook, VoleProverContext, VoleVerifierContext};
 use hybrid_array::Array;
 use volar_spec::{
     SpecRng,
@@ -17,8 +17,8 @@ use volar_spec::{
     ot::{
         ferret::FERRET_REG_TOY,
         two_party::{
-            stack_bea95_receiver, stack_bea95_sender, stack_setup_receiver, stack_setup_sender,
-            StackIo,
+            StackIo, stack_bea95_receiver, stack_bea95_sender, stack_setup_receiver,
+            stack_setup_sender,
         },
         wire::TAG_HAT,
     },
@@ -93,11 +93,7 @@ fn xor_and_program() -> cirrus_recompile_core::Program {
     recorder.finish(vec![a, b], vec![out])
 }
 
-fn shares(
-    r0: [u8; 16],
-    z: [u8; 16],
-    bit: bool,
-) -> (Vope<U1, Galois128, U1>, Q<U1, Galois128>) {
+fn shares(r0: [u8; 16], z: [u8; 16], bit: bool) -> (Vope<U1, Galois128, U1>, Q<U1, Galois128>) {
     vole_commit_bit_shares(
         Array::<Galois128, U1>::from_fn(|_| Galois128(u128::from_le_bytes(r0))),
         Array::<Galois128, U1>::from_fn(|_| Galois128(u128::from_le_bytes(z))),
@@ -133,9 +129,10 @@ fn ferret_stack_tcp_circuit_loop() {
             let mut verifier = VoleVerifierContext {
                 delta: delta.clone(),
                 hats: HatIter(&mut io),
+                hook: NoopVoleVerifierHook,
+                gate_index: 0,
             };
-            let outs =
-                cirrus_recompile_rt::execute(&mut verifier, &program, &[q_a, q_b]).unwrap();
+            let outs = cirrus_recompile_rt::execute(&mut verifier, &program, &[q_a, q_b]).unwrap();
             let vope_v = {
                 let raw = io.recv(TAG_HAT);
                 let mut b = [0u8; 16];
