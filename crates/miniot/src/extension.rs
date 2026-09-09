@@ -187,6 +187,54 @@ impl<D: Digest, const L: usize> BaseOt<L> for MlkemBaseOt<D> {
     }
 }
 
+
+// ============================================================================
+// Ferret seed-COT derivation over the post-quantum base OT
+// ============================================================================
+
+use volar_spec::ot::ferret::{FerretReceiverSeed, FerretSenderSeed};
+use volar_spec::ot::iknp::iknp_cot_extend_base;
+
+/// Derive the `m` Ferret seed correlated-OTs from an IKNP extension whose base
+/// OT is the ML-KEM post-quantum OT.
+///
+/// Ferret (`ferret_extend`) needs `m` seed COTs `(Delta; q[i], u[i], w[i])`
+/// satisfying `w[i] = q[i] XOR (u[i].Delta)`. The standard bootstrap runs the
+/// kappa base OTs plus IKNP to make exactly that correlation; running the base
+/// OT over [`MlkemBaseOt`] makes the whole Ferret stack post-quantum at the
+/// base-OT layer — the OT-extension-compatibility bridge for Ferret, matching
+/// the IKNP one above.
+///
+/// Returns the `(sender_seed, receiver_seed)` pair `ferret_extend` consumes.
+pub fn ferret_seed_cots_mlkem<D: Digest, R: SpecRng>(
+    rng_s: &mut R,
+    rng_r: &mut R,
+    m: usize,
+) -> (FerretSenderSeed, FerretReceiverSeed) {
+    // Receiver choice bits `u[i]`.
+    let mut u = alloc::vec![false; m];
+    for b in u.iter_mut() {
+        *b = (rng_r.next_u32() & 1) == 1;
+    }
+    // The C-OT correlation Delta.
+    let mut delta = [0u8; 16];
+    for chunk in delta.chunks_mut(4) {
+        chunk.copy_from_slice(&rng_s.next_u32().to_le_bytes()[..chunk.len()]);
+    }
+
+    // IKNP with the ML-KEM base OT: sender gets r0[i], receiver gets v[i]
+    // with v[i] = r0[i] XOR (u[i].Delta). Map r0 -> q, v -> w.
+    let (q_rows, w_rows) =
+        iknp_cot_extend_base::<MlkemBaseOt<D>, D, R, 16>(rng_s, rng_r, &u, &delta);
+    debug_assert_eq!(q_rows.len(), m);
+    debug_assert_eq!(w_rows.len(), m);
+
+    (
+        FerretSenderSeed { delta, q: q_rows.into_iter().collect() },
+        FerretReceiverSeed { u, w: w_rows.into_iter().collect() },
+    )
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -265,6 +313,44 @@ mod tests {
             } else {
                 assert_eq!(receiver_v[j], sender_r0[j], "bit {} = 0 → r0", j);
             }
+        }
+    }
+
+    /// Ferret support: bootstrap the Ferret MPCOT extension from seed COTs
+    /// derived over the post-quantum ML-KEM base OT, and check the C-OT
+    /// relation holds end-to-end.
+    #[test]
+    fn ferret_with_mlkem_base() {
+        use volar_spec::ot::ferret::{FERRET_REG_TOY, ferret_extend};
+
+        let p = FERRET_REG_TOY;
+        let m = p.seed_cot_count(false);
+        let mut rs = Splitmix(0xFE_22_11);
+        let mut rr = Splitmix(0x88_33_44);
+        let mut rng_f = Splitmix(0xDE_AD_99);
+
+        let (ss, rseed) = ferret_seed_cots_mlkem::<Sha256, _>(&mut rs, &mut rr, m);
+        let delta = ss.delta;
+
+        let out = ferret_extend(&mut rng_f, p, &ss, &rseed);
+
+        // Sender/receiver output COTs satisfy w = q XOR (x*Delta).
+        let n_out = out.sender_out.len();
+        assert_eq!(n_out, p.output_cot_count(false));
+        for j in 0..n_out {
+            let mut want = out.sender_out[j];
+            if out.recv_x[j] {
+                for b in 0..16 { want[b] ^= delta[b]; }
+            }
+            assert_eq!(out.recv_z[j], want, "output row {}", j);
+        }
+        // The kept next-seed COTs satisfy the relation too.
+        for j in 0..out.sender_seed.q.len() {
+            let mut want = out.sender_seed.q[j];
+            if out.receiver_seed.u[j] {
+                for b in 0..16 { want[b] ^= delta[b]; }
+            }
+            assert_eq!(out.receiver_seed.w[j], want, "seed row {}", j);
         }
     }
 }
