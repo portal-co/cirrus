@@ -651,6 +651,20 @@ impl<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const B: usize>
         splitmix64(self.rng_state)
     }
 
+    /// The number of ORAM accesses performed so far. The deterministic
+    /// read-data base for the *next* read is
+    /// `gram_data_base::<D, N>(self.access_count() + 1, 0)`; tests and the
+    /// garbler-side harness use this to derive the matching base.
+    pub fn access_count(&self) -> u64 {
+        self.access_count
+    }
+
+    /// The deterministic base for the `bit`-th wire of access `access`
+    /// (`bit` 0 = read-data output, `bit` 1 = write-data input).
+    pub fn base_for(access: u64, bit: u64) -> Garble<N> {
+        gram_data_base::<D, N>(access, bit)
+    }
+
     /// Split off an independent leaf-assignment stream for one access,
     /// advancing the shared state once. The returned stream owns its state
     /// (no borrow of `self`) so it can be passed to `self.host.access`.
