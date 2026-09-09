@@ -15,13 +15,15 @@
 
 use core::{convert::Infallible, fmt, marker::PhantomData};
 
+extern crate alloc;
+
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, ContextWithMux,
     ContextWithStorage, ContextWithValue, HasError, Pusher, StorageAddressBit,
 };
 use digest::{Digest, array::Array};
 use volar_spec::{
-    garble::{Eval, Garble, GarbleTable, GlobalSecret},
+    garble::{Eval, Garble, GarbleTable, GlobalSecret, GramOutput, gram_decode_label, gram_regarble},
     vole::VoleArray,
 };
 
@@ -311,4 +313,68 @@ fn concrete_storage_index<W>(address: &[StorageAddressBit<W>]) -> usize {
                 index
             }
         })
+}
+
+// ============================================================================
+// GRAM action host (interpreter-side garbled RAM access gadget)
+// ============================================================================
+
+/// The result of one GRAM action call: one bit per `num_bits`, each delivered
+/// per its [`GramOutput`] mode.
+#[derive(Clone)]
+pub enum GramActionResult<N: VoleArray<u8>> {
+    /// All result bits are cleartext (the [`GramOutput::Cleartext`] gadget):
+    /// the evaluator decoded them and learns the values. Used for the ORAM
+    /// `begin` leaf index and the tree path read.
+    Cleartext(alloc::vec::Vec<bool>),
+    /// Result bits are re-garbled to fresh labels (the [`GramOutput::Regarble`]
+    /// gadget): the evaluator receives labels it cannot read. Used for ORAM
+    /// `process`/`evict` bucket data that must stay secret.
+    Regarble(alloc::vec::Vec<Eval<N>>),
+}
+
+/// Interpreter-side GRAM action host: executes one action of the garbled RAM
+/// access sub-protocol against evaluator-held labels, mirroring the volar
+/// garble weaver's cleartext-read / re-garble gadget (see `MPC_PLAN.md`
+/// workstream A).
+///
+/// The host is the evaluator's trusted local party: it holds each wire's
+/// false-label (`base`) so it can [`gram_decode_label`] the action argument
+/// labels into plaintext, run the ORAM client logic (position-map lookup,
+/// stash scan, eviction) over them, and return each result bit per its
+/// [`GramOutput`] mode. This is the live-`Context` counterpart of the woven
+/// evaluator's host extern call — same label-level operations, shared through
+/// `volar_spec::garble`.
+pub struct GramActionHost<N: VoleArray<u8>> {
+    secret: GlobalSecret<N>,
+}
+
+impl<N: VoleArray<u8>> GramActionHost<N> {
+    /// Construct a host from the garbler's [`GlobalSecret`]. The host needs
+    /// the secret only to re-garble result bits; decoding uses each wire's
+    /// false-label.
+    pub fn new(secret: GlobalSecret<N>) -> Self {
+        Self { secret }
+    }
+
+    /// Decode each action argument label to its plaintext bit. `args[i]` is
+    /// the evaluator's label for arg wire `i`, `bases[i]` that wire's
+    /// false-label.
+    pub fn decode_args(args: &[Eval<N>], bases: &[Garble<N>]) -> alloc::vec::Vec<bool> {
+        args.iter()
+            .zip(bases)
+            .map(|(label, base)| gram_decode_label(label, base))
+            .collect()
+    }
+
+    /// Package a host-computed result bit per its [`GramOutput`] mode:
+    /// cleartext (the evaluator learns it) or re-garbled under `base`.
+    pub fn deliver(&self, mode: GramOutput, base: &Garble<N>, bit: bool) -> GramActionResult<N> {
+        match mode {
+            GramOutput::Cleartext => GramActionResult::Cleartext(alloc::vec![bit]),
+            GramOutput::Regarble => {
+                GramActionResult::Regarble(alloc::vec![gram_regarble(&self.secret, base, bit)])
+            }
+        }
+    }
 }
