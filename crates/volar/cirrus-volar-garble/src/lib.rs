@@ -611,6 +611,10 @@ pub struct GramStorage<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const
     /// supply).
     access_count: u64,
     marker: PhantomData<D>,
+    /// Position-map leaf-assignment randomness (splitmix64 state). A real
+    /// RNG is required: reusing a constant leaf breaks ORAM correctness
+    /// across cells.
+    rng_state: u64,
 }
 
 impl<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const B: usize>
@@ -630,9 +634,39 @@ impl<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const B: usize>
             tree,
             secret,
             access_count: 0,
+            rng_state: 0x9E3779B97F4A7C15,
             marker: PhantomData,
         }
     }
+
+    /// Set the position-map RNG seed (test determinism).
+    pub fn with_rng_seed(mut self, seed: u64) -> Self {
+        self.rng_state = seed;
+        self
+    }
+
+    /// Next splitmix64 output for ORAM leaf assignment.
+    fn next_rng(&mut self) -> u64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E3779B97F4A7C15);
+        splitmix64(self.rng_state)
+    }
+
+    /// Split off an independent leaf-assignment stream for one access,
+    /// advancing the shared state once. The returned stream owns its state
+    /// (no borrow of `self`) so it can be passed to `self.host.access`.
+    fn rng_stream(&mut self) -> impl FnMut() -> u64 + 'static {
+        let mut s = self.next_rng();
+        move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            splitmix64(s)
+        }
+    }
+}
+
+fn splitmix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
 
 // Delegate the gate operations to the wrapped context.
@@ -771,12 +805,13 @@ where
         storage: &mut Self::Storage,
         address: &[StorageAddressBit<Garble<N>>],
     ) -> Result<Garble<N>, Infallible> {
-        // Garbler side: track the address bits as their false-labels and
-        // return the cell's deterministic ORAM data-wire base. No tables are
-        // emitted for the access (the ORAM client logic is the gadget).
-        let _ = address;
+        // Garbler side: return the cell's tracked false-label base. No
+        // tables are emitted for the access (the ORAM client logic is the
+        // gadget). The address is concrete (data-independent in the begin
+        // gadget).
+        let cell = concrete_storage_index(address);
         self.access_count += 1;
-        Ok(storage.cell_bases[0].clone())
+        Ok(storage.cell_bases[cell].clone())
     }
 
     fn storage_write(
@@ -785,10 +820,10 @@ where
         address: &[StorageAddressBit<Garble<N>>],
         value: Garble<N>,
     ) -> Result<(), Infallible> {
-        let _ = address;
+        let cell = concrete_storage_index(address);
         self.access_count += 1;
         // The garbler records the cell's new base (the written wire).
-        storage.cell_bases[0] = value;
+        storage.cell_bases[cell] = value;
         Ok(())
     }
 }
@@ -816,13 +851,15 @@ where
         let addr = cell as u64;
         let (addr_labels, addr_bases) = self.encode_addr(addr);
         let base = gram_data_base::<D, N>(access, 0);
-        let read = self.host.access(
-            self.tree,
+        let mut stream = self.rng_stream();
+        let this = &mut *self;
+        let read = this.host.access(
+            &mut *this.tree,
             &addr_labels,
             &addr_bases,
             None,
             &mut |_| base.clone(),
-            &mut || 0,
+            &mut stream,
         );
         Ok(read.data_labels[0].clone())
     }
@@ -845,14 +882,14 @@ where
         let mut wb = alloc::vec![false; 8 * B];
         wb[0] = bit;
         let base = gram_data_base::<D, N>(access, 0);
-        let tree = &mut *self.tree;
+        let mut stream = self.rng_stream();
         self.host.access(
-            tree,
+            &mut *self.tree,
             &addr_labels,
             &addr_bases,
             Some(&wb),
             &mut |_| base.clone(),
-            &mut || 0,
+            &mut stream,
         );
         Ok(())
     }

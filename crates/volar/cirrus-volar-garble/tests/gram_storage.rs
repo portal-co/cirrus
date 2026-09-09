@@ -88,3 +88,53 @@ fn gram_storage_write_then_read_roundtrip() {
     let bit2 = gram_decode_label(&read_label2, &base(4, 0));
     assert!(!bit2, "second read must return the overwritten bit (false)");
 }
+
+#[test]
+fn gram_storage_multiple_cells() {
+    let secret = det_secret();
+    let levels = 4;
+    let num_addrs = 8u64;
+
+    let mut tree = OramTree::<Z, B>::new(levels);
+    let tables: Vec<GarbleTable<U16>> = Vec::new();
+    let eval_backend = VolarEvalBackend::<Sha256, _, U16>::new(tables.into_iter());
+    let mut storage_space = GramStorageSpace::<U16>::new::<Sha256>(num_addrs as usize);
+    let mut ctx = GramStorage::<_, Sha256, U16, Z, B>::new(
+        eval_backend,
+        secret.clone(),
+        &mut tree,
+        levels,
+        num_addrs,
+    );
+
+    // Helper: address bits for a concrete cell index (3-bit addresses).
+    let addr_of = |cell: u64| -> Vec<StorageAddressBit<Eval<U16>>> {
+        (0..3)
+            .map(|i| StorageAddressBit {
+                wire: Eval::zero(),
+                known: Some((cell >> i) & 1 == 1),
+            })
+            .collect()
+    };
+
+    // Write distinct bits to cells 0, 3, 5 (accesses 1, 2, 3).
+    let writes = [(0u64, true), (3u64, true), (5u64, false)];
+    for (k, (cell, bit)) in writes.iter().enumerate() {
+        let access = (k + 1) as u64;
+        let vb = base(access, 1);
+        let vl = secret.encode(&vb, *bit);
+        ctx.storage_write(&mut storage_space, &addr_of(*cell), vl)
+            .expect("write");
+    }
+
+    // Read them back (accesses 4, 5, 6); each read re-garbles to
+    // gram_data_base(access, 0).
+    for (k, (cell, want)) in writes.iter().enumerate() {
+        let access = (writes.len() + k + 1) as u64;
+        let rl = ctx
+            .storage_read(&mut storage_space, &addr_of(*cell))
+            .expect("read");
+        let got = gram_decode_label(&rl, &base(access, 0));
+        assert_eq!(got, *want, "cell {cell}");
+    }
+}
