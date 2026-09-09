@@ -52,9 +52,10 @@ fn gram_storage_write_then_read_roundtrip() {
     );
 
     // WRITE cell 0 = true through the ContextWithStorage (capstone path).
-    // This is access #1; storage_write decodes the value against
-    // gram_data_base(1, 1), so the value label is encoded against that base.
-    let value_base = base(1, 1);
+    // The write value is decoded against the cell's current base
+    // (`cell_bases[0]`, initially `gram_data_base(0, 0)`), so the value
+    // label is encoded against that base.
+    let value_base = base(0, 0);
     let value_label = secret.encode(&value_base, true);
     let addr0: Vec<StorageAddressBit<Eval<U16>>> = (0..3)
         .map(|i| StorageAddressBit {
@@ -77,8 +78,10 @@ fn gram_storage_write_then_read_roundtrip() {
     let bit = gram_decode_label(&read_label, &base(2, 0));
     assert!(bit, "read must return the written bit (true)");
 
-    // WRITE cell 0 = false, read it back — exercises a second round.
-    let value_base2 = base(3, 1);
+    // WRITE cell 0 = false, read it back — exercises a second round. The
+    // cell's base is still the write's value base (the tree now holds the
+    // bit under the value's base), so encode the second write against it.
+    let value_base2 = base(0, 0);
     let value_label2 = secret.encode(&value_base2, false);
     ctx.storage_write(&mut storage_space, &addr0, value_label2)
         .expect("storage_write 2");

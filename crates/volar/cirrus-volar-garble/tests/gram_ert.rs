@@ -1,4 +1,5 @@
-//! D3: a real RV32 store/load executed through the GRAM-backed storage.
+//! D3: a real RV32 store/load executed through the GRAM-backed storage, as a
+//! two-party garbled-circuit run.
 //!
 //! `GramStorage` (the A1 capstone) routes every `ContextWithStorage`
 //! operation through a full Path-ORAM access over garbled labels. Here the
@@ -8,22 +9,33 @@
 //! garbled memory behind a genuine embedded symbolic executor — the D3
 //! "microcontroller-class vc evaluator" shape.
 //!
-//! The evaluator is `VcEvalBackend`, the constant-carrying backend D3 adds:
-//! the ERT machine fabricates its ABI/ALU constants from the `zero`/`one`
-//! wires and `ContextWithCreate`, so those must be two *distinct* labels
-//! (the garbler's constant-wire labels), not the all-zero `Eval` a woven
-//! `VolarEvalBackend` would return for both.
+//! This is the full **two-party** D3 run: a *garbler* (`VcGarbleBackend` +
+//! garbler-side `GramStorage`) and an *evaluator* (`VcEvalBackend` +
+//! evaluator-side `GramStorage`) both execute the same RV32 program with the
+//! same concrete control flow. The garbler streams one `GarbleTable` per AND
+//! gate; the evaluator consumes them in order and decodes the result.
+//!
+//! Two transports are covered: a buffered Vec pipe (garbler runs to
+//! completion, then the evaluator replays) and a live coroutine pipe
+//! (garbler and evaluator interleaved through `cirrus_coroutine`).
+//!
+//! Both parties use constant-carrying backends: the ERT machine fabricates
+//! its ABI/ALU constants from a single `zero`/`one` wire pair, so each
+//! `create` must return the *same* label per constant (the garbler-side
+//! `VcGarbleBackend` and evaluator-side `VcEvalBackend` D3 adds).
 //!
 //! Run (heavyweight): `cargo test -p cirrus-volar-garble --test gram_ert --
 //! --ignored --nocapture`.
 
 use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_emit};
-use cirrus_volar_garble::{GramStorage, GramStorageSpace, VcEvalBackend};
+use cirrus_volar_garble::{
+    GramStorage, GramStorageSpace, VcEvalBackend, VcGarbleBackend,
+};
 use hybrid_array::{Array, typenum::U16};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use sha2::Sha256;
 use volar_oram::OramTree;
-use volar_spec::garble::{Eval, GarbleTable, GlobalSecret, gram_decode_label};
+use volar_spec::garble::{Eval, Garble, GarbleTable, GlobalSecret};
 
 const Z: usize = 4;
 const B: usize = 8;
@@ -45,24 +57,33 @@ fn no_hash<C, E>(_: &mut C, _: &[[Eval<U16>; 32]]) -> Result<[u8; 32], E> {
     Ok([0; 32])
 }
 
-/// A deterministic base for the constant wires / ABI constants. Distinct
-/// from every ORAM data base so constant labels never collide with a
-/// re-garbled storage bit.
-fn const_base(secret_tag: u8) -> volar_spec::garble::Garble<U16> {
-    volar_spec::garble::Garble {
+/// The const-0 wire's false-label is the all-zero base (the free-XOR
+/// identity); const-1 is a distinct revealed base.
+fn const_base(secret_tag: u8) -> Garble<U16> {
+    if secret_tag == 0x00 {
+        return Garble {
+            base: Array::from_fn(|_| 0u8),
+        };
+    }
+    Garble {
         base: Array::from_fn(|i| {
             (i as u8).wrapping_mul(11).wrapping_add(secret_tag) | 1
         }),
     }
 }
 
-/// Execute an RV32 `sw` (store word to the vstack) then `lw` (load it back)
-/// with the vstack backed by `GramStorage`. The stored word is symbolic
-/// (driven through the GRAM), and the loaded register is decoded against
-/// the deterministic re-garble base supply.
-#[test]
-#[ignore = "heavyweight: 64+ full Path-ORAM accesses over garbled labels"]
-fn ert_sw_lw_through_gram_storage() {
+/// The shared program + machine setup, run identically by both parties.
+struct Setup {
+    stored: u32,
+    mem: Vec<u8>,
+    levels: usize,
+    num_addrs: u64,
+    storage_bits: usize,
+    zero_base: Garble<U16>,
+    one_base: Garble<U16>,
+}
+
+fn setup() -> Setup {
     let stored = 0x8001_80ffu32;
     let mem = program([
         Inst::Addi {
@@ -87,49 +108,28 @@ fn ert_sw_lw_through_gram_storage() {
         },
         Inst::Ecall,
     ]);
-
-    let storage_bits = 256usize; // 32 bytes of vstack.
-    let num_addrs = storage_bits as u64;
     let levels = 8;
-
-    let secret = det_secret();
-
-    // The constant wires: const-0 is the all-zero label (identity under
-    // free-XOR, as in any garbled circuit); const-1 is a distinct encoded
-    // label. In a real session the garbler reveals these at setup.
-    let zero_label = Eval::<U16>::zero();
-    let one_label = secret.encode(&const_base(0x01), true);
-
-    let mut tree = OramTree::<Z, B>::new(levels);
-    let tables: Vec<GarbleTable<U16>> = Vec::new();
-    let consts: Vec<Eval<U16>> = vec![zero_label.clone(), one_label.clone()];
-    let eval_backend =
-        VcEvalBackend::<Sha256, _, U16, _>::new(tables.into_iter(), consts.into_iter());
-    let storage_space = GramStorageSpace::<U16>::new::<Sha256>(num_addrs as usize);
-    let gram = GramStorage::<_, Sha256, U16, Z, B>::new(
-        eval_backend,
-        secret.clone(),
-        &mut tree,
+    let storage_bits = 256usize; // 32 bytes of vstack, one ORAM block per bit.
+    let num_addrs = storage_bits as u64;
+    Setup {
+        stored,
+        mem,
         levels,
         num_addrs,
-    );
+        storage_bits,
+        zero_base: const_base(0x00),
+        one_base: const_base(0x01),
+    }
+}
 
-    let mut handler = RvDefaultHandler {
-        inner: DefaultHandler {
-            context: gram,
-            hash: no_hash,
-        },
-    };
-    let mut storage = storage_space;
-
-    let zero = zero_label.clone();
-    let one = one_label.clone();
-    let mut regs: [[Eval<U16>; 32]; 32] =
+/// Seed the register file identically on both parties: every register
+/// starts at the const-0 wire except T0 (the stored word's constant bits)
+/// and A0 (u32::MAX, the exit signal). All constant, so the garbler and
+/// evaluator agree on every input label with no OT.
+fn seed_regs<W: Clone>(stored: u32, zero: &W, one: &W) -> ([[W; 32]; 32], [Option<u32>; 32]) {
+    let mut regs: [[W; 32]; 32] =
         core::array::from_fn(|_| core::array::from_fn(|_| zero.clone()));
     let mut constants = [None; 32];
-    // T0 = the symbolic word to store (each bit a constant-0/constant-1
-    // label per the stored word's bits). It is symbolic: it flows through
-    // the GRAM. A0 = u32::MAX signals exit.
     let stored_bits: [bool; 32] = core::array::from_fn(|b| stored & (1 << b) != 0);
     for (i, b) in stored_bits.iter().enumerate() {
         regs[Reg::T0.0 as usize][i] = if *b { one.clone() } else { zero.clone() };
@@ -140,65 +140,167 @@ fn ert_sw_lw_through_gram_storage() {
         regs[Reg::A0.0 as usize][i] = if *b { one.clone() } else { zero.clone() };
     }
     constants[Reg::A0.0 as usize] = Some(u32::MAX);
-    let mut rstack = [0; 8];
+    (regs, constants)
+}
 
+/// A `Pusher` that buffers every pushed table into a `Vec` (the buffered
+/// pipe transport).
+struct VecPusher<T>(std::vec::Vec<T>);
+impl<T> cirrus_core::Pusher<T> for VecPusher<T> {
+    fn push(&mut self, x: T) {
+        self.0.push(x);
+    }
+}
+
+/// The garbler-side run: execute the program, streaming each AND table to
+/// `pusher`. Returns the garbler's final T1 (the loaded register's tracked
+/// false-labels, for output decode) and the number of tables produced.
+fn run_garbler<P: cirrus_core::Pusher<GarbleTable<U16>>>(
+    s: &Setup,
+    secret: &GlobalSecret<U16>,
+    pusher: &mut P,
+) -> [Garble<U16>; 32] {
+    let garble_backend = VcGarbleBackend::<Sha256, U16>::new(
+        pusher,
+        secret.clone(),
+        s.zero_base.clone(),
+        s.one_base.clone(),
+    );
+    let mut tree = OramTree::<Z, B>::new(s.levels);
+    let storage_space = GramStorageSpace::<U16>::new::<Sha256>(s.num_addrs as usize);
+    let gram = GramStorage::<_, Sha256, U16, Z, B>::new(
+        garble_backend,
+        secret.clone(),
+        &mut tree,
+        s.levels,
+        s.num_addrs,
+    );
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: gram,
+            hash: |_ctx: &mut _, _words: &[[Garble<U16>; 32]]| {
+                Ok::<_, core::convert::Infallible>([0u8; 32])
+            },
+        },
+    };
+    let zero = s.zero_base.clone();
+    let one = s.one_base.clone();
+    let (mut regs, mut constants) = seed_regs(s.stored, &zero, &one);
+    let mut rstack = [0u32; 8];
+    let mut storage = storage_space;
     ert_emit(
         &mut handler,
         &mut storage,
-        storage_bits,
-        RawMemory::from(&mem[..]),
+        s.storage_bits,
+        RawMemory::from(&s.mem[..]),
         &mut rstack,
         0,
         &mut regs,
         &mut constants,
-        zero.clone(),
-        one.clone(),
+        zero,
+        one,
     )
-    .map_err(|e| {
-        // ErtError has no Debug; render the variant coarsely. A full D3 run
-        // needs the garbler to supply the AND tables the RV32 ALU consumes
-        // (the storage path is table-free GRAM, but the ALU is not); this
-        // scaffold runs evaluator-only with an empty table stream, so the
-        // first AND gate reports Emitted (table supply). See MPC_PLAN D3.
-        match e {
-            cirrus_ert::ErtError::Emitted(_) => "context error (table/constant supply)",
-            cirrus_ert::ErtError::Decode(_) => "decode error",
-            cirrus_ert::ErtError::Unexpected => "unexpected (decode/branch/addr)",
-        }
+    .map_err(|e| match e {
+        cirrus_ert::ErtError::Emitted(_) => "garbler context error",
+        cirrus_ert::ErtError::Decode(_) => "garbler decode error",
+        cirrus_ert::ErtError::Unexpected => "garbler unexpected",
     })
-    .unwrap();
-
-    // Decode the loaded register against the deterministic re-garble bases.
-    // The machine performs a fixed sequence of storage accesses; recover the
-    // concrete bits by decoding each against its access's base supply.
-    let loaded = recover_word(&regs[Reg::T1.0 as usize], &constants[Reg::T1.0 as usize]);
-    assert_eq!(loaded, stored, "lw must recover the word sw stored via ORAM");
+    .expect("garbler-side ERT run failed");
+    let out = regs[Reg::T1.0 as usize].clone();
+    drop(handler);
+    out
 }
 
-/// Recover a 32-bit register's concrete value. If the machine resolved it
-/// to a constant, use that; otherwise decode the symbolic bits against the
-/// constant bases (a bit equals 1 iff its label matches the constant-1
-/// label, 0 iff it matches the constant-0 label).
-fn recover_word(bits: &[Eval<U16>; 32], constant: &Option<u32>) -> u32 {
-    if let Some(v) = constant {
-        return *v;
+/// The evaluator-side run: consume the AND-table stream, run the program
+/// through GRAM storage, and return the loaded register's labels.
+fn run_evaluator<I: Iterator<Item = GarbleTable<U16>>>(
+    s: &Setup,
+    secret: &GlobalSecret<U16>,
+    tables: I,
+) -> [Eval<U16>; 32] {
+    let zero_label = Eval::<U16>::zero();
+    let one_label = secret.encode(&s.one_base, true);
+    let consts: Vec<Eval<U16>> = vec![zero_label.clone(), one_label.clone()];
+
+    let mut tree = OramTree::<Z, B>::new(s.levels);
+    let eval_backend = VcEvalBackend::<Sha256, _, U16, _>::new(tables, consts.into_iter());
+    let mut storage_space = GramStorageSpace::<U16>::new::<Sha256>(s.num_addrs as usize);
+    // Seed the written cells' bases so the write-value decode matches the
+    // garbler. The machine stores T0's 32 constant bits at SP (byte 16, so
+    // bit-cells 128..160); each written wire's base is the const-0/const-1
+    // base, which the garbler records in `cell_bases`. Mirror that here.
+    let sp_byte = (s.storage_bits / 8) as i64 - 16;
+    let first_cell = (sp_byte as usize) * 8;
+    for i in 0..32 {
+        let bit = (s.stored >> i) & 1 != 0;
+        storage_space.cell_bases[first_cell + i] =
+            if bit { s.one_base.clone() } else { s.zero_base.clone() };
     }
-    let zero_base = const_base(0x00);
-    let one_base = const_base(0x01);
+    let gram = GramStorage::<_, Sha256, U16, Z, B>::new(
+        eval_backend,
+        secret.clone(),
+        &mut tree,
+        s.levels,
+        s.num_addrs,
+    );
+    let mut handler = RvDefaultHandler {
+        inner: DefaultHandler {
+            context: gram,
+            hash: no_hash,
+        },
+    };
+    let mut storage = storage_space;
+    let (mut regs, mut constants) = seed_regs(s.stored, &zero_label, &one_label);
+    let mut rstack = [0u32; 8];
+    ert_emit(
+        &mut handler,
+        &mut storage,
+        s.storage_bits,
+        RawMemory::from(&s.mem[..]),
+        &mut rstack,
+        0,
+        &mut regs,
+        &mut constants,
+        zero_label.clone(),
+        one_label.clone(),
+    )
+    .map_err(|e| match e {
+        cirrus_ert::ErtError::Emitted(_) => "evaluator context error (table supply)",
+        cirrus_ert::ErtError::Decode(_) => "evaluator decode error",
+        cirrus_ert::ErtError::Unexpected => "evaluator unexpected",
+    })
+    .expect("evaluator-side ERT run failed");
+    let out = regs[Reg::T1.0 as usize].clone();
+    drop(handler);
+    out
+}
+
+/// Open each bit of the loaded register against the garbler's tracked
+/// false-labels and reassemble the concrete word.
+fn open_word(eval_bits: &[Eval<U16>; 32], garble_bases: &[Garble<U16>; 32]) -> u32 {
     let mut out = 0u32;
-    for (i, label) in bits.iter().enumerate() {
-        let is_one = gram_decode_label(label, &one_base);
-        let is_zero = gram_decode_label(label, &zero_base);
-        // A constant bit's label decodes cleanly against exactly one base.
-        let bit = if is_one {
-            true
-        } else {
-            assert!(is_zero, "bit {i} decoded against neither constant base");
-            false
-        };
-        if bit {
+    for i in 0..32 {
+        let opened = eval_bits[i].open(&garble_bases[i]);
+        if opened[0] & 1 != 0 {
             out |= 1 << i;
         }
     }
     out
+}
+
+/// Two-party GRAM ERT run over a **buffered Vec pipe**: the garbler runs to
+/// completion, then the evaluator replays the table stream.
+#[test]
+#[ignore = "heavyweight: 64+ full Path-ORAM accesses over garbled labels"]
+fn ert_sw_lw_through_gram_storage_two_party_vec_pipe() {
+    let s = setup();
+    let secret = det_secret();
+
+    let mut tables = VecPusher::<GarbleTable<U16>>(Vec::new());
+    let garble_out = run_garbler(&s, &secret, &mut tables);
+
+    let eval_out = run_evaluator(&s, &secret, tables.0.into_iter());
+
+    let loaded = open_word(&eval_out, &garble_out);
+    assert_eq!(loaded, s.stored, "lw must recover the word sw stored via ORAM");
 }

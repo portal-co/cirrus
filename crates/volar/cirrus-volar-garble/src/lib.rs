@@ -143,6 +143,107 @@ impl<D: Digest, N: VoleArray<u8>> ContextWithStorage<bool> for VolarGarbleBacken
     }
 }
 
+/// A constant-carrying garbler backend.
+///
+/// [`VolarGarbleBackend::create`] returns a *fresh* label from the digest
+/// chain on every call, which is correct for a woven circuit (no internal
+/// constants) but wrong for the ERT RV32 machine, whose ABI/ALU build
+/// constant words from a *single* `zero`/`one` wire pair: each `create`
+/// must return the *same* label for the same constant or the machine's
+/// one-zero-wire invariant breaks. `VcGarbleBackend` caches the const-0 /
+/// const-1 false-labels (derived once from the caller-supplied bases) and
+/// returns them consistently. It is the garbler-side counterpart of
+/// [`VcEvalBackend`]: the garbler's const-0 base is the all-zero label (so
+/// the evaluator's const-0 `Eval` is the all-zero label too, identity
+/// under free-XOR), and const-1 is a distinct revealed base.
+pub struct VcGarbleBackend<'a, 'b, D: Digest, N: VoleArray<u8>> {
+    /// The underlying gate garbler streaming tables to `queue`.
+    inner: VolarGarbleBackend<'a, 'b, D, N>,
+    /// The cached constant-0 / constant-1 wire false-labels.
+    zero_label: Option<Garble<N>>,
+    one_label: Option<Garble<N>>,
+}
+
+impl<'a, 'b, D: Digest, N: VoleArray<u8>> VcGarbleBackend<'a, 'b, D, N> {
+    /// Wrap a table sink, a global secret, and the two constant-wire bases.
+    /// `zero_base` should be the all-zero base so the evaluator's const-0
+    /// label is the all-zero `Eval` (free-XOR identity).
+    pub fn new(
+        queue: &'a mut (dyn Pusher<GarbleTable<N>> + 'b),
+        secret: GlobalSecret<N>,
+        zero_base: Garble<N>,
+        one_base: Garble<N>,
+    ) -> Self {
+        Self {
+            inner: VolarGarbleBackend::new(queue, secret),
+            zero_label: Some(zero_base),
+            one_label: Some(one_base),
+        }
+    }
+
+    /// The global secret (for deriving the evaluator's input labels).
+    pub fn secret(&self) -> &GlobalSecret<N> {
+        &self.inner.secret
+    }
+
+    fn zero_label(&mut self) -> Garble<N> {
+        self.zero_label.clone().unwrap()
+    }
+
+    fn one_label(&mut self) -> Garble<N> {
+        self.one_label.clone().unwrap()
+    }
+}
+
+impl<D: Digest, N: VoleArray<u8>> HasError for VcGarbleBackend<'_, '_, D, N> {
+    type Error = Infallible;
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithValue<bool> for VcGarbleBackend<'_, '_, D, N> {
+    type Wrapped = Garble<N>;
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithCreate<bool> for VcGarbleBackend<'_, '_, D, N> {
+    fn create(&mut self, val: bool) -> Result<Garble<N>, Infallible> {
+        Ok(if val { self.one_label() } else { self.zero_label() })
+    }
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithBitXor<bool> for VcGarbleBackend<'_, '_, D, N> {
+    fn bitxor(&mut self, a: Garble<N>, b: Garble<N>) -> Result<Garble<N>, Infallible> {
+        self.inner.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut Garble<N>, b: Garble<N>) -> Result<(), Infallible> {
+        *a = self.bitxor(a.clone(), b)?;
+        Ok(())
+    }
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithBitAnd<bool> for VcGarbleBackend<'_, '_, D, N> {
+    fn bitand(&mut self, a: Garble<N>, b: Garble<N>) -> Result<Garble<N>, Infallible> {
+        self.inner.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut Garble<N>, b: Garble<N>) -> Result<(), Infallible> {
+        *a = self.bitand(a.clone(), b)?;
+        Ok(())
+    }
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithBitOr<bool> for VcGarbleBackend<'_, '_, D, N> {
+    fn bitor(&mut self, a: Garble<N>, b: Garble<N>) -> Result<Garble<N>, Infallible> {
+        self.inner.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut Garble<N>, b: Garble<N>) -> Result<(), Infallible> {
+        *a = self.bitor(a.clone(), b)?;
+        Ok(())
+    }
+}
+impl<D: Digest, N: VoleArray<u8>> ContextWithMux<bool> for VcGarbleBackend<'_, '_, D, N> {
+    fn mux(
+        &mut self,
+        cond: Garble<N>,
+        then: Garble<N>,
+        r#else: Garble<N>,
+    ) -> Result<Garble<N>, Infallible> {
+        self.inner.mux(cond, then, r#else)
+    }
+}
+
 /// An error while replaying a [`GarbleTable`] stream: the record iterator
 /// ended before every AND gate was evaluated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -962,13 +1063,7 @@ where
         storage: &mut Self::Storage,
         address: &[StorageAddressBit<Garble<N>>],
     ) -> Result<Garble<N>, Infallible> {
-        // Garbler side: return the cell's tracked false-label base. No
-        // tables are emitted for the access (the ORAM client logic is the
-        // gadget). The address is concrete (data-independent in the begin
-        // gadget).
-        let cell = concrete_storage_index(address);
-        self.access_count += 1;
-        Ok(storage.cell_bases[cell].clone())
+        Ok(self.garbler_read(storage, address))
     }
 
     fn storage_write(
@@ -977,10 +1072,34 @@ where
         address: &[StorageAddressBit<Garble<N>>],
         value: Garble<N>,
     ) -> Result<(), Infallible> {
-        let cell = concrete_storage_index(address);
-        self.access_count += 1;
-        // The garbler records the cell's new base (the written wire).
-        storage.cell_bases[cell] = value;
+        self.garbler_write(storage, address, value);
+        Ok(())
+    }
+}
+
+impl<'t, 'b, D, N, const Z: usize, const B: usize> ContextWithStorage<bool>
+    for GramStorage<'t, VcGarbleBackend<'t, 'b, D, N>, D, N, Z, B>
+where
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    type Storage = GramStorageSpace<N>;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+    ) -> Result<Garble<N>, Infallible> {
+        Ok(self.garbler_read(storage, address))
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+        value: Garble<N>,
+    ) -> Result<(), Infallible> {
+        self.garbler_write(storage, address, value);
         Ok(())
     }
 }
@@ -1034,8 +1153,12 @@ where
         let addr = cell as u64;
         let (addr_labels, addr_bases) = self.encode_addr(addr);
         // The write bit is the evaluator's label for `value`; decode it
-        // host-side against the value's base (supplied via the cell base).
-        let bit = gram_decode_label(&value, &gram_data_base::<D, N>(access, 1));
+        // host-side against the value's base. For a machine-driven write the
+        // value wire's base is the machine's (e.g. a constant-wire base);
+        // the garbler tracks it in `cell_bases[cell]` and the evaluator
+        // mirrors that here so both parties decode the same bit.
+        let value_base = storage.cell_bases[cell].clone();
+        let bit = gram_decode_label(&value, &value_base);
         let mut wb = alloc::vec![false; 8 * B];
         wb[0] = bit;
         let base = gram_data_base::<D, N>(access, 0);
@@ -1069,5 +1192,36 @@ where
             bases.push(base);
         }
         (labels, bases)
+    }
+
+    /// Garbler-side read: return the deterministic base the evaluator's
+    /// read label is re-garbled to (`gram_data_base(access, 0)`), so the
+    /// two parties' output wires share one base. No tables are emitted for
+    /// the access (the ORAM client logic is the gadget). The address is
+    /// concrete (data-independent in the begin gadget).
+    fn garbler_read(
+        &mut self,
+        storage: &mut GramStorageSpace<N>,
+        address: &[StorageAddressBit<Garble<N>>],
+    ) -> Garble<N> {
+        let _cell = concrete_storage_index(address);
+        let _ = storage;
+        self.access_count += 1;
+        let access = self.access_count;
+        gram_data_base::<D, N>(access, 0)
+    }
+
+    /// Garbler-side write: record the cell's new base (the written wire's
+    /// base), which the evaluator mirrors in `cell_bases[cell]` so its
+    /// write-value decode matches. No table is emitted.
+    fn garbler_write(
+        &mut self,
+        storage: &mut GramStorageSpace<N>,
+        address: &[StorageAddressBit<Garble<N>>],
+        value: Garble<N>,
+    ) {
+        let cell = concrete_storage_index(address);
+        self.access_count += 1;
+        storage.cell_bases[cell] = value;
     }
 }
