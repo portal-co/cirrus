@@ -51,4 +51,4 @@ hybrid-array = { version = "0.4.8", default-features = false }
 # Local Ferret / OT-stack APIs (Unpinned). Matches the `.git`-suffixed
 # volar-spec dependency above; do not add an unqualified-URL patch.
 [patch."https://github.com/portal-co/volar.git"]
-volar-spec = { path = "../volar/crates/spec/volar-spec" }
+volar-spec = { path = "../../volar/crates/spec/volar-spec" }

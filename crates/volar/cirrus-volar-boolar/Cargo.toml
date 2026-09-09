@@ -13,7 +13,7 @@ cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-reco
 volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git", features = ["lazy"] }
 volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 volar-ir-build = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git", features = ["llvm"], optional = true }
-lazy-repo = { path = "../../../../lazy-repo/crates/lazy-repo", default-features = false }
+lazy-repo = { git = "https://github.com/portal-co/lazy-repo", default-features = false }
 lazy-repo-crypto = { path = "../../../../lazy-repo/crates/lazy-repo-crypto", default-features = false }
 
 [dev-dependencies]
