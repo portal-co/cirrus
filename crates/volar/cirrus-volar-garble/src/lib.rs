@@ -547,3 +547,335 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         }
     }
 }
+
+// ============================================================================
+// GRAM-backed storage (A1 capstone): sublinear ORAM storage for the
+// garbled-circuit contexts
+// ============================================================================
+
+use volar_oram::OramTree;
+
+/// A deterministic base supply for ORAM data wires: the `i`-th access's
+/// `j`-th data-bit false-label is derived as
+/// `H(0xDA || access_index || bit_index)` — a pure function both the garbler
+/// and the evaluator-side host compute, mirroring
+/// [`Garble::action_result_base`], so the garbler's downstream gates and the
+/// host's re-garble agree with no extra communication.
+fn gram_data_base<D: Digest, N: VoleArray<u8>>(access: u64, bit: u64) -> Garble<N> {
+    let mut d = D::new();
+    d.update(&[0xDAu8]);
+    d.update(&access.to_le_bytes());
+    d.update(&bit.to_le_bytes());
+    let hash = d.finalize();
+    Garble {
+        base: Array::<u8, N>::from_fn(|i| hash[i]),
+    }
+}
+
+/// GRAM-backed storage for the garbled-circuit contexts: the A1 capstone.
+///
+/// Replaces the linear-scan `[Garble]`/`[Eval]` slice storage with a
+/// **sublinear ORAM** backed by an evaluator-hosted [`OramTree`]. The storage
+/// is a pair `(garbler_addr_bases, tree)` where the garbler side tracks the
+/// per-address false-labels it assigned and the evaluator side holds the
+/// ORAM tree plus its ORAM host.
+///
+/// The two roles share one context type parameterized on the wire label
+/// `W` (`Garble<N>` garbler-side, `Eval<N>` evaluator-side):
+///
+/// - **Garbler** (`GramStorage<VolarGarbleBackend>`): `storage_read` returns
+///   the deterministic ORAM data-wire bases; the address bits are tracked as
+///   their false-labels. No tables are emitted for the access itself (the
+///   ORAM client logic is the gadget).
+/// - **Evaluator** (`GramStorage<VolarEvalBackend>`): `storage_read` /
+///   `storage_write` decode the address, run the full ORAM access through
+///   [`GramOramHost`], and return the re-garbled read-data labels — which
+///   decode correctly against the garbler's deterministic bases.
+///
+/// This is the interpreter-side counterpart of the volar woven GRAM circuit
+/// (`weave_garbler_with_gram` + `weave_evaluator_with_gram`): same label
+/// currency, same ORAM access sub-protocol, driven live by the `Context`.
+///
+/// `Z` is the ORAM bucket size, `B` the block size in bytes (one bit per
+/// byte stored, matching the one-bit-per-cell boolar convention).
+pub struct GramStorage<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const B: usize> {
+    /// The wrapped gate context (garbler or evaluator backend).
+    pub inner: C,
+    /// The ORAM host (evaluator-side; holds the secret for re-garbling).
+    pub host: GramOramHost<N, Z, B>,
+    /// The evaluator-hosted ORAM tree.
+    pub tree: &'t mut OramTree<Z, B>,
+    /// The garbler's global secret (re-garbling + address re-encoding).
+    secret: GlobalSecret<N>,
+    /// Number of ORAM accesses performed (drives the deterministic base
+    /// supply).
+    access_count: u64,
+    marker: PhantomData<D>,
+}
+
+impl<'t, C, D: Digest, N: VoleArray<u8>, const Z: usize, const B: usize>
+    GramStorage<'t, C, D, N, Z, B>
+{
+    /// Wrap a gate context with GRAM storage over `tree`.
+    pub fn new(
+        inner: C,
+        secret: GlobalSecret<N>,
+        tree: &'t mut OramTree<Z, B>,
+        levels: usize,
+        num_addrs: u64,
+    ) -> Self {
+        Self {
+            inner,
+            host: GramOramHost::new(secret.clone(), levels, num_addrs),
+            tree,
+            secret,
+            access_count: 0,
+            marker: PhantomData,
+        }
+    }
+}
+
+// Delegate the gate operations to the wrapped context.
+impl<'t, C, D, N, const Z: usize, const B: usize> HasError for GramStorage<'t, C, D, N, Z, B>
+where
+    C: HasError,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    type Error = C::Error;
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithValue<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithValue<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    type Wrapped = C::Wrapped;
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithCreate<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithCreate<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    fn create(&mut self, val: bool) -> Result<C::Wrapped, C::Error> {
+        self.inner.create(val)
+    }
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithBitXor<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithBitXor<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    fn bitxor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
+        self.inner.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
+        self.inner.bitxor_assign(a, b)
+    }
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithBitAnd<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithBitAnd<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    fn bitand(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
+        self.inner.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
+        self.inner.bitand_assign(a, b)
+    }
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithBitOr<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithBitOr<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    fn bitor(&mut self, a: C::Wrapped, b: C::Wrapped) -> Result<C::Wrapped, C::Error> {
+        self.inner.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut C::Wrapped, b: C::Wrapped) -> Result<(), C::Error> {
+        self.inner.bitor_assign(a, b)
+    }
+}
+
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithMux<bool>
+    for GramStorage<'t, C, D, N, Z, B>
+where
+    C: ContextWithMux<bool>,
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    fn mux(
+        &mut self,
+        cond: C::Wrapped,
+        then: C::Wrapped,
+        r#else: C::Wrapped,
+    ) -> Result<C::Wrapped, C::Error> {
+        self.inner.mux(cond, then, r#else)
+    }
+}
+
+/// The caller-owned storage space for [`GramStorage`]: one ORAM memory of
+/// `num_addrs` blocks. Holds the garbler's per-address false-labels so the
+/// garbler side can track addresses as bases; the evaluator side uses only
+/// the concrete address index (the tree lives on the context).
+///
+/// One block = `B` bytes; a storage cell is one bit (boolar convention), so
+/// a `storage_read` returns the bit at a concrete (byte, bit) position. To
+/// keep the gadget simple, each storage cell maps to one ORAM block whose
+/// byte 0 bit 0 carries the value — matching the small-memory GRAM regime
+/// the gadget targets.
+pub struct GramStorageSpace<N: VoleArray<u8>> {
+    /// The garbler's false-label for each storage cell's ORAM data wire
+    /// (`num_cells` of them), used garbler-side as the tracked address base
+    /// and evaluator-side as the deterministic base the host re-garbles to.
+    pub cell_bases: alloc::vec::Vec<Garble<N>>,
+}
+
+impl<N: VoleArray<u8>> GramStorageSpace<N> {
+    /// Allocate a storage space of `num_cells` one-bit cells, deriving each
+    /// cell's base deterministically.
+    pub fn new<D: Digest>(num_cells: usize) -> Self {
+        Self {
+            cell_bases: (0..num_cells)
+                .map(|i| gram_data_base::<D, N>(0, i as u64))
+                .collect(),
+        }
+    }
+}
+
+impl<'t, 'b, D, N, const Z: usize, const B: usize> ContextWithStorage<bool>
+    for GramStorage<'t, VolarGarbleBackend<'t, 'b, D, N>, D, N, Z, B>
+where
+    D: Digest,
+    N: VoleArray<u8>,
+{
+    type Storage = GramStorageSpace<N>;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+    ) -> Result<Garble<N>, Infallible> {
+        // Garbler side: track the address bits as their false-labels and
+        // return the cell's deterministic ORAM data-wire base. No tables are
+        // emitted for the access (the ORAM client logic is the gadget).
+        let _ = address;
+        self.access_count += 1;
+        Ok(storage.cell_bases[0].clone())
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Garble<N>>],
+        value: Garble<N>,
+    ) -> Result<(), Infallible> {
+        let _ = address;
+        self.access_count += 1;
+        // The garbler records the cell's new base (the written wire).
+        storage.cell_bases[0] = value;
+        Ok(())
+    }
+}
+
+impl<'t, D, I, N, const Z: usize, const B: usize> ContextWithStorage<bool>
+    for GramStorage<'t, VolarEvalBackend<D, I, N>, D, N, Z, B>
+where
+    D: Digest,
+    I: Iterator<Item = GarbleTable<N>>,
+    N: VoleArray<u8>,
+{
+    type Storage = GramStorageSpace<N>;
+
+    fn storage_read(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Eval<N>>],
+    ) -> Result<Eval<N>, VolarEvalError> {
+        let cell = concrete_storage_index(address);
+        let _ = storage;
+        self.access_count += 1;
+        let access = self.access_count;
+        // Run the ORAM access (read) through the host; the data bit is
+        // re-garbled to the cell's deterministic base.
+        let addr = cell as u64;
+        let (addr_labels, addr_bases) = self.encode_addr(addr);
+        let base = gram_data_base::<D, N>(access, 0);
+        let read = self.host.access(
+            self.tree,
+            &addr_labels,
+            &addr_bases,
+            None,
+            &mut |_| base.clone(),
+            &mut || 0,
+        );
+        Ok(read.data_labels[0].clone())
+    }
+
+    fn storage_write(
+        &mut self,
+        storage: &mut Self::Storage,
+        address: &[StorageAddressBit<Eval<N>>],
+        value: Eval<N>,
+    ) -> Result<(), VolarEvalError> {
+        let cell = concrete_storage_index(address);
+        let _ = storage;
+        self.access_count += 1;
+        let access = self.access_count;
+        let addr = cell as u64;
+        let (addr_labels, addr_bases) = self.encode_addr(addr);
+        // The write bit is the evaluator's label for `value`; decode it
+        // host-side against the value's base (supplied via the cell base).
+        let bit = gram_decode_label(&value, &gram_data_base::<D, N>(access, 1));
+        let mut wb = alloc::vec![false; 8 * B];
+        wb[0] = bit;
+        let base = gram_data_base::<D, N>(access, 0);
+        let tree = &mut *self.tree;
+        self.host.access(
+            tree,
+            &addr_labels,
+            &addr_bases,
+            Some(&wb),
+            &mut |_| base.clone(),
+            &mut || 0,
+        );
+        Ok(())
+    }
+}
+
+impl<'t, D, I, N, const Z: usize, const B: usize>
+    GramStorage<'t, VolarEvalBackend<D, I, N>, D, N, Z, B>
+where
+    D: Digest,
+    I: Iterator<Item = GarbleTable<N>>,
+    N: VoleArray<u8>,
+{
+    /// Encode a concrete 64-bit address as labels + bases (the evaluator
+    /// learns the address — data-independent in the ORAM begin gadget).
+    fn encode_addr(&self, addr: u64) -> (alloc::vec::Vec<Eval<N>>, alloc::vec::Vec<Garble<N>>) {
+        let mut labels = alloc::vec::Vec::with_capacity(64);
+        let mut bases = alloc::vec::Vec::with_capacity(64);
+        for i in 0..64u64 {
+            let base = gram_data_base::<D, N>(u64::MAX, i);
+            let bit = (addr >> i) & 1 == 1;
+            labels.push(self.secret.encode(&base, bit));
+            bases.push(base);
+        }
+        (labels, bases)
+    }
+}
