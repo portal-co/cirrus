@@ -5,6 +5,9 @@ extern crate std;
 
 pub mod transport;
 
+#[cfg(feature = "volar-ext")]
+pub mod extension;
+
 use core::array;
 
 use digest::Digest;

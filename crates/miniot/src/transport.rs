@@ -32,7 +32,6 @@
 //! all `N` keys); the receiver can decapsulate only its choice index's
 //! ciphertext, so it recovers only that payload.
 
-#![no_std]
 
 extern crate alloc;
 
