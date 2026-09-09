@@ -73,6 +73,7 @@ fn const_base(secret_tag: u8) -> Garble<U16> {
 }
 
 /// The shared program + machine setup, run identically by both parties.
+#[derive(Clone)]
 struct Setup {
     stored: u32,
     mem: Vec<u8>,
@@ -304,3 +305,60 @@ fn ert_sw_lw_through_gram_storage_two_party_vec_pipe() {
     let loaded = open_word(&eval_out, &garble_out);
     assert_eq!(loaded, s.stored, "lw must recover the word sw stored via ORAM");
 }
+
+/// Two-party GRAM ERT run over a **threaded pipe**: the garbler runs on a
+/// spawned OS thread, streaming each AND table through a
+/// `std::sync::mpsc` channel; the evaluator (main thread) pulls them as its
+/// table iterator. The garbler's tracked output bases return through a
+/// second channel. This is the streaming shape a real online session takes
+/// (no full table buffering), using a plain channel rather than a
+/// stackful-coroutine context switch — multiple OS threads are available.
+#[test]
+#[ignore = "heavyweight: 64+ full Path-ORAM accesses over garbled labels"]
+fn ert_sw_lw_through_gram_storage_two_party_thread_pipe() {
+    let s = setup();
+    let secret = det_secret();
+
+    // tables: garbler -> evaluator (one GarbleTable per AND gate).
+    let (table_tx, table_rx) = std::sync::mpsc::channel::<GarbleTable<U16>>();
+    // output bases: garbler -> evaluator (the loaded register's tracked
+    // false-labels, for the final decode).
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<[Garble<U16>; 32]>();
+
+    // The garbler thread: stream each table, then send the output bases.
+    let s_g = s.clone();
+    let secret_g = secret.clone();
+    let garbler = std::thread::spawn(move || {
+        struct ChanPusher(std::sync::mpsc::Sender<GarbleTable<U16>>);
+        impl cirrus_core::Pusher<GarbleTable<U16>> for ChanPusher {
+            fn push(&mut self, x: GarbleTable<U16>) {
+                // If the evaluator finished early (it shouldn't), stop.
+                let _ = self.0.send(x);
+            }
+        }
+        let out = run_garbler(&s_g, &secret_g, &mut ChanPusher(table_tx));
+        let _ = out_tx.send(out);
+    });
+
+    // The evaluator's table iterator pulls from the channel, blocking until
+    // the garbler produces the next table.
+    struct ChanTables(std::sync::mpsc::Receiver<GarbleTable<U16>>);
+    impl Iterator for ChanTables {
+        type Item = GarbleTable<U16>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.recv().ok()
+        }
+    }
+
+    let eval_out = run_evaluator(&s, &secret, ChanTables(table_rx));
+
+    let garble_out = out_rx
+        .recv()
+        .expect("garbler thread must have completed and sent its output");
+    garbler.join().expect("garbler thread panicked");
+
+    let loaded = open_word(&eval_out, &garble_out);
+    assert_eq!(loaded, s.stored, "lw must recover the word sw stored via ORAM");
+}
+
+
