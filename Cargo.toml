@@ -43,6 +43,10 @@ ark-std = { version = "0.6.0", default-features = false }
 # variant, unlike volar-ir/waffle-) -- do not add an unqualified-URL patch
 # block for this; nothing needs it.
 volar-spec = { version = "0.1.0", git = "https://github.com/portal-co/volar.git" }
+# volar-oram: evaluator-side Path-ORAM client (no_std + alloc), used by the
+# cirrus GRAM interpreter to drive ORAM accesses over garbled labels. Same
+# ".git"-suffixed spelling / patch as volar-spec.
+volar-oram = { version = "0.1.0", git = "https://github.com/portal-co/volar.git" }
 # Pinned to match volar-spec's own Cargo.toml exactly.
 cipher = { version = "0.5.1", default-features = false }
 digest = { version = "0.11.3", default-features = false }
@@ -52,3 +56,6 @@ hybrid-array = { version = "0.4.8", default-features = false }
 # volar-spec dependency above; do not add an unqualified-URL patch.
 [patch."https://github.com/portal-co/volar.git"]
 volar-spec = { path = "../../volar/crates/spec/volar-spec" }
+volar-oram = { path = "../../volar/crates/oram/volar-oram" }
+volar-oram-core = { path = "../../volar/crates/oram/volar-oram-core" }
+volar-channel = { path = "../../volar/crates/channel/volar-channel" }

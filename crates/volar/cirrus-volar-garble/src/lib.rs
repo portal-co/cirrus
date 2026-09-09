@@ -378,3 +378,172 @@ impl<N: VoleArray<u8>> GramActionHost<N> {
         }
     }
 }
+
+// ============================================================================
+// GRAM ORAM host (interpreter-side full ORAM access over labels)
+// ============================================================================
+
+/// The result of one full interpreter-side ORAM access: the block's read
+/// data as re-garbled labels (secret), ready to flow back into the circuit.
+#[derive(Clone)]
+pub struct GramOramRead<N: VoleArray<u8>> {
+    /// The accessed block's data bits, re-garbled to fresh labels (one per
+    /// data bit, `8 * B` of them).
+    pub data_labels: alloc::vec::Vec<Eval<N>>,
+    /// The cleartext old-leaf index the access touched (data-independent —
+    /// the evaluator is allowed to learn it, per the GRAM output contract).
+    pub old_leaf: u64,
+}
+
+/// Interpreter-side full ORAM access over garbled labels: the cirrus
+/// counterpart of volar-vc's `OramHost` + `OramHostShim`, combining the
+/// label layer ([`GramActionHost`]) with the shared bit-level driver
+/// ([`volar_oram::bit_host::OramHost`]).
+///
+/// Where the woven evaluator calls a host extern once per action, the cirrus
+/// interpreter drives the whole begin → process → evict×2 sequence inline
+/// over the evaluator's labels: it decodes the address label to plaintext,
+/// runs the ORAM client against the evaluator-hosted [`OramTree`], and
+/// re-garbles the resulting read-data bits to fresh labels.
+///
+/// The host holds the garbler's [`GlobalSecret`] (for re-garbling) and the
+/// shared bit-level driver. The per-result-wire bases are supplied by a
+/// `base_for(i) -> Garble<N>` closure — the same deterministic base supply
+/// the garbler used for those wires (the increment-4 embedder contract).
+///
+/// `Z` is the bucket size, `B` the block size in bytes; `levels` the tree
+/// depth.
+pub struct GramOramHost<N: VoleArray<u8>, const Z: usize, const B: usize> {
+    /// Label layer: decode arg labels, re-garble result bits.
+    action_host: GramActionHost<N>,
+    /// Shared bit-level ORAM client driver (label-free).
+    driver: volar_oram::bit_host::OramHost<Z, B>,
+}
+
+impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
+    /// Construct a host from the garbler's secret, for a tree of `levels`
+    /// levels addressing `num_addrs` blocks.
+    pub fn new(secret: GlobalSecret<N>, levels: usize, num_addrs: u64) -> Self {
+        Self {
+            action_host: GramActionHost::new(secret),
+            driver: volar_oram::bit_host::OramHost::new(levels, num_addrs),
+        }
+    }
+
+    /// Borrow the shared driver's ORAM client (e.g. to inspect the stash).
+    pub fn client(&self) -> &volar_oram::OramClient<Z, B> {
+        self.driver.client()
+    }
+
+    /// Run one full ORAM access over labels against the evaluator-hosted
+    /// `tree`, returning the accessed block's data re-garbled to labels.
+    ///
+    /// - `addr_labels` / `addr_bases`: the evaluator's labels for the 64
+    ///   address input bits (LSB-first) and their false-labels. The host
+    ///   decodes them to a plaintext `u64` address — the address is a
+    ///   client-secret input that becomes data-independent once the position
+    ///   map is consulted, so the host may learn it (per the GRAM output
+    ///   contract for `begin`).
+    /// - `write`: `Some(bits)` writes the supplied `8 * B` data bits into the
+    ///   cell; `None` is a read. (In the full gadget the write-data bits
+    ///   arrive as labels too and are decoded here; the harness passes them
+    ///   pre-decoded.)
+    /// - `base_for(i)`: the false-label for the `i`-th read-data result bit.
+    /// - `rng`: position-map leaf-assignment randomness.
+    ///
+    /// The tree is evaluator-hosted: the host reads/writes buckets in the
+    /// clear at the (cleartext) leaves the client logic selects.
+    pub fn access(
+        &mut self,
+        tree: &mut volar_oram::OramTree<Z, B>,
+        addr_labels: &[Eval<N>],
+        addr_bases: &[Garble<N>],
+        write: Option<&[bool]>,
+        base_for: &mut dyn FnMut(usize) -> Garble<N>,
+        rng: &mut dyn FnMut() -> u64,
+    ) -> GramOramRead<N> {
+        use volar_oram::bit_host::OramHost as Drv;
+
+        // 1. Decode the address labels to a plaintext u64 (LSB-first).
+        assert_eq!(
+            addr_labels.len(),
+            64,
+            "GramOramHost: address is 64 bits"
+        );
+        let addr_bits_decoded = GramActionHost::<N>::decode_args(addr_labels, addr_bases);
+        let mut addr = 0u64;
+        for (i, b) in addr_bits_decoded.iter().enumerate() {
+            if *b {
+                addr |= 1u64 << i;
+            }
+        }
+        let mut addr_bits = alloc::vec::Vec::new();
+        Drv::<Z, B>::push_u64(&mut addr_bits, addr, 64);
+
+        // begin: addr → old_leaf.
+        let leaf_bits = self
+            .driver
+            .begin(&addr_bits, rng)
+            .expect("GramOramHost: begin");
+        let mut off = 0usize;
+        let old_leaf = Drv::<Z, B>::take_u64(&leaf_bits, &mut off, 64);
+
+        // 2. Read the tree path at old_leaf, flatten to bits.
+        let path = tree.read_path(old_leaf);
+        let mut path_bits = alloc::vec::Vec::new();
+        self.driver.push_path(&mut path_bits, &path);
+
+        // 3. process: path ‖ data ‖ is_write → wb_path ‖ read_data ‖ e1 ‖ e2.
+        let mut proc_args = path_bits.clone();
+        let wd: alloc::vec::Vec<bool> = match write {
+            Some(w) => w.to_vec(),
+            None => alloc::vec![false; 8 * B],
+        };
+        proc_args.extend_from_slice(&wd);
+        proc_args.push(write.is_some());
+        let proc_out = self.driver.process(&proc_args).expect("GramOramHost: process");
+
+        let path_bits_len = path_bits.len();
+        let wb_bits = &proc_out[..path_bits_len];
+        let mut roff = path_bits_len;
+        let mut read_data_bits = alloc::vec::Vec::with_capacity(8 * B);
+        for _ in 0..(8 * B) {
+            read_data_bits.push(proc_out[roff]);
+            roff += 1;
+        }
+        let evict1 = Drv::<Z, B>::take_u64(&proc_out, &mut roff, 64);
+        let evict2 = Drv::<Z, B>::take_u64(&proc_out, &mut roff, 64);
+
+        // 4. Write back the updated path at old_leaf.
+        let wb_path = self.driver.take_path(wb_bits, "wb").expect("GramOramHost: wb path");
+        tree.write_path(old_leaf, &wb_path);
+
+        // 5. Two eviction passes.
+        for evict_leaf in [evict1, evict2] {
+            let ep = tree.read_path(evict_leaf);
+            let mut ep_bits = alloc::vec::Vec::new();
+            self.driver.push_path(&mut ep_bits, &ep);
+            let new_ep_bits = self.driver.evict(&ep_bits).expect("GramOramHost: evict");
+            let new_ep = self
+                .driver
+                .take_path(&new_ep_bits, "evict_out")
+                .expect("GramOramHost: evict path");
+            tree.write_path(evict_leaf, &new_ep);
+        }
+
+        // 6. Re-garble the read-data bits to fresh labels.
+        let data_labels = read_data_bits
+            .iter()
+            .enumerate()
+            .map(|(i, &bit)| match self.action_host.deliver(GramOutput::Regarble, &base_for(i), bit) {
+                GramActionResult::Regarble(labels) => labels[0].clone(),
+                GramActionResult::Cleartext(_) => unreachable!("Regarble mode returns labels"),
+            })
+            .collect();
+
+        GramOramRead {
+            data_labels,
+            old_leaf,
+        }
+    }
+}
