@@ -271,6 +271,149 @@ where
     }
 }
 
+/// A constant-carrying evaluator backend for the embedded vc executor (D3).
+///
+/// `VolarEvalBackend` collapses both `create(false)` and `create(true)` to
+/// an all-zero `Eval` — the right choice for a woven circuit (which never
+/// fabricates constants internally) but wrong for the ERT RV32 machine,
+/// whose ALU and ABI build constant words from the `zero`/`one` ABI wires
+/// and `ContextWithCreate`. With both constants equal, every constant
+/// computation silently evaluates to 0.
+///
+/// `VcEvalBackend` fixes this by sourcing the constant-0 and constant-1
+/// wire labels from a caller-supplied iterator — the garbler's constant-
+/// wire labels, delivered at session setup (public constants, so they may
+/// be revealed in the clear). The ERT machine uses exactly one constant-0
+/// and one constant-1 wire per run, so a two-label supply suffices.
+///
+/// Gate semantics are identical to `VolarEvalBackend` (XOR free, AND via a
+/// streamed table, OR/mux derived); only the constant wiring differs. The
+/// garbler builds its half of the circuit treating `const0`/`const1` as
+/// ordinary input wires, so every AND table already accounts for them.
+pub struct VcEvalBackend<D: Digest, I, N: VoleArray<u8>, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    /// The underlying gate evaluator.
+    inner: VolarEvalBackend<D, I, N>,
+    /// Ordered constant labels: the first `next()` is the const-0 wire, the
+    /// second the const-1 wire. Subsequent `create` calls reuse them.
+    consts: C,
+    /// The resolved constant-0 / constant-1 wire labels, once pulled.
+    zero_label: Option<Eval<N>>,
+    one_label: Option<Eval<N>>,
+}
+
+impl<D: Digest, I, N: VoleArray<u8>, C> VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    /// Construct a constant-carrying evaluator pulling AND tables from
+    /// `tables` and the two constant-wire labels from `consts`.
+    pub fn new(tables: I, consts: C) -> Self {
+        Self {
+            inner: VolarEvalBackend::new(tables),
+            consts,
+            zero_label: None,
+            one_label: None,
+        }
+    }
+
+    /// The constant-0 wire label, pulling it from the supply on first use.
+    fn zero_label(&mut self) -> Eval<N> {
+        if self.zero_label.is_none() {
+            self.zero_label = Some(self.consts.next().unwrap_or_else(Eval::zero));
+        }
+        self.zero_label.clone().unwrap()
+    }
+
+    /// The constant-1 wire label, pulling it from the supply on first use.
+    fn one_label(&mut self) -> Eval<N> {
+        if self.one_label.is_none() {
+            // Ensure const-0 was consumed first so the supply order holds.
+            let _ = self.zero_label();
+            self.one_label = Some(self.consts.next().unwrap_or_else(Eval::zero));
+        }
+        self.one_label.clone().unwrap()
+    }
+}
+
+impl<D: Digest, I, N: VoleArray<u8>, C> HasError for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    type Error = VolarEvalError;
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithValue<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    type Wrapped = Eval<N>;
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithCreate<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    fn create(&mut self, val: bool) -> Result<Eval<N>, VolarEvalError> {
+        Ok(if val { self.one_label() } else { self.zero_label() })
+    }
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithBitXor<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    fn bitxor(&mut self, a: Eval<N>, b: Eval<N>) -> Result<Eval<N>, VolarEvalError> {
+        self.inner.bitxor(a, b)
+    }
+    fn bitxor_assign(&mut self, a: &mut Eval<N>, b: Eval<N>) -> Result<(), VolarEvalError> {
+        self.inner.bitxor_assign(a, b)
+    }
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithBitAnd<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    fn bitand(&mut self, a: Eval<N>, b: Eval<N>) -> Result<Eval<N>, VolarEvalError> {
+        self.inner.bitand(a, b)
+    }
+    fn bitand_assign(&mut self, a: &mut Eval<N>, b: Eval<N>) -> Result<(), VolarEvalError> {
+        self.inner.bitand_assign(a, b)
+    }
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithBitOr<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    fn bitor(&mut self, a: Eval<N>, b: Eval<N>) -> Result<Eval<N>, VolarEvalError> {
+        self.inner.bitor(a, b)
+    }
+    fn bitor_assign(&mut self, a: &mut Eval<N>, b: Eval<N>) -> Result<(), VolarEvalError> {
+        self.inner.bitor_assign(a, b)
+    }
+}
+impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithMux<bool> for VcEvalBackend<D, I, N, C>
+where
+    I: Iterator<Item = GarbleTable<N>>,
+    C: Iterator<Item = Eval<N>>,
+{
+    fn mux(
+        &mut self,
+        cond: Eval<N>,
+        then: Eval<N>,
+        r#else: Eval<N>,
+    ) -> Result<Eval<N>, VolarEvalError> {
+        self.inner.mux(cond, then, r#else)
+    }
+}
+
 impl<D: Digest, I, N: VoleArray<u8>> ContextWithStorage<bool> for VolarEvalBackend<D, I, N>
 where
     I: Iterator<Item = GarbleTable<N>>,
@@ -842,11 +985,11 @@ where
     }
 }
 
-impl<'t, D, I, N, const Z: usize, const B: usize> ContextWithStorage<bool>
-    for GramStorage<'t, VolarEvalBackend<D, I, N>, D, N, Z, B>
+impl<'t, C, D, N, const Z: usize, const B: usize> ContextWithStorage<bool>
+    for GramStorage<'t, C, D, N, Z, B>
 where
+    C: HasError<Error = VolarEvalError> + ContextWithValue<bool, Wrapped = Eval<N>>,
     D: Digest,
-    I: Iterator<Item = GarbleTable<N>>,
     N: VoleArray<u8>,
 {
     type Storage = GramStorageSpace<N>;
@@ -909,11 +1052,9 @@ where
     }
 }
 
-impl<'t, D, I, N, const Z: usize, const B: usize>
-    GramStorage<'t, VolarEvalBackend<D, I, N>, D, N, Z, B>
+impl<'t, C, D, N, const Z: usize, const B: usize> GramStorage<'t, C, D, N, Z, B>
 where
     D: Digest,
-    I: Iterator<Item = GarbleTable<N>>,
     N: VoleArray<u8>,
 {
     /// Encode a concrete 64-bit address as labels + bases (the evaluator
