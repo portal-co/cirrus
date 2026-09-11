@@ -1,0 +1,18 @@
+{
+  "name": "@portal-solutions/cirrus-boolar",
+  "version": "0.1.0",
+  "description": "Generic TypeScript executor for Volar Boolar circuits",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  }
+}
