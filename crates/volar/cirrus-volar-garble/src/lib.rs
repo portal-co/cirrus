@@ -27,6 +27,9 @@ use volar_spec::{
     vole::VoleArray,
 };
 
+pub mod cut_and_choose;
+
+
 /// The garbler-side context: streams one [`GarbleTable`] per AND gate to
 /// [`Self::queue`], in circuit order.
 pub struct VolarGarbleBackend<'a, 'b, D: Digest, N: VoleArray<u8>> {
