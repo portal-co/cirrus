@@ -2,14 +2,17 @@
 //! Cut-and-choose harness over the volar garble/eval backends, using the generic
 //! [`Broadcast`] wrapper to run the evaluator's N copies in parallel.
 //!
-//! Same-process protocol demo: the garbler garbles N copies of a program (each
-//! with an independent `GlobalSecret` + label chain derived from a per-copy
-//! seed), commits to each, the evaluator challenges with an open subset, the
-//! garbler opens (reveals the seed) and the evaluator re-garbles to verify, and
-//! the remaining copies are evaluated with agreement required.
+//! M3 adds *authentication*: the garbler commits to every copy's table stream,
+//! input/output label bases, and its own (garbler) input label *before* the
+//! challenge, so it cannot adapt copies to the challenge, swap copies, or change
+//! its input label afterwards. The evaluator verifies:
+//!   - each *opened* copy re-garbles (from the revealed seed) to the commitment;
+//!   - each *use* copy's received tables/bases/label hash to the commitment;
+//!   - all use copies agree on the output.
 //!
-//! An honest garbler is accepted; a garbler that corrupts one copy is caught
-//! (either its opened copy fails re-garbling, or the use set disagrees).
+//! An honest garbler is accepted. A malicious garbler is caught whether it
+//! garbles dishonestly, adapts a copy after committing, delivers a wrong input
+//! label, or commits to inconsistent inputs across the use set (agreement).
 
 use cipher::consts::{U16, U32};
 use cirrus_recompile_core::{Idx, Op, Program};
@@ -20,16 +23,20 @@ use hybrid_array::Array;
 use sha2::Sha256;
 use volar_spec::garble::{Eval, Garble, GarbleTable, GlobalSecret};
 
-/// One garbled copy of the program: the table stream plus the input/output
-/// false-label bases the garbler used, plus its per-copy global secret.
+type Hash = Array<u8, U32>;
+
+/// One garbled copy of the program (garbler-private; the `secret` is never
+/// revealed for a use copy, only for an opened one).
 struct GarbledCopy {
     tables: Vec<GarbleTable<U16>>,
     input_bases: Vec<Garble<U16>>,
     output_bases: Vec<Garble<U16>>,
     secret: GlobalSecret<U16>,
+    /// The garbler's delivered input label (for input wire 0, the garbler's bit).
+    garbler_input_label: Eval<U16>,
 }
 
-fn dg(parts: &[&[u8]]) -> Array<u8, U32> {
+fn dg(parts: &[&[u8]]) -> Hash {
     let mut h = Sha256::new();
     for p in parts {
         h.update(p);
@@ -37,8 +44,7 @@ fn dg(parts: &[&[u8]]) -> Array<u8, U32> {
     h.finalize()
 }
 
-/// digest^`k`(seed) — the garbler's `fresh_label` chain.
-fn chain(seed: &Array<u8, U32>, k: usize) -> Array<u8, U32> {
+fn chain(seed: &Hash, k: usize) -> Hash {
     let mut s = seed.clone();
     for _ in 0..k {
         s = Sha256::digest(&s);
@@ -46,20 +52,12 @@ fn chain(seed: &Array<u8, U32>, k: usize) -> Array<u8, U32> {
     s
 }
 
-fn garble_of(chain_bytes: &Array<u8, U32>) -> Garble<U16> {
+fn garble_of(chain_bytes: &Hash) -> Garble<U16> {
     Garble {
         base: Array::<u8, U16>::from_fn(|i| chain_bytes[i]),
     }
 }
 
-fn table_eq(a: &GarbleTable<U16>, b: &GarbleTable<U16>) -> bool {
-    a.table.iter().zip(b.table.iter()).all(|(x, y)| x[..] == y[..])
-}
-fn garble_eq(a: &Garble<U16>, b: &Garble<U16>) -> bool {
-    a.base[..] == b.base[..]
-}
-
-// A tiny `Pusher` over a `Vec` so the garbler can stream tables.
 struct PusherVec<T>(Vec<T>);
 impl<T> cirrus_core::Pusher<T> for PusherVec<T> {
     fn push(&mut self, x: T) {
@@ -67,14 +65,9 @@ impl<T> cirrus_core::Pusher<T> for PusherVec<T> {
     }
 }
 
-/// Garble one copy deterministically from `copy_seed`. The input bases are the
-/// first `n_inputs` chain labels; the internal gate labels continue the chain
-/// (the garbler's `seed` is set past the input labels so they never collide).
-fn garble_copy(
-    program: &Program,
-    copy_seed: &Array<u8, U32>,
-    secret: &GlobalSecret<U16>,
-) -> GarbledCopy {
+/// Garble one copy deterministically from `copy_seed`, and prepare the garbler's
+/// input label for its private input wire (input 0).
+fn garble_copy(program: &Program, copy_seed: &Hash, secret: &GlobalSecret<U16>, garbler_bit: bool) -> GarbledCopy {
     let n_inputs = program.inputs.len();
     let input_bases: Vec<Garble<U16>> =
         (0..n_inputs).map(|k| garble_of(&chain(copy_seed, k + 1))).collect();
@@ -82,45 +75,48 @@ fn garble_copy(
     let mut garbler = VolarGarbleBackend::<Sha256, U16>::new(&mut pusher, secret.clone());
     garbler.seed = chain(copy_seed, n_inputs);
     let output_bases = cirrus_recompile_rt::execute(&mut garbler, program, &input_bases).unwrap();
+    let garbler_input_label = secret.encode(&input_bases[0], garbler_bit);
     GarbledCopy {
         tables: pusher.0,
         input_bases,
         output_bases,
         secret: secret.clone(),
+        garbler_input_label,
     }
 }
 
-/// Re-garble from a revealed seed and check the copy matches exactly.
-fn open_and_verify(program: &Program, copy_seed: &Array<u8, U32>, copy: &GarbledCopy) -> bool {
-    let fresh = garble_copy(program, copy_seed, &copy.secret);
-    fresh.tables.len() == copy.tables.len()
-        && fresh.tables.iter().zip(&copy.tables).all(|(a, b)| table_eq(a, b))
-        && fresh.input_bases.len() == copy.input_bases.len()
-        && fresh.input_bases.iter().zip(&copy.input_bases).all(|(a, b)| garble_eq(a, b))
-        && fresh.output_bases.len() == copy.output_bases.len()
-        && fresh.output_bases.iter().zip(&copy.output_bases).all(|(a, b)| garble_eq(a, b))
-}
-
-/// A binding commitment to a copy's table stream and label bases.
-fn commitment(copy: &GarbledCopy) -> Array<u8, U32> {
+/// The authentication commitment: binds the table stream, the label bases, and
+/// the garbler's input label. This is everything the evaluator later relies on,
+/// so committing before the challenge prevents adaptive attacks.
+fn commitment(
+    tables: &[GarbleTable<U16>],
+    input_bases: &[Garble<U16>],
+    output_bases: &[Garble<U16>],
+    garbler_input_label: &Eval<U16>,
+) -> Hash {
     let mut h = Sha256::new();
-    for t in &copy.tables {
+    for t in tables {
         for row in &t.table {
             h.update(&row[..]);
         }
     }
-    for g in copy.input_bases.iter().chain(copy.output_bases.iter()) {
+    for g in input_bases.iter().chain(output_bases.iter()) {
         h.update(&g.base[..]);
     }
+    h.update(&garbler_input_label.target[..]);
     h.finalize()
+}
+
+fn commitment_of(copy: &GarbledCopy) -> Hash {
+    commitment(&copy.tables, &copy.input_bases, &copy.output_bases, &copy.garbler_input_label)
 }
 
 fn sample_program() -> Program {
     // sum = a^b, carry = a&b, out = mux(sum, carry, a).
     Program {
         ops: vec![
-            Op::Create(false), // slot 0 = input a
-            Op::Create(false), // slot 1 = input b
+            Op::Create(false), // slot 0 = input a (garbler)
+            Op::Create(false), // slot 1 = input b (evaluator)
             Op::BitXor(Idx(0), Idx(1)), // slot 2 = sum
             Op::BitAnd(Idx(0), Idx(1)), // slot 3 = carry
             Op::Mux { cond: Idx(2), then: Idx(3), r#else: Idx(0) }, // slot 4
@@ -131,64 +127,100 @@ fn sample_program() -> Program {
     }
 }
 
-/// The full cut-and-choose run. `corrupt` sabotages one copy's tables (a
-/// malicious garbler). Returns the agreed output bits, or `Err` on detection.
-fn cut_and_choose(
+/// A malicious garbler's attack.
+#[derive(Clone, Copy, PartialEq)]
+enum Attack {
+    None,
+    /// Corrupt copy i's tables *before* committing (dishonest garble).
+    DishonestGarble(usize),
+    /// Corrupt copy i's tables *after* committing (adaptive to the challenge).
+    AdaptiveCorrupt(usize),
+    /// Deliver a wrong garbler-input label for use copy i.
+    WrongInputLabel(usize),
+    /// Commit to inconsistent garbler bits across the use copies.
+    InconsistentInput,
+}
+
+fn derive_seed(master: &Hash, i: usize) -> Hash {
+    dg(&[&master[..], b"copy", &[i as u8]])
+}
+fn derive_secret(master: &Hash, i: usize) -> GlobalSecret<U16> {
+    GlobalSecret::new(Array::<u8, U16>::from_fn(|b| dg(&[&master[..], b"delta", &[i as u8]])[b]))
+}
+
+/// The full cut-and-choose run with authentication. Returns the agreed output
+/// bits, or `Err` when the garbler's misbehavior is detected.
+fn run_protocol(
     program: &Program,
     n: usize,
-    garbler_input: bool,
+    garbler_bit: bool,
     eval_input: bool,
-    corrupt: Option<usize>,
+    attack: Attack,
 ) -> Result<Vec<bool>, String> {
     let master = dg(&[b"master"]);
-    // 1. Garble N copies.
+    // === GARBLER: garble N copies (inconsistent-input commits to split bits) ===
     let mut copies: Vec<GarbledCopy> = (0..n)
         .map(|i| {
-            let copy_seed = dg(&[&master[..], b"copy", &[i as u8]]);
-            let secret = GlobalSecret::new(Array::<u8, U16>::from_fn(|b| {
-                dg(&[&master[..], b"delta", &[i as u8]])[b]
-            }));
-            garble_copy(program, &copy_seed, &secret)
+            // The garbler's bit per copy (inconsistent-input flips it for some).
+            let bit = if attack == Attack::InconsistentInput && i % 4 == 3 {
+                !garbler_bit
+            } else {
+                garbler_bit
+            };
+            garble_copy(program, &derive_seed(&master, i), &derive_secret(&master, i), bit)
         })
         .collect();
-    // A malicious garbler corrupts one copy's first table.
-    if let Some(i) = corrupt {
+    // === ATTACK: dishonest garble (corrupt before commit) ===
+    if let Attack::DishonestGarble(i) = attack {
         if let Some(t) = copies[i].tables.get_mut(0) {
             for row in t.table.iter_mut() {
                 row[0] ^= 1;
             }
         }
     }
-    // 2. Commit (a real run sends these before the challenge).
-    let _commitments: Vec<_> = copies.iter().map(commitment).collect();
-    // 3. Challenge: open the even-indexed copies.
-    let open: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
-    // 4. Open + verify.
-    for &i in &open {
-        let copy_seed = dg(&[&master[..], b"copy", &[i as u8]]);
-        if !open_and_verify(program, &copy_seed, &copies[i]) {
-            return Err(format!("copy {i} failed re-garbling (malicious garbler)"));
+    // === GARBLER: commit (before the challenge) ===
+    let commitments: Vec<Hash> = copies.iter().map(commitment_of).collect();
+    // === EVALUATOR: challenge — open the even-indexed copies ===
+    let open_set: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+    let use_set: Vec<usize> = (0..n).filter(|i| i % 2 == 1).collect();
+    // === ATTACK: adaptive corrupt (after commit, before delivery) ===
+    if let Attack::AdaptiveCorrupt(i) = attack {
+        if let Some(t) = copies[i].tables.get_mut(0) {
+            for row in t.table.iter_mut() {
+                row[0] ^= 1;
+            }
         }
     }
-    // 5. Use the unopened copies; their outputs must agree. Encode inputs per
-    // copy (garbler input 0 directly; evaluator input 1 via a simulated OT —
-    // same-process here, a real run delivers it by OT).
-    let use_set: Vec<usize> = (0..n).filter(|i| i % 2 == 1).collect();
+    // === OPEN: garbler reveals the seed; evaluator re-garbles and verifies ===
+    for &i in &open_set {
+        let derived = garble_copy(program, &derive_seed(&master, i), &derive_secret(&master, i), garbler_bit);
+        if commitment_of(&derived) != commitments[i] {
+            return Err(format!("opened copy {i} does not match its commitment"));
+        }
+    }
+    // === USE: evaluator verifies each use copy against its commitment, then ===
+    // === evaluates all use copies in parallel and requires agreement.      ===
     let mut evaluators = Vec::new();
     let mut input_labels_per = Vec::new();
     for &i in &use_set {
-        let copy = &copies[i];
-        let labels: Vec<Eval<U16>> = vec![
-            copy.secret.encode(&copy.input_bases[0], garbler_input),
-            copy.secret.encode(&copy.input_bases[1], eval_input),
+        let mut copy_labels = vec![
+            copies[i].garbler_input_label.clone(),
+            copies[i].secret.encode(&copies[i].input_bases[1], eval_input),
         ];
+        // ATTACK: wrong input label (garbler delivers a label it didn't commit to).
+        if attack == Attack::WrongInputLabel(i) {
+            copy_labels[0] = copies[i].secret.encode(&copies[i].input_bases[0], !garbler_bit);
+        }
+        // Verify the use copy's tables/bases/input-label against its commitment.
+        let delivered = commitment(&copies[i].tables, &copies[i].input_bases, &copies[i].output_bases, &copy_labels[0]);
+        if delivered != commitments[i] {
+            return Err(format!("use copy {i} does not match its commitment"));
+        }
         evaluators.push(VolarEvalBackend::<Sha256, _, U16>::new(
-            copy.tables.clone().into_iter(),
+            copies[i].tables.clone().into_iter(),
         ));
-        input_labels_per.push(labels);
+        input_labels_per.push(copy_labels);
     }
-    // Run the use-set evaluators in parallel via the Broadcast wrapper: the
-    // program executes once, each Boolean op broadcast to all use-set copies.
     let mut broadcast = Broadcast(evaluators);
     let n_inputs = program.inputs.len();
     let broadcast_inputs: Vec<Vec<Eval<U16>>> = (0..n_inputs)
@@ -218,7 +250,7 @@ fn cut_and_choose_honest_garbler_accepted() {
     let program = sample_program();
     for g in [false, true] {
         for e in [false, true] {
-            let out = cut_and_choose(&program, 4, g, e, None).expect("honest garbler accepted");
+            let out = run_protocol(&program, 4, g, e, Attack::None).expect("honest garbler accepted");
             let sum = g ^ e;
             let carry = g & e;
             let mux = if sum { carry } else { g };
@@ -228,12 +260,38 @@ fn cut_and_choose_honest_garbler_accepted() {
 }
 
 #[test]
-fn cut_and_choose_malicious_garbler_caught() {
+fn cut_and_choose_dishonest_garble_caught() {
     let program = sample_program();
-    // Corrupting an *opened* copy (index 0) fails re-garbling.
-    let r = cut_and_choose(&program, 4, false, true, Some(0));
-    assert!(r.is_err(), "corrupting an opened copy is caught: {r:?}");
-    // Corrupting a *use* copy (index 1) makes the use set disagree.
-    let r = cut_and_choose(&program, 4, false, true, Some(1));
-    assert!(r.is_err(), "corrupting a use copy is caught: {r:?}");
+    // Corrupt an *opened* copy (0) before commit → re-garble mismatch.
+    assert!(run_protocol(&program, 4, false, true, Attack::DishonestGarble(0)).is_err());
+    // Corrupt a *use* copy (1) before commit → the use set disagrees.
+    assert!(run_protocol(&program, 4, false, true, Attack::DishonestGarble(1)).is_err());
+}
+
+#[test]
+fn cut_and_choose_adaptive_corrupt_caught() {
+    let program = sample_program();
+    // Corrupting a *use* copy after committing: the delivered tables no longer
+    // match the pre-challenge commitment, so the evaluator detects it.
+    assert!(run_protocol(&program, 4, false, true, Attack::AdaptiveCorrupt(1)).is_err());
+    // Corrupting an *open* copy after committing is harmless: the open reveals the
+    // seed and the evaluator re-garbles from it, ignoring the in-memory copy, so
+    // the protocol still accepts (the adaptive threat is only against use copies).
+    assert!(run_protocol(&program, 4, false, true, Attack::AdaptiveCorrupt(0)).is_ok());
+}
+
+#[test]
+fn cut_and_choose_wrong_input_label_caught() {
+    let program = sample_program();
+    // Delivering a garbler-input label that doesn't match the commitment fails.
+    assert!(run_protocol(&program, 4, false, true, Attack::WrongInputLabel(1)).is_err());
+}
+
+#[test]
+fn cut_and_choose_inconsistent_input_caught() {
+    let program = sample_program();
+    // Committing to inconsistent garbler bits across use copies: the copies are
+    // honestly garbled and individually consistent, but they compute different
+    // outputs, so the agreement check catches it.
+    assert!(run_protocol(&program, 4, false, true, Attack::InconsistentInput).is_err());
 }
