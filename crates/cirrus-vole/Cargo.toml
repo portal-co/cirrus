@@ -1,8 +1,0 @@
-[package]
-name = "cirrus-vole"
-edition = "2024"
-version.workspace = true
-description.workspace = true
-
-[dependencies]
-cirrus-core = { version = "0.1.0", path = "../cirrus-core" }

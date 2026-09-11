@@ -8,3 +8,15 @@ description.workspace = true
 digest = "0.11.3"
 ml-kem = "0.3.2"
 rand = { version = "0.10.2", default-features = false }
+# OT-extension compatibility: implement volar-spec's BaseOt for the ML-KEM OT.
+# Optional so the bare KEM-OT + transport stay volar-spec-free.
+volar-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+sha2 = "0.11"
+rand = { version = "0.10.2", features = ["sys_rng"] }
+
+[features]
+std = []
+# Pull in volar-spec and expose the BaseOt OT-extension bridge.
+volar-ext = ["dep:volar-spec"]

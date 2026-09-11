@@ -6,4 +6,4 @@ description = "Shared symbolic-word execution support for cirrus ERT facades"
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
-volar-circuit-exec-core = { path = "../../../../llvm-bridge/crates/volar-circuit-exec-core", default-features = false }
+volar-circuit-exec-core = { git = "ssh://git@github.com/portal-co/llvm-bridge.git", default-features = false }
