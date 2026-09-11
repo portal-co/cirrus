@@ -15,9 +15,9 @@ cirrus-llvm = { version = "0.1.0", path = "../cirrus-llvm" }
 cirrus-llvm-frontend = { version = "0.1.0", path = "../cirrus-llvm-frontend" }
 cirrus-llvm-pass-api = { version = "0.1.0", path = "../cirrus-llvm-pass-api" }
 cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
-volar-llvm-constchain = { git = "https://github.com/portal-co/llvm-bridge" }
-volar-llvm-pass-support = { path = "../../../../llvm-bridge/crates/volar-llvm-pass-support" }
+volar-llvm-constchain = { git = "https://github.com/portal-co/llvm-bridge.git" }
+volar-llvm-pass-support = { git = "ssh://git@github.com/portal-co/llvm-bridge.git" }
 inkwell = { workspace = true, features = ["llvm22-1"] }
 
 [build-dependencies]
-volar-llvm-pass-build = { path = "../../../../llvm-bridge/crates/volar-llvm-pass-build" }
+volar-llvm-pass-build = { git = "ssh://git@github.com/portal-co/llvm-bridge.git" }
