@@ -128,3 +128,48 @@ fn gram_oram_multiple_addrs() {
     assert_eq!(read_byte(&mut host, &mut tree, 0, &mut rng, 0x40), [0x11; B]);
     assert_eq!(read_byte(&mut host, &mut tree, 3, &mut rng, 0x60), [0x77; B]);
 }
+
+// The **encrypted tree** (ported S5/S6 scheme): the tree at rest holds only
+// ciphertext under the host's AES key, while reads/writes still round-trip.
+#[test]
+fn gram_oram_encrypted_tree_roundtrip() {
+    let secret = det_secret();
+    let levels = 4;
+    let num_addrs = 8u64;
+    let key = [0x42u8; 16];
+    let mut host = GramOramHost::<U16, Z, B>::new_encrypted(det_secret(), levels, num_addrs, key, 16);
+    let mut tree = OramTree::<Z, B>::new(levels);
+    // Pre-format: the fresh (dummy) entries become ciphertext.
+    host.cryptor().unwrap().format_tree(&mut tree);
+    let mut rng = DetRng(0xBEEF);
+    let data_bases: Vec<Garble<U16>> = (0..(8 * B)).map(|i| det_garble(0x70 + i as u8)).collect();
+    let bits_of = |byte: u8| -> Vec<bool> { (0..(8 * B)).map(|i| (byte >> (i % 8)) & 1 == 1).collect() };
+
+    // Write addr 2 = 0x5A, addr 6 = 0xC3.
+    for (addr, byte, seed) in [(2u64, 0x5Au8, 0x10u8), (6, 0xC3, 0x20)] {
+        let (al, ab) = encode_u64(&secret, addr, seed);
+        host.access(&mut tree, &al, &ab, Some(&bits_of(byte)), &mut |i| data_bases[i].clone(), &mut || rng.next());
+    }
+    // The stored tree bytes are ciphertext: a written block's data is not the
+    // plaintext byte pattern.
+    let plaintext_hits = tree
+        .buckets
+        .iter()
+        .flat_map(|b| b.entries.iter())
+        .filter(|e| e.data == [0x5Au8; B] || e.data == [0xC3u8; B])
+        .count();
+    assert_eq!(plaintext_hits, 0, "encrypted tree must not store plaintext blocks");
+
+    // Reads still round-trip.
+    for (addr, byte, seed) in [(2u64, 0x5Au8, 0x30u8), (6, 0xC3, 0x40)] {
+        let (al, ab) = encode_u64(&secret, addr, seed);
+        let read = host.access(&mut tree, &al, &ab, None, &mut |i| data_bases[i].clone(), &mut || rng.next());
+        let mut got = [0u8; B];
+        for (i, label) in read.data_labels.iter().enumerate() {
+            if gram_decode_label(label, &data_bases[i]) {
+                got[i / 8] |= 1 << (i % 8);
+            }
+        }
+        assert_eq!(got, [byte; B], "encrypted read addr {addr}");
+    }
+}

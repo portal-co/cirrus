@@ -639,6 +639,180 @@ pub struct GramOramRead<N: VoleArray<u8>> {
     pub old_leaf: u64,
 }
 
+/// Host-side **encrypted tree** for the cirrus ORAM host: the same AES-128
+/// per-node-pad scheme as volar-vc's in-circuit gadget (the S5/S6 encrypted
+/// tree), applied host-side so the physical tree at rest holds only ciphertext.
+///
+/// The tweak layout matches volar-vc's `slot_tweak_versioned_bytes` (depth at
+/// byte 0, the path prefix — the node's position within its level — at bits
+/// 16.., and the per-node version at bits 32..), so the two runtimes agree on
+/// the scheme. Entries are serialized as `addr ‖ leaf ‖ data` and XORed with an
+/// AES-CTR pad stream keyed on the node's tweak (block counter at byte 8).
+///
+/// **Scope**: in the cirrus interpreter the ORAM host runs *on* the evaluator,
+/// so a host-side key does not hide the tree from the evaluator — this protects
+/// the tree at rest (e.g. on untrusted storage) and exercises the shared scheme;
+/// the obliviousness-from-the-evaluator property needs the in-circuit client
+/// (volar-vc's symbolic-ORAM gadget), which cirrus does not depend on.
+pub struct TreeCryptor {
+    /// The AES-128 tree key.
+    key: [u8; 16],
+    /// Per-node version counters, heap-indexed; bumped on every write.
+    versions: alloc::vec::Vec<u64>,
+    /// Version width in bits.
+    version_bits: usize,
+    /// Whether per-node versioning (replay protection) is active.
+    versioned: bool,
+}
+
+impl TreeCryptor {
+    /// Fresh cryptor for a `num_nodes`-bucket tree (=`2^levels - 1`) under `key`.
+    pub fn new(key: [u8; 16], num_nodes: usize, version_bits: usize, versioned: bool) -> Self {
+        Self { key, versions: alloc::vec![0; num_nodes], version_bits, versioned }
+    }
+
+    /// The node tweak (matches volar-vc's `slot_tweak_versioned_bytes`).
+    fn tweak(&self, depth: usize, pos: u64, version: u64) -> [u8; 16] {
+        let mut tw = [0u8; 16];
+        tw[0] = depth as u8;
+        for j in 0..depth {
+            if (pos >> (depth - 1 - j)) & 1 == 1 {
+                let bit = 16 + j;
+                tw[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        for j in 0..self.version_bits {
+            if (version >> j) & 1 == 1 {
+                let bit = 32 + j;
+                tw[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        tw
+    }
+
+    /// The `nbytes`-byte pad stream for the node at (depth, pos), AES-CTR.
+    fn pad(&self, depth: usize, pos: u64, version: u64, nbytes: usize) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::with_capacity(nbytes);
+        let mut ctr = 0u8;
+        while out.len() < nbytes {
+            let mut tw = self.tweak(depth, pos, version);
+            tw[8] = ctr;
+            out.extend_from_slice(&volar_spec::faest::aes::encrypt_block(&self.key, &tw));
+            ctr += 1;
+        }
+        out.truncate(nbytes);
+        out
+    }
+
+    /// The current version of the heap node `idx`.
+    fn version(&self, idx: usize) -> u64 {
+        if self.versioned { self.versions[idx] } else { 0 }
+    }
+
+    /// XOR `e` with the node pad at the given `version` (symmetric).
+    fn crypt_entry<const B: usize>(
+        &self,
+        depth: usize,
+        pos: u64,
+        version: u64,
+        e: &volar_oram::OramEntry<B>,
+    ) -> volar_oram::OramEntry<B> {
+        let mut bytes = alloc::vec::Vec::with_capacity(16 + B);
+        bytes.extend_from_slice(&e.addr.to_le_bytes());
+        bytes.extend_from_slice(&e.leaf.to_le_bytes());
+        bytes.extend_from_slice(&e.data);
+        let pad = self.pad(depth, pos, version, bytes.len());
+        for (b, p) in bytes.iter_mut().zip(pad) {
+            *b ^= p;
+        }
+        let mut data = [0u8; B];
+        data.copy_from_slice(&bytes[16..16 + B]);
+        volar_oram::OramEntry {
+            addr: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            leaf: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            data,
+        }
+    }
+
+    /// Decrypt: the stored ciphertext is under the node's *current* version.
+    fn decrypt_entry<const B: usize>(&self, depth: usize, pos: u64, idx: usize, e: &volar_oram::OramEntry<B>) -> volar_oram::OramEntry<B> {
+        self.crypt_entry(depth, pos, self.version(idx), e)
+    }
+
+    /// Encrypt: the new ciphertext is under the node's *next* version (the
+    /// caller bumps the counter to match after the write).
+    fn encrypt_entry<const B: usize>(&self, depth: usize, pos: u64, idx: usize, e: &volar_oram::OramEntry<B>) -> volar_oram::OramEntry<B> {
+        self.crypt_entry(depth, pos, self.version(idx) + 1, e)
+    }
+
+    /// Decrypt a tree path read at `leaf` (ciphertext → plaintext entries).
+    pub fn decrypt_path<const Z: usize, const B: usize>(
+        &self,
+        tree: &OramTree<Z, B>,
+        leaf: u64,
+    ) -> alloc::vec::Vec<volar_oram::Bucket<Z, B>> {
+        let idxs = tree.path_indices(leaf);
+        tree.read_path(leaf)
+            .into_iter()
+            .enumerate()
+            .map(|(d, bucket)| {
+                let idx = idxs[d];
+                let pos = idx - ((1usize << d) - 1);
+                volar_oram::Bucket {
+                    entries: core::array::from_fn(|zs| {
+                        self.decrypt_entry(d, pos as u64, idx, &bucket.entries[zs])
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// Encrypt and write a tree path at `leaf`, bumping the node versions.
+    pub fn encrypt_path<const Z: usize, const B: usize>(
+        &mut self,
+        tree: &mut OramTree<Z, B>,
+        leaf: u64,
+        path: &[volar_oram::Bucket<Z, B>],
+    ) {
+        let idxs = tree.path_indices(leaf);
+        let cipher: alloc::vec::Vec<_> = path
+            .iter()
+            .enumerate()
+            .map(|(d, bucket)| {
+                let idx = idxs[d];
+                let pos = idx - ((1usize << d) - 1);
+                volar_oram::Bucket {
+                    entries: core::array::from_fn(|zs| {
+                        self.encrypt_entry(d, pos as u64, idx, &bucket.entries[zs])
+                    }),
+                }
+            })
+            .collect();
+        tree.write_path(leaf, &cipher);
+        if self.versioned {
+            for &i in &idxs {
+                self.versions[i] += 1;
+            }
+        }
+    }
+
+    /// Pre-format a fresh tree: encrypt the (dummy) entries in place so the
+    /// stored bytes are ciphertext.
+    pub fn format_tree<const Z: usize, const B: usize>(&self, tree: &mut OramTree<Z, B>) {
+        let levels = tree.levels;
+        for d in 0..levels {
+            for k in 0..(1usize << d) {
+                let idx = (1usize << d) - 1 + k;
+                for zs in 0..Z {
+                    let e = tree.buckets[idx].entries[zs].clone();
+                    // The fresh tree starts at version 0; format under version 0.
+                    tree.buckets[idx].entries[zs] = self.crypt_entry(d, k as u64, 0, &e);
+                }
+            }
+        }
+    }
+}
+
 /// Interpreter-side full ORAM access over garbled labels: the cirrus
 /// counterpart of volar-vc's `OramHost` + `OramHostShim`, combining the
 /// label layer ([`GramActionHost`]) with the shared bit-level driver
@@ -662,6 +836,9 @@ pub struct GramOramHost<N: VoleArray<u8>, const Z: usize, const B: usize> {
     action_host: GramActionHost<N>,
     /// Shared bit-level ORAM client driver (label-free).
     driver: volar_oram::bit_host::OramHost<Z, B>,
+    /// Optional host-side tree encryption (the S5/S6 encrypted-tree scheme,
+    /// ported). When set, the physical tree holds only ciphertext.
+    cryptor: Option<TreeCryptor>,
 }
 
 impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
@@ -671,7 +848,32 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         Self {
             action_host: GramActionHost::new(secret),
             driver: volar_oram::bit_host::OramHost::new(levels, num_addrs),
+            cryptor: None,
         }
+    }
+
+    /// Construct a host with an **encrypted tree** (the ported S5/S6 scheme):
+    /// the tree at rest holds only ciphertext under `key`, with per-node
+    /// versioned pads when `version_bits > 0`. The caller pre-formats the tree
+    /// via [`TreeCryptor::format_tree`].
+    pub fn new_encrypted(
+        secret: GlobalSecret<N>,
+        levels: usize,
+        num_addrs: u64,
+        key: [u8; 16],
+        version_bits: usize,
+    ) -> Self {
+        let num_nodes = (1usize << levels) - 1;
+        Self {
+            action_host: GramActionHost::new(secret),
+            driver: volar_oram::bit_host::OramHost::new(levels, num_addrs),
+            cryptor: Some(TreeCryptor::new(key, num_nodes, version_bits, version_bits > 0)),
+        }
+    }
+
+    /// Expose the cryptor so the caller can pre-format the tree.
+    pub fn cryptor(&self) -> Option<&TreeCryptor> {
+        self.cryptor.as_ref()
     }
 
     /// Borrow the shared driver's ORAM client (e.g. to inspect the stash).
@@ -732,8 +934,12 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         let mut off = 0usize;
         let old_leaf = Drv::<Z, B>::take_u64(&leaf_bits, &mut off, 64);
 
-        // 2. Read the tree path at old_leaf, flatten to bits.
-        let path = tree.read_path(old_leaf);
+        // 2. Read the tree path at old_leaf, flatten to bits. With an encrypted
+        // tree, the stored ciphertext is decrypted host-side first.
+        let path = match &self.cryptor {
+            Some(c) => c.decrypt_path(tree, old_leaf),
+            None => tree.read_path(old_leaf),
+        };
         let mut path_bits = alloc::vec::Vec::new();
         self.driver.push_path(&mut path_bits, &path);
 
@@ -758,13 +964,19 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         let evict1 = Drv::<Z, B>::take_u64(&proc_out, &mut roff, 64);
         let evict2 = Drv::<Z, B>::take_u64(&proc_out, &mut roff, 64);
 
-        // 4. Write back the updated path at old_leaf.
+        // 4. Write back the updated path at old_leaf (encrypted if configured).
         let wb_path = self.driver.take_path(wb_bits, "wb").expect("GramOramHost: wb path");
-        tree.write_path(old_leaf, &wb_path);
+        match &mut self.cryptor {
+            Some(c) => c.encrypt_path(tree, old_leaf, &wb_path),
+            None => tree.write_path(old_leaf, &wb_path),
+        }
 
         // 5. Two eviction passes.
         for evict_leaf in [evict1, evict2] {
-            let ep = tree.read_path(evict_leaf);
+            let ep = match &self.cryptor {
+                Some(c) => c.decrypt_path(tree, evict_leaf),
+                None => tree.read_path(evict_leaf),
+            };
             let mut ep_bits = alloc::vec::Vec::new();
             self.driver.push_path(&mut ep_bits, &ep);
             let new_ep_bits = self.driver.evict(&ep_bits).expect("GramOramHost: evict");
@@ -772,7 +984,10 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
                 .driver
                 .take_path(&new_ep_bits, "evict_out")
                 .expect("GramOramHost: evict path");
-            tree.write_path(evict_leaf, &new_ep);
+            match &mut self.cryptor {
+                Some(c) => c.encrypt_path(tree, evict_leaf, &new_ep),
+                None => tree.write_path(evict_leaf, &new_ep),
+            }
         }
 
         // 6. Re-garble the read-data bits to fresh labels.
