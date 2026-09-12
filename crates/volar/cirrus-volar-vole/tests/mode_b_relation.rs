@@ -492,3 +492,99 @@ fn scheduler_preserves_fail_closed_unsupported_statement() {
         Err(ModeBRelationError::UnsupportedStatement { wire: 1 })
     ));
 }
+
+#[test]
+fn native_vole_verifier_relation_accepts_honest_correlations() {
+    use cirrus_volar_vole::{
+        VoleVerifierSemantics, VoleVerifierTrace, schedule_boolar_constraints,
+    };
+
+    let circuit = half_adder(); // Xor then And over inputs 0,1.
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let semantics = schedule_boolar_constraints(
+        &circuit,
+        VoleVerifierSemantics::new(relation.circuit_id, relation.wire_count),
+    )
+    .unwrap();
+    assert_eq!(semantics.layout.hats.len(), 1);
+
+    // a=true, b=false; sum=true, carry=false.
+    let delta = [7, 11, 13, 17];
+    let x = [[1, 1, 1, 1], [0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 0]];
+    let v0 = [101, 102, 103, 104];
+    let v1 = [201, 202, 203, 204];
+    let v = [
+        v0,
+        v1,
+        core::array::from_fn(|lane| (v0[lane] + v1[lane]) % cirrus_volar_vole::KOALABEAR_MODULUS),
+        [401, 402, 403, 404],
+    ];
+    let hats = vec![core::array::from_fn(|lane| {
+        v[0][lane] * v[1][lane] % cirrus_volar_vole::KOALABEAR_MODULUS
+    })];
+    let trace = VoleVerifierTrace {
+        delta,
+        x: x.to_vec(),
+        v: v.to_vec(),
+        hats,
+    };
+    let witness = semantics.materialize_witness(&trace).unwrap();
+    assert_eq!(witness.values.len(), semantics.layout.variable_count);
+}
+
+#[test]
+fn native_vole_verifier_relation_rejects_bad_hat_and_topology() {
+    use cirrus_volar_vole::{
+        VoleVerifierSemantics, VoleVerifierTrace, schedule_boolar_constraints,
+    };
+
+    let circuit = half_adder();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let semantics = schedule_boolar_constraints(
+        &circuit,
+        VoleVerifierSemantics::new(relation.circuit_id, relation.wire_count),
+    )
+    .unwrap();
+    let delta = [7, 11, 13, 17];
+    let x = [[1, 1, 1, 1], [0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 0]];
+    let v0 = [101, 102, 103, 104];
+    let v1 = [201, 202, 203, 204];
+    let v = [
+        v0,
+        v1,
+        core::array::from_fn(|lane| (v0[lane] + v1[lane]) % cirrus_volar_vole::KOALABEAR_MODULUS),
+        [401, 402, 403, 404],
+    ];
+    let mut trace = VoleVerifierTrace {
+        delta,
+        x: x.to_vec(),
+        v: v.to_vec(),
+        hats: vec![core::array::from_fn(|lane| {
+            v[0][lane] * v[1][lane] % cirrus_volar_vole::KOALABEAR_MODULUS
+        })],
+    };
+    trace.hats[0][0] = (trace.hats[0][0] + 1) % cirrus_volar_vole::KOALABEAR_MODULUS;
+    assert!(matches!(
+        semantics.materialize_witness(&trace),
+        Err(ModeBRelationError::UnsatisfiedUnifiedRow { .. })
+    ));
+
+    let unsupported = BCircuit {
+        params: 1,
+        stmts: vec![Node::new(
+            BIrStmt::StorageRead {
+                storage: StorageId(1),
+                lane: LaneId(0),
+                addr: vec![],
+            },
+            (),
+            None,
+        )],
+        pre_init: vec![],
+        outputs: vec![],
+    };
+    assert!(matches!(
+        schedule_boolar_constraints(&unsupported, VoleVerifierSemantics::new([0; 32], 2),),
+        Err(ModeBRelationError::UnsupportedStatement { wire: 1 })
+    ));
+}

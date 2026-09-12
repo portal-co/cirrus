@@ -44,23 +44,27 @@ pub struct LinearCombination {
     pub terms: Vec<(usize, i64)>,
 }
 impl LinearCombination {
-    fn constant(c: i64) -> Self {
+    /// A field-independent constant.
+    pub fn constant(c: i64) -> Self {
         Self {
             constant: c,
             terms: Vec::new(),
         }
     }
-    fn var(v: usize) -> Self {
+    /// A single variable with coefficient one.
+    pub fn var(v: usize) -> Self {
         Self {
             constant: 0,
             terms: vec![(v, 1)],
         }
     }
-    fn add(mut self, v: usize, c: i64) -> Self {
+    /// Append one variable term.
+    pub fn add(mut self, v: usize, c: i64) -> Self {
         self.terms.push((v, c));
         self
     }
-    fn add_terms(mut self, terms: Vec<(usize, i64)>) -> Self {
+    /// Append several variable terms.
+    pub fn add_terms(mut self, terms: Vec<(usize, i64)>) -> Self {
         self.terms.extend(terms);
         self
     }

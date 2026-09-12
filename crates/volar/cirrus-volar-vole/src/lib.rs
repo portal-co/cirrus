@@ -36,6 +36,7 @@ mod spartan_whir_adapter;
 mod trace_audit;
 mod trace_to_proof;
 mod typed;
+mod vole_verifier_relation;
 
 pub use hook::{NoopVoleVerifierHook, VoleVerifierHook};
 pub use locked::{
@@ -68,6 +69,10 @@ pub use trace_to_proof::{
     build_trace_proof_artifacts,
 };
 pub use typed::TypedVoleValue;
+pub use vole_verifier_relation::{
+    VOLE_VERIFIER_LANES, VOLE_VERIFIER_RELATION_PROFILE, VoleVerifierRelationLayout,
+    VoleVerifierSemantics, VoleVerifierTrace,
+};
 
 use alloc::vec::Vec;
 use core::{
