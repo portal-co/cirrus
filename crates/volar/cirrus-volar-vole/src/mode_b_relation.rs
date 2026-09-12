@@ -84,6 +84,154 @@ pub enum PublicBinding {
     Output { index: usize, wire: usize },
 }
 
+/// Generic sink used by the canonical Boolar statement scheduler.
+///
+/// Implementations decide whether a scheduled operation constrains actual
+/// Boolean values, VOLE verifier correlations, or another profile-specific
+/// representation. The scheduler owns wire order and fail-closed statement
+/// dispatch; semantics own the emitted rows.
+pub trait ConstraintSemantics {
+    /// Emit constraints for one supported statement. `wire` is the canonical
+    /// statement output index (`circuit.params + statement_index`).
+    fn statement(
+        &mut self,
+        wire: usize,
+        statement: &BIrStmt<IRVarId, StorageId>,
+    ) -> Result<(), ModeBRelationError>;
+}
+
+/// The current actual-Boolean-value Mode-B lowering, exposed as scheduler
+/// semantics. It is row-for-row compatible with [`ModeBRelation::from_boolar`].
+#[derive(Clone, Debug)]
+pub struct ActualBooleanSemantics {
+    /// R1CS rows emitted so far.
+    pub rows: Vec<R1csRow>,
+    next_helper: usize,
+}
+
+impl ActualBooleanSemantics {
+    /// Start a lowering for `wire_count` canonical primary wires.
+    pub fn new(wire_count: usize) -> Self {
+        let mut this = Self {
+            rows: Vec::new(),
+            next_helper: wire_count,
+        };
+        for wire in 0..wire_count {
+            this.booleanity(wire);
+        }
+        this
+    }
+
+    fn booleanity(&mut self, wire: usize) {
+        self.rows.push(R1csRow {
+            a: LinearCombination::var(wire),
+            b: LinearCombination::var(wire).add(wire, -1),
+            c: LinearCombination::constant(0),
+        });
+    }
+
+    fn prior(wire: usize, reference: IRVarId) -> Result<usize, ModeBRelationError> {
+        let index = reference.0 as usize;
+        if index >= wire {
+            Err(ModeBRelationError::InvalidWireReference {
+                wire,
+                referenced: reference.0,
+            })
+        } else {
+            Ok(index)
+        }
+    }
+
+    fn linear_result(&mut self, a: LinearCombination, c: usize) {
+        self.rows.push(R1csRow {
+            a,
+            b: LinearCombination::constant(1),
+            c: LinearCombination::var(c),
+        });
+    }
+
+    /// Number of primary wires plus allocated multiplication helpers.
+    pub fn witness_count(&self) -> usize {
+        self.next_helper
+    }
+}
+
+impl ConstraintSemantics for ActualBooleanSemantics {
+    fn statement(
+        &mut self,
+        wire: usize,
+        statement: &BIrStmt<IRVarId, StorageId>,
+    ) -> Result<(), ModeBRelationError> {
+        match statement {
+            BIrStmt::Zero => self.linear_result(LinearCombination::constant(0), wire),
+            BIrStmt::One => self.linear_result(LinearCombination::constant(1), wire),
+            BIrStmt::And(x, y) => {
+                let x = Self::prior(wire, *x)?;
+                let y = Self::prior(wire, *y)?;
+                self.rows.push(R1csRow {
+                    a: LinearCombination::var(x),
+                    b: LinearCombination::var(y),
+                    c: LinearCombination::var(wire),
+                });
+            }
+            BIrStmt::Not(x) => {
+                let x = Self::prior(wire, *x)?;
+                self.linear_result(LinearCombination::constant(1).add(x, -1), wire);
+            }
+            BIrStmt::Xor(x, y) => {
+                let x = Self::prior(wire, *x)?;
+                let y = Self::prior(wire, *y)?;
+                let helper = self.next_helper;
+                self.next_helper += 1;
+                self.rows.push(R1csRow {
+                    a: LinearCombination::var(x),
+                    b: LinearCombination::var(y),
+                    c: LinearCombination::var(helper),
+                });
+                self.linear_result(LinearCombination::var(x).add(y, 1).add(helper, -2), wire);
+            }
+            BIrStmt::Or(x, y) => {
+                let x = Self::prior(wire, *x)?;
+                let y = Self::prior(wire, *y)?;
+                let helper = self.next_helper;
+                self.next_helper += 1;
+                self.rows.push(R1csRow {
+                    a: LinearCombination::var(x),
+                    b: LinearCombination::var(y),
+                    c: LinearCombination::var(helper),
+                });
+                self.linear_result(LinearCombination::var(x).add(y, 1).add(helper, -1), wire);
+            }
+            // The read value is constrained by the RAM relation.
+            BIrStmt::StorageRead { .. } => {}
+            // Boolar storage writes produce the mandated dummy zero bit.
+            BIrStmt::StorageWrite { .. } => {
+                self.linear_result(LinearCombination::constant(0), wire);
+            }
+            _ => return Err(ModeBRelationError::UnsupportedStatement { wire }),
+        }
+        Ok(())
+    }
+}
+
+/// Run the canonical statement scheduler over a circuit and return the
+/// semantics result. This is the shared schedule for actual values and later
+/// VOLE verifier-state correlation semantics.
+pub fn schedule_boolar_constraints<P, S>(
+    circuit: &BCircuit<P>,
+    mut semantics: S,
+) -> Result<S, ModeBRelationError>
+where
+    P: Clone,
+    S: ConstraintSemantics,
+{
+    for (statement_index, node) in circuit.stmts.iter().enumerate() {
+        let wire = circuit.params as usize + statement_index;
+        semantics.statement(wire, &node.kind)?;
+    }
+    Ok(semantics)
+}
+
 /// Versioned field configuration for the initial prime-field RAM format.
 ///
 /// Record keys are encoded in the KoalaBear quintic extension, rather than a
@@ -1801,95 +1949,11 @@ impl ModeBRelation {
     /// Lower the supported Boolar subset to field-independent R1CS rows.
     pub fn from_boolar<P: Clone>(circuit: &BCircuit<P>) -> Result<Self, ModeBRelationError> {
         let wires = circuit.params as usize + circuit.stmts.len();
-        let mut rows = Vec::new();
         // Booleanity is explicit, so a prime-field backend cannot accept
         // non-Boolean intermediate values satisfying only gate equations.
-        for w in 0..wires {
-            rows.push(R1csRow {
-                a: LinearCombination::var(w),
-                b: LinearCombination::var(w).add(w, -1),
-                c: LinearCombination::constant(0),
-            });
-        }
-        let mut helpers = wires;
-        for (s, node) in circuit.stmts.iter().enumerate() {
-            let w = circuit.params as usize + s;
-            let prior = |v: IRVarId| -> Result<usize, ModeBRelationError> {
-                let i = v.0 as usize;
-                if i >= w {
-                    Err(ModeBRelationError::InvalidWireReference {
-                        wire: w,
-                        referenced: v.0,
-                    })
-                } else {
-                    Ok(i)
-                }
-            };
-            let (a, b, c) = match &node.kind {
-                BIrStmt::Zero => (
-                    LinearCombination::constant(0),
-                    LinearCombination::constant(1),
-                    LinearCombination::var(w),
-                ),
-                BIrStmt::One => (
-                    LinearCombination::constant(1),
-                    LinearCombination::constant(1),
-                    LinearCombination::var(w),
-                ),
-                BIrStmt::And(x, y) => (
-                    LinearCombination::var(prior(*x)?),
-                    LinearCombination::var(prior(*y)?),
-                    LinearCombination::var(w),
-                ),
-                BIrStmt::Not(x) => (
-                    LinearCombination::constant(1).add(prior(*x)?, -1),
-                    LinearCombination::constant(1),
-                    LinearCombination::var(w),
-                ),
-                BIrStmt::Xor(x, y) => {
-                    let h = helpers;
-                    helpers += 1;
-                    rows.push(R1csRow {
-                        a: LinearCombination::var(prior(*x)?),
-                        b: LinearCombination::var(prior(*y)?),
-                        c: LinearCombination::var(h),
-                    });
-                    (
-                        LinearCombination::var(prior(*x)?)
-                            .add(prior(*y)?, 1)
-                            .add(h, -2),
-                        LinearCombination::constant(1),
-                        LinearCombination::var(w),
-                    )
-                }
-                BIrStmt::Or(x, y) => {
-                    let h = helpers;
-                    helpers += 1;
-                    rows.push(R1csRow {
-                        a: LinearCombination::var(prior(*x)?),
-                        b: LinearCombination::var(prior(*y)?),
-                        c: LinearCombination::var(h),
-                    });
-                    (
-                        LinearCombination::var(prior(*x)?)
-                            .add(prior(*y)?, 1)
-                            .add(h, -1),
-                        LinearCombination::constant(1),
-                        LinearCombination::var(w),
-                    )
-                }
-                // The read value is constrained by the RAM relation below.
-                BIrStmt::StorageRead { .. } => continue,
-                // Boolar storage writes produce the mandated dummy zero bit.
-                BIrStmt::StorageWrite { .. } => (
-                    LinearCombination::constant(0),
-                    LinearCombination::constant(1),
-                    LinearCombination::var(w),
-                ),
-                _ => return Err(ModeBRelationError::UnsupportedStatement { wire: w }),
-            };
-            rows.push(R1csRow { a, b, c });
-        }
+        let semantics = schedule_boolar_constraints(circuit, ActualBooleanSemantics::new(wires))?;
+        let rows = semantics.rows;
+        let helpers = semantics.next_helper;
         let mut public_bindings: Vec<_> = (0..circuit.params as usize)
             .map(|index| PublicBinding::Input { index, wire: index })
             .collect();

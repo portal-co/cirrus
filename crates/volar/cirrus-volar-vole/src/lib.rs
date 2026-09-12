@@ -44,15 +44,15 @@ pub use locked::{
     MutexPuller, MutexPusher, PullerByRef,
 };
 pub use mode_b_relation::{
-    CircuitId, KOALABEAR_MODULUS, KOALABEAR_QUINTIC_DEGREE, KoalaBearLinearCombination,
-    KoalaBearR1cs, KoalaBearR1csRow, LinearCombination, MODE_B_RELATION_VERSION,
-    ModeBPublicInstance, ModeBRelation, ModeBRelationError, PRIME_RAM_ADDRESS_BITS,
-    PRIME_RAM_FORMAT, PRIME_RAM_LANE_BITS, PRIME_RAM_STORAGE_BITS, PRIME_RAM_TIME_BITS,
-    PrimeFieldRamConfig, PrimeRamMaterialization, PrimeRamPermutationChallenges,
-    PrimeRamPermutationR1cs, PrimeRamR1cs, PrimeRamRecord, PrimeRamRecordLayout,
-    PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess, RamAccessKind,
-    RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation, UnifiedR1cs,
-    UnifiedR1csWitness,
+    ActualBooleanSemantics, CircuitId, ConstraintSemantics, KOALABEAR_MODULUS,
+    KOALABEAR_QUINTIC_DEGREE, KoalaBearLinearCombination, KoalaBearR1cs, KoalaBearR1csRow,
+    LinearCombination, MODE_B_RELATION_VERSION, ModeBPublicInstance, ModeBRelation,
+    ModeBRelationError, PRIME_RAM_ADDRESS_BITS, PRIME_RAM_FORMAT, PRIME_RAM_LANE_BITS,
+    PRIME_RAM_STORAGE_BITS, PRIME_RAM_TIME_BITS, PrimeFieldRamConfig, PrimeRamMaterialization,
+    PrimeRamPermutationChallenges, PrimeRamPermutationR1cs, PrimeRamR1cs, PrimeRamRecord,
+    PrimeRamRecordLayout, PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess,
+    RamAccessKind, RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation,
+    UnifiedR1cs, UnifiedR1csWitness, schedule_boolar_constraints,
 };
 #[cfg(feature = "spartan-whir-adapter")]
 pub use spartan_whir_adapter::{

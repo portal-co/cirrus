@@ -456,3 +456,39 @@ fn spartan_whir_adapter_preserves_shape_and_witness_layout() {
         vec![1, 0, 1, 0],
     );
 }
+
+#[test]
+fn generic_actual_boolean_scheduler_matches_relation_rows() {
+    use cirrus_volar_vole::{ActualBooleanSemantics, schedule_boolar_constraints};
+
+    for circuit in [half_adder(), storage_write_then_read()] {
+        let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+        let scheduled =
+            schedule_boolar_constraints(&circuit, ActualBooleanSemantics::new(relation.wire_count))
+                .unwrap();
+        assert_eq!(scheduled.rows, relation.rows);
+        assert_eq!(scheduled.witness_count(), relation.witness_count);
+    }
+}
+
+#[test]
+fn scheduler_preserves_fail_closed_unsupported_statement() {
+    use cirrus_volar_vole::{ActualBooleanSemantics, schedule_boolar_constraints};
+
+    let circuit = BCircuit {
+        params: 1,
+        stmts: vec![Node::new(
+            BIrStmt::Rng {
+                name: "unsupported".into(),
+            },
+            (),
+            None,
+        )],
+        pre_init: vec![],
+        outputs: vec![],
+    };
+    assert!(matches!(
+        schedule_boolar_constraints(&circuit, ActualBooleanSemantics::new(2)),
+        Err(ModeBRelationError::UnsupportedStatement { wire: 1 })
+    ));
+}
