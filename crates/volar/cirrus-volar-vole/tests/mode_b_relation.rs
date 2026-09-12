@@ -252,6 +252,37 @@ fn koalabear_lowering_normalizes_signed_and_duplicate_coefficients() {
 }
 
 #[test]
+fn spartan_whir_shape_uses_witness_one_public_column_order() {
+    let circuit = half_adder();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let shape = relation
+        .export_unified_r1cs(&circuit, None)
+        .unwrap()
+        .lower_koalabear()
+        .unwrap()
+        .export_spartan_whir_shape()
+        .unwrap();
+    // Spartan-WHIR/Circom convention is claimed outputs, then public inputs.
+    assert_eq!(shape.public_wires, vec![2, 3, 0, 1]);
+    assert_eq!(shape.public_input_count, 4);
+    assert_eq!(shape.witness_count, relation.witness_count - 4);
+    let columns = shape
+        .a
+        .iter()
+        .chain(shape.b.iter())
+        .chain(shape.c.iter())
+        .map(|entry| entry.column)
+        .collect::<Vec<_>>();
+    assert!(
+        columns
+            .iter()
+            .all(|column| *column < shape.witness_count + 1 + shape.public_input_count)
+    );
+    assert!(columns.contains(&shape.witness_count)); // constant-one column
+    assert!(columns.contains(&(shape.witness_count + 1))); // first public output
+}
+
+#[test]
 fn unified_exporter_rejects_ram_challenges_without_storage() {
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();

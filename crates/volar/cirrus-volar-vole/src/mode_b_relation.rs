@@ -339,6 +339,158 @@ pub struct KoalaBearR1cs {
     pub public_bindings: Vec<PublicBinding>,
 }
 
+/// Sparse matrix entry in the column layout consumed by `spartan-whir`:
+/// `[ private witness | constant one | public inputs ]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpartanWhirMatrixEntry {
+    /// Zero-based constraint row.
+    pub row: usize,
+    /// Zero-based matrix column.
+    pub column: usize,
+    /// Canonical KoalaBear coefficient.
+    pub value: u32,
+}
+
+/// A dependency-free Spartan-WHIR R1CS-shape export. A std adapter can turn
+/// this directly into `spartan_whir::{R1csShape, SparseMatrix}` without
+/// changing ordering or coefficient representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpartanWhirR1csShape {
+    /// Structural relation binding.
+    pub circuit_id: CircuitId,
+    /// Number of constraints.
+    pub constraint_count: usize,
+    /// Number of non-public witness columns.
+    pub witness_count: usize,
+    /// Number of externally supplied public inputs.
+    pub public_input_count: usize,
+    /// Unified variables in exact public-input order: outputs then inputs.
+    pub public_wires: Vec<usize>,
+    /// Sparse A matrix.
+    pub a: Vec<SpartanWhirMatrixEntry>,
+    /// Sparse B matrix.
+    pub b: Vec<SpartanWhirMatrixEntry>,
+    /// Sparse C matrix.
+    pub c: Vec<SpartanWhirMatrixEntry>,
+}
+
+impl KoalaBearR1cs {
+    /// Re-index the unified layout into Spartan-WHIR's `[W | 1 | X]` columns.
+    /// Public values are deliberately ordered `claimed outputs || inputs`, as
+    /// required by its KoalaBear Circom frontend.
+    pub fn export_spartan_whir_shape(&self) -> Result<SpartanWhirR1csShape, ModeBRelationError> {
+        let mut public_wires = Vec::with_capacity(self.public_bindings.len());
+        for output in self
+            .public_bindings
+            .iter()
+            .filter_map(|binding| match *binding {
+                PublicBinding::Output { wire, .. } => Some(wire),
+                PublicBinding::Input { .. } => None,
+            })
+        {
+            push_public_wire(&mut public_wires, output)?;
+        }
+        for input in self
+            .public_bindings
+            .iter()
+            .filter_map(|binding| match *binding {
+                PublicBinding::Input { wire, .. } => Some(wire),
+                PublicBinding::Output { .. } => None,
+            })
+        {
+            push_public_wire(&mut public_wires, input)?;
+        }
+        let mut private_columns = vec![None; self.variable_count];
+        let mut next_private = 0;
+        for (wire, slot) in private_columns.iter_mut().enumerate() {
+            if !public_wires.contains(&wire) {
+                *slot = Some(next_private);
+                next_private += 1;
+            }
+        }
+        let public_input_count = public_wires.len();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut c = Vec::new();
+        for (row, constraint) in self.rows.iter().enumerate() {
+            lower_spartan_lc(
+                &constraint.a,
+                row,
+                next_private,
+                &private_columns,
+                &public_wires,
+                &mut a,
+            );
+            lower_spartan_lc(
+                &constraint.b,
+                row,
+                next_private,
+                &private_columns,
+                &public_wires,
+                &mut b,
+            );
+            lower_spartan_lc(
+                &constraint.c,
+                row,
+                next_private,
+                &private_columns,
+                &public_wires,
+                &mut c,
+            );
+        }
+        Ok(SpartanWhirR1csShape {
+            circuit_id: self.circuit_id,
+            constraint_count: self.rows.len(),
+            witness_count: next_private,
+            public_input_count,
+            public_wires,
+            a,
+            b,
+            c,
+        })
+    }
+}
+
+fn push_public_wire(public_wires: &mut Vec<usize>, wire: usize) -> Result<(), ModeBRelationError> {
+    if public_wires.contains(&wire) {
+        return Err(ModeBRelationError::DuplicatePublicWire { wire });
+    }
+    public_wires.push(wire);
+    Ok(())
+}
+
+fn lower_spartan_lc(
+    lc: &KoalaBearLinearCombination,
+    row: usize,
+    witness_count: usize,
+    private_columns: &[Option<usize>],
+    public_wires: &[usize],
+    output: &mut Vec<SpartanWhirMatrixEntry>,
+) {
+    if lc.constant != 0 {
+        output.push(SpartanWhirMatrixEntry {
+            row,
+            column: witness_count,
+            value: lc.constant,
+        });
+    }
+    for (wire, value) in &lc.terms {
+        let column = private_columns[*wire].unwrap_or_else(|| {
+            witness_count
+                + 1
+                + public_wires
+                    .iter()
+                    .position(|candidate| candidate == wire)
+                    .expect("public wire")
+        });
+        output.push(SpartanWhirMatrixEntry {
+            row,
+            column,
+            value: *value,
+        });
+    }
+}
+
 impl UnifiedR1cs {
     /// Reduce signed relation coefficients modulo KoalaBear and canonicalize
     /// each sparse vector for a Spartan-WHIR matrix exporter.
@@ -1216,6 +1368,11 @@ pub enum ModeBRelationError {
         /// Declared variable count.
         variable_count: usize,
     },
+    /// A public binding names one unified wire more than once.
+    DuplicatePublicWire {
+        /// Duplicated unified wire index.
+        wire: usize,
+    },
     /// A storage-free unified export must not receive RAM challenges.
     UnexpectedRamPermutationChallenges,
     /// A circuit exceeds the fixed KoalaBear-quintic RAM ABI bounds.
@@ -1275,6 +1432,9 @@ impl fmt::Display for ModeBRelationError {
                 f,
                 "R1CS variable {variable} is outside declared layout of {variable_count} variables"
             ),
+            Self::DuplicatePublicWire { wire } => {
+                write!(f, "unified wire {wire} appears in multiple public bindings")
+            }
             Self::UnexpectedRamPermutationChallenges => {
                 f.write_str("storage-free unified export received RAM permutation challenges")
             }

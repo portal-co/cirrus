@@ -48,7 +48,7 @@ pub use mode_b_relation::{
     PrimeFieldRamConfig, PrimeRamMaterialization, PrimeRamPermutationChallenges,
     PrimeRamPermutationR1cs, PrimeRamR1cs, PrimeRamRecord, PrimeRamRecordLayout,
     PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess, RamAccessKind,
-    RamWitness, StorageRelation, UnifiedR1cs,
+    RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation, UnifiedR1cs,
 };
 pub use trace_audit::{
     BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
