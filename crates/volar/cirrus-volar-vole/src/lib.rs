@@ -55,7 +55,10 @@ pub use mode_b_relation::{
     UnifiedR1csWitness,
 };
 #[cfg(feature = "spartan-whir-adapter")]
-pub use spartan_whir_adapter::{SpartanWhirAdapterShape, SpartanWhirAdapterWitness};
+pub use spartan_whir_adapter::{
+    SpartanWhirAdapterShape, SpartanWhirAdapterWitness, SpartanWhirTraceKeys,
+    SpartanWhirTraceProof, TraceProofBackendError, TraceProofSecurityProfile,
+};
 pub use trace_audit::{
     BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
     TraceDigest, WireAuthPath, WireOpening, commit_boolar_trace,

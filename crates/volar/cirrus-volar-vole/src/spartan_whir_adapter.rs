@@ -8,11 +8,20 @@
 //! and is not performed here.
 
 use alloc::{vec, vec::Vec};
+use core::fmt;
 
 use p3_field::PrimeCharacteristicRing;
-use spartan_whir::{R1csShape, R1csWitness, SparseMatEntry, SparseMatrix, engine::F};
+use spartan_whir::{
+    MatrixClosingMode, PoseidonProof, PoseidonProvingKey, PoseidonSetupConfig,
+    PoseidonVerifyingKey, QuinticExtension, R1csShape, R1csWitness, SecurityConfig,
+    SoundnessAssumption, SparseMatEntry, SparseMatrix, SpartanSnarkConfig, SpartanWhirError,
+    WhirParams, engine::F, recommended_quintic_whir_params,
+};
 
-use crate::{ModeBRelationError, SpartanWhirMatrixEntry, SpartanWhirR1csShape, UnifiedR1csWitness};
+use crate::{
+    ModeBRelationError, SpartanWhirMatrixEntry, SpartanWhirR1csShape, TraceProofArtifacts,
+    UnifiedR1csWitness,
+};
 
 /// A `spartan-whir` R1CS shape together with the Mode-B circuit binding that
 /// selected it.
@@ -38,6 +47,181 @@ pub struct SpartanWhirAdapterWitness {
     /// verification; it must never be trusted merely because a proof carries a
     /// copy of it.
     pub public_values: Vec<F>,
+}
+
+/// Security and PCS profile for the initial no-ZK trace-to-proof lifecycle.
+///
+/// The default is the explicit 80-bit CapacityBound profile used by upstream
+/// phase-3 tests. It is convenient for integration testing, but it is **not**
+/// a production-security recommendation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceProofSecurityProfile {
+    /// Spartan/Merkle target and soundness assumption.
+    pub security: SecurityConfig,
+    /// Plain-WHIR parameters selected for the padded witness size.
+    pub whir_params: WhirParams,
+}
+
+impl TraceProofSecurityProfile {
+    /// Explicit test profile matching upstream phase-3 no-ZK fixtures.
+    pub fn capacity_bound_80_test() -> Self {
+        Self {
+            security: SecurityConfig {
+                security_level_bits: 80,
+                merkle_security_bits: 80,
+                soundness_assumption: SoundnessAssumption::CapacityBound,
+            },
+            whir_params: WhirParams {
+                pow_bits: 0,
+                folding_factor: 1,
+                starting_log_inv_rate: 6,
+                rs_domain_initial_reduction_factor: 1,
+                ..WhirParams::default()
+            },
+        }
+    }
+
+    /// Upstream-recommended quintic parameters for `num_variables`.
+    pub fn recommended_quintic(num_variables: usize, security: SecurityConfig) -> Self {
+        Self {
+            security,
+            whir_params: recommended_quintic_whir_params(num_variables),
+        }
+    }
+}
+
+/// A proving key and the verifying key bound to the same Mode-B circuit ID.
+pub struct SpartanWhirTraceKeys {
+    /// Structural Mode-B circuit binding.
+    pub circuit_id: crate::CircuitId,
+    /// Upstream circuit-specific proving key.
+    pub proving: PoseidonProvingKey<QuinticExtension>,
+    /// Upstream circuit-specific verifying key.
+    pub verifying: PoseidonVerifyingKey<QuinticExtension>,
+}
+
+/// One no-ZK Poseidon/Quintic Spartan-WHIR proof plus its circuit binding.
+pub struct SpartanWhirTraceProof {
+    /// Structural Mode-B circuit binding.
+    pub circuit_id: crate::CircuitId,
+    /// Upstream proof object. Its embedded public-input vector is an untrusted
+    /// copy; verification always receives expected public values separately.
+    pub proof: PoseidonProof<QuinticExtension>,
+}
+
+/// Why trace artifacts cannot enter the initial upstream proving lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceProofBackendError {
+    /// The initial lifecycle supports only storage-free circuits.
+    StorageRequiresChallengeSlots,
+    /// Upstream setup, proving, or verification failed.
+    Upstream(&'static str),
+}
+
+impl fmt::Display for TraceProofBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageRequiresChallengeSlots => {
+                f.write_str("storage-bearing trace proofs require transcript challenge slots")
+            }
+            Self::Upstream(operation) => write!(f, "upstream spartan-whir {operation} failed"),
+        }
+    }
+}
+
+impl core::error::Error for TraceProofBackendError {}
+
+impl From<SpartanWhirError> for TraceProofBackendError {
+    fn from(_: SpartanWhirError) -> Self {
+        // Keep the no_std-facing error small and non-String; callers needing
+        // diagnostics can call upstream directly.
+        Self::Upstream("operation")
+    }
+}
+
+impl TraceProofArtifacts {
+    /// Convert validated no-storage artifacts to upstream keys.
+    pub fn setup_spartan_whir_keys(
+        &self,
+        profile: &TraceProofSecurityProfile,
+    ) -> Result<SpartanWhirTraceKeys, TraceProofBackendError> {
+        if self.unified.ram.is_some() || self.ram_witness.is_some() {
+            return Err(TraceProofBackendError::StorageRequiresChallengeSlots);
+        }
+        let adapter = self
+            .unified
+            .clone()
+            .lower_koalabear()
+            .and_then(|lowered| lowered.export_spartan_whir_shape())
+            .map_err(|_| TraceProofBackendError::Upstream("shape export"))?
+            .to_spartan_whir_adapter();
+        adapter
+            .validate()
+            .map_err(|_| TraceProofBackendError::Upstream("shape validation"))?;
+        let num_variables = adapter.shape.num_vars.next_power_of_two().ilog2() as usize;
+        let config: PoseidonSetupConfig = SpartanSnarkConfig {
+            matrix_closing: MatrixClosingMode::DirectSparse,
+            security: profile.security,
+            whir_params: if profile.whir_params == WhirParams::default() {
+                recommended_quintic_whir_params(num_variables)
+            } else {
+                profile.whir_params.clone()
+            },
+            spark_whir_params: None,
+        };
+        let (proving, verifying) =
+            PoseidonProvingKey::<QuinticExtension>::setup(adapter.shape.clone(), config)
+                .map_err(|_| TraceProofBackendError::Upstream("setup"))?;
+        Ok(SpartanWhirTraceKeys {
+            circuit_id: adapter.circuit_id,
+            proving,
+            verifying,
+        })
+    }
+
+    /// Prove a validated no-storage trace with the initial upstream backend.
+    pub fn prove_spartan_whir(
+        &self,
+        keys: &SpartanWhirTraceKeys,
+    ) -> Result<SpartanWhirTraceProof, TraceProofBackendError> {
+        if keys.circuit_id != self.circuit_id {
+            return Err(TraceProofBackendError::Upstream("circuit binding"));
+        }
+        let adapter = self
+            .unified
+            .clone()
+            .lower_koalabear()
+            .and_then(|lowered| lowered.export_spartan_whir_shape())
+            .map_err(|_| TraceProofBackendError::Upstream("shape export"))?
+            .to_spartan_whir_adapter();
+        let split = adapter
+            .split_witness(&self.witness)
+            .map_err(|_| TraceProofBackendError::Upstream("witness split"))?;
+        let proof = keys
+            .proving
+            .prove(split.witness, split.public_values)
+            .map_err(|_| TraceProofBackendError::Upstream("prove"))?;
+        Ok(SpartanWhirTraceProof {
+            circuit_id: self.circuit_id,
+            proof,
+        })
+    }
+}
+
+impl SpartanWhirTraceKeys {
+    /// Verify a proof against verifier-selected public values.
+    pub fn verify(
+        &self,
+        expected_public_values: &[F],
+        proof: &SpartanWhirTraceProof,
+    ) -> Result<(), TraceProofBackendError> {
+        if proof.circuit_id != self.circuit_id {
+            return Err(TraceProofBackendError::Upstream("circuit binding"));
+        }
+        self.verifying
+            .verify(expected_public_values, &proof.proof)
+            .map_err(|_| TraceProofBackendError::Upstream("verify"))
+    }
 }
 
 impl SpartanWhirR1csShape {

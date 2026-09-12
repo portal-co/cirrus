@@ -208,3 +208,65 @@ fn panic_expected_trace_validation_error(error: TraceToProofError) {
         "unexpected validation error: {error:?}"
     );
 }
+
+#[cfg(feature = "spartan-whir-adapter")]
+#[test]
+fn storage_free_trace_proves_and_verifies_through_spartan_whir() {
+    use p3_field::{PrimeCharacteristicRing, PrimeField32};
+
+    let circuit = half_adder();
+    let input = TraceToProofInput {
+        audit: commit_boolar_trace(&circuit, &[true, false, true, false]).unwrap(),
+        public_inputs: vec![true, false],
+        claimed_outputs: vec![true, false],
+    };
+    let artifacts =
+        build_trace_proof_artifacts(&circuit, &input, RamChallengeInput::NoStorage).unwrap();
+    let profile = cirrus_volar_vole::TraceProofSecurityProfile::capacity_bound_80_test();
+    let keys = artifacts.setup_spartan_whir_keys(&profile).unwrap();
+    assert_eq!(keys.circuit_id, artifacts.circuit_id);
+
+    let proof = artifacts.prove_spartan_whir(&keys).unwrap();
+    let expected_public = [1_u32, 0, 1, 0].map(spartan_whir::engine::F::from_u32);
+    keys.verify(&expected_public, &proof).unwrap();
+    assert_eq!(
+        proof
+            .proof
+            .instance
+            .public_inputs
+            .iter()
+            .map(|value| value.as_canonical_u32())
+            .collect::<Vec<_>>(),
+        vec![1, 0, 1, 0]
+    );
+
+    let mut wrong_public = expected_public.to_vec();
+    wrong_public[0] = spartan_whir::engine::F::from_u32(0);
+    assert!(keys.verify(&wrong_public, &proof).is_err());
+}
+
+#[cfg(feature = "spartan-whir-adapter")]
+#[test]
+fn storage_trace_is_rejected_until_challenge_slots_exist() {
+    let circuit = storage_write_then_read();
+    let input = TraceToProofInput {
+        audit: commit_boolar_trace(&circuit, &[true, true, false, true]).unwrap(),
+        public_inputs: vec![true, true],
+        claimed_outputs: vec![true],
+    };
+    let artifacts = build_trace_proof_artifacts(
+        &circuit,
+        &input,
+        RamChallengeInput::DifferentialOracle(challenges()),
+    )
+    .unwrap();
+    let profile = cirrus_volar_vole::TraceProofSecurityProfile::capacity_bound_80_test();
+    let error = match artifacts.setup_spartan_whir_keys(&profile) {
+        Ok(_) => panic!("storage trace must not enter the initial proof lifecycle"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "storage-bearing trace proofs require transcript challenge slots"
+    );
+}
