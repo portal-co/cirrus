@@ -1,0 +1,16 @@
+[package]
+name = "cirrus-spartan-whir"
+version = "0.1.0"
+edition = "2024"
+description = "Independent no_std Spartan-WHIR implementation for Cirrus trace proofs"
+
+[features]
+default = []
+# std is for tests/tools only; the library itself is no_std+alloc.
+std = []
+# Differential oracle tests against the pinned upstream implementation.
+oracle-tests = ["std", "dep:spartan-whir", "dep:p3-field"]
+
+[dependencies]
+spartan-whir = { git = "https://github.com/ethereum/spartan-whir.git", rev = "f525cddea38bb605304d3a8e6394dda10ac64b4a", optional = true }
+p3-field = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
