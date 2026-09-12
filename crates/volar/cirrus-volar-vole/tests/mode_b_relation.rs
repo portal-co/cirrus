@@ -212,6 +212,46 @@ fn unified_exporter_has_one_non_overlapping_coordinate_system() {
 }
 
 #[test]
+fn koalabear_lowering_normalizes_signed_and_duplicate_coefficients() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let export = relation
+        .export_unified_r1cs(
+            &circuit,
+            Some(&PrimeRamPermutationChallenges {
+                gamma: [-1, 2, 3, 4, 5],
+                eta: [6, 7, 8, 9, 10],
+            }),
+        )
+        .unwrap();
+    let lowered = export.lower_koalabear().unwrap();
+    assert_eq!(lowered.modulus, KOALABEAR_MODULUS);
+    assert_eq!(lowered.variable_count, export.variable_count);
+    assert_eq!(lowered.rows.len(), export.rows.len());
+    assert!(
+        lowered
+            .rows
+            .iter()
+            .flat_map(|row| [&row.a, &row.b, &row.c])
+            .all(|lc| {
+                lc.constant < KOALABEAR_MODULUS
+                    && lc.terms.windows(2).all(|pair| pair[0].0 < pair[1].0)
+                    && lc.terms.iter().all(|(_, coefficient)| {
+                        *coefficient != 0 && *coefficient < KOALABEAR_MODULUS
+                    })
+            })
+    );
+    // The relation contains `-1` coefficients, which become canonical field
+    // representatives rather than host-language signed integers.
+    assert!(lowered.rows.iter().any(|row| {
+        [&row.a, &row.b, &row.c].into_iter().any(|lc| {
+            lc.constant == KOALABEAR_MODULUS - 1
+                || lc.terms.iter().any(|(_, c)| *c == KOALABEAR_MODULUS - 1)
+        })
+    }));
+}
+
+#[test]
 fn unified_exporter_rejects_ram_challenges_without_storage() {
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();

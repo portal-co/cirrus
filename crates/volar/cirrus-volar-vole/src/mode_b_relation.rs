@@ -301,6 +301,68 @@ pub struct UnifiedR1cs {
     pub permutation: Option<PrimeRamPermutationR1cs>,
 }
 
+/// A canonical sparse linear combination over the KoalaBear base field.
+/// Constants and coefficients are representatives in `0..KOALABEAR_MODULUS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KoalaBearLinearCombination {
+    /// Canonical base-field constant coefficient.
+    pub constant: u32,
+    /// Strictly increasing variable indices with nonzero canonical coefficients.
+    pub terms: Vec<(usize, u32)>,
+}
+
+/// One KoalaBear-base-field R1CS equation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KoalaBearR1csRow {
+    /// Left sparse linear combination.
+    pub a: KoalaBearLinearCombination,
+    /// Right sparse linear combination.
+    pub b: KoalaBearLinearCombination,
+    /// Result sparse linear combination.
+    pub c: KoalaBearLinearCombination,
+}
+
+/// The unified relation lowered to canonical KoalaBear base-field matrix
+/// coefficients. Extension arithmetic has already been expanded into these
+/// base-field rows; this type performs no extension-field encoding itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KoalaBearR1cs {
+    /// Structural circuit binding inherited from [`UnifiedR1cs`].
+    pub circuit_id: CircuitId,
+    /// The field modulus, fixed to [`KOALABEAR_MODULUS`].
+    pub modulus: u32,
+    /// Number of R1CS variables.
+    pub variable_count: usize,
+    /// Canonically lowered sparse rows.
+    pub rows: Vec<KoalaBearR1csRow>,
+    /// Unified public bindings.
+    pub public_bindings: Vec<PublicBinding>,
+}
+
+impl UnifiedR1cs {
+    /// Reduce signed relation coefficients modulo KoalaBear and canonicalize
+    /// each sparse vector for a Spartan-WHIR matrix exporter.
+    pub fn lower_koalabear(&self) -> Result<KoalaBearR1cs, ModeBRelationError> {
+        Ok(KoalaBearR1cs {
+            circuit_id: self.circuit_id,
+            modulus: KOALABEAR_MODULUS,
+            variable_count: self.variable_count,
+            rows: self
+                .rows
+                .iter()
+                .map(|row| {
+                    Ok(KoalaBearR1csRow {
+                        a: lower_linear_combination(&row.a, self.variable_count)?,
+                        b: lower_linear_combination(&row.b, self.variable_count)?,
+                        c: lower_linear_combination(&row.c, self.variable_count)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ModeBRelationError>>()?,
+            public_bindings: self.public_bindings.clone(),
+        })
+    }
+}
+
 impl PrimeRamR1cs {
     /// Emit the fixed-variable-order rows for `access_count` RAM records.
     ///
@@ -923,6 +985,45 @@ fn allocate_record(next: &mut usize, rows: &mut Vec<R1csRow>) -> PrimeRamRecordL
         key,
     }
 }
+fn lower_linear_combination(
+    value: &LinearCombination,
+    variable_count: usize,
+) -> Result<KoalaBearLinearCombination, ModeBRelationError> {
+    let modulus = i64::from(KOALABEAR_MODULUS);
+    let mut terms: Vec<(usize, i64)> = value
+        .terms
+        .iter()
+        .map(|(variable, coefficient)| {
+            if *variable >= variable_count {
+                return Err(ModeBRelationError::R1csVariableOutOfBounds {
+                    variable: *variable,
+                    variable_count,
+                });
+            }
+            Ok((*variable, coefficient.rem_euclid(modulus)))
+        })
+        .collect::<Result<_, _>>()?;
+    terms.sort_unstable_by_key(|(variable, _)| *variable);
+    let mut canonical: Vec<(usize, i64)> = Vec::with_capacity(terms.len());
+    for (variable, coefficient) in terms {
+        if let Some((previous, accumulated)) = canonical.last_mut()
+            && *previous == variable
+        {
+            *accumulated = (*accumulated + coefficient).rem_euclid(modulus);
+        } else {
+            canonical.push((variable, coefficient));
+        }
+    }
+    canonical.retain(|(_, coefficient)| *coefficient != 0);
+    Ok(KoalaBearLinearCombination {
+        constant: value.constant.rem_euclid(modulus) as u32,
+        terms: canonical
+            .into_iter()
+            .map(|(variable, coefficient)| (variable, coefficient as u32))
+            .collect(),
+    })
+}
+
 fn shift_row(row: &R1csRow, offset: usize) -> R1csRow {
     R1csRow {
         a: shift_linear_combination(&row.a, offset),
@@ -1108,6 +1209,13 @@ pub enum ModeBRelationError {
     RamVariableLayoutOverlap,
     /// A storage-bearing unified export requires transcript-derived RAM challenges.
     MissingRamPermutationChallenges,
+    /// A row referenced a variable outside its declared unified layout.
+    R1csVariableOutOfBounds {
+        /// Referenced variable.
+        variable: usize,
+        /// Declared variable count.
+        variable_count: usize,
+    },
     /// A storage-free unified export must not receive RAM challenges.
     UnexpectedRamPermutationChallenges,
     /// A circuit exceeds the fixed KoalaBear-quintic RAM ABI bounds.
@@ -1160,6 +1268,13 @@ impl fmt::Display for ModeBRelationError {
             Self::MissingRamPermutationChallenges => {
                 f.write_str("storage-bearing unified export requires RAM permutation challenges")
             }
+            Self::R1csVariableOutOfBounds {
+                variable,
+                variable_count,
+            } => write!(
+                f,
+                "R1CS variable {variable} is outside declared layout of {variable_count} variables"
+            ),
             Self::UnexpectedRamPermutationChallenges => {
                 f.write_str("storage-free unified export received RAM permutation challenges")
             }
