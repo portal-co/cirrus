@@ -60,6 +60,10 @@ impl LinearCombination {
         self.terms.push((v, c));
         self
     }
+    fn add_terms(mut self, terms: Vec<(usize, i64)>) -> Self {
+        self.terms.extend(terms);
+        self
+    }
 }
 
 /// One R1CS equation `A(w) * B(w) = C(w)`.
@@ -208,6 +212,616 @@ pub struct PrimeRamMaterialization {
     pub execution: Vec<PrimeRamRecord>,
     /// Address/time sorted table plus explicit scan auxiliaries.
     pub sorted: Vec<PrimeRamScanRow>,
+}
+
+/// Variable locations for one bounded RAM record in the prime-field R1CS
+/// layout. Bit arrays are little-endian; `key` is the quintic polynomial-basis
+/// representation documented by `koalabear-ext5-ram-v1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamRecordLayout {
+    pub storage: [usize; PRIME_RAM_STORAGE_BITS],
+    pub lane: [usize; PRIME_RAM_LANE_BITS],
+    pub address: [usize; PRIME_RAM_ADDRESS_BITS],
+    pub time: [usize; PRIME_RAM_TIME_BITS],
+    pub kind: usize,
+    pub value: usize,
+    pub key: [usize; KOALABEAR_QUINTIC_DEGREE],
+}
+
+/// Variable locations for one explicit sorted-table scan row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamScanLayout {
+    pub record: PrimeRamRecordLayout,
+    /// Per-bit cell equality flags, ordered storage/lane/address MSB first.
+    pub cell_bit_equal: Vec<usize>,
+    /// Prefix equality flags; entry zero is the fixed one prefix.
+    pub cell_prefix_equal: Vec<usize>,
+    /// One-hot first-differing-bit selectors for strict cell ordering.
+    pub cell_first_difference: Vec<usize>,
+    /// Time equality/prefix/first-difference gadget, gated by `same_cell`.
+    pub time_bit_equal: Vec<usize>,
+    pub time_prefix_equal: Vec<usize>,
+    pub time_first_difference: Vec<usize>,
+    pub same_cell: usize,
+    pub first_read: usize,
+    pub later_read: usize,
+    pub first_write: usize,
+    pub later_write: usize,
+    pub prior_latest: usize,
+    pub latest: usize,
+}
+
+/// Frozen variable layout and explicit static R1CS rows for the non-challenge
+/// RAM constraints. The grand-product rows are challenge-bound and must be
+/// appended by the Spartan-WHIR adapter after transcript challenges exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamR1cs {
+    pub variable_count: usize,
+    pub rows: Vec<R1csRow>,
+    pub execution: Vec<PrimeRamRecordLayout>,
+    pub sorted: Vec<PrimeRamScanLayout>,
+}
+
+/// Fiat--Shamir challenges represented in the canonical quintic basis. They
+/// are transcript outputs, never prover-selected witness values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamPermutationChallenges {
+    pub gamma: [i64; KOALABEAR_QUINTIC_DEGREE],
+    pub eta: [i64; KOALABEAR_QUINTIC_DEGREE],
+}
+
+/// Challenge-bound variables and rows for the extension-field permutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamPermutationR1cs {
+    pub variable_count: usize,
+    pub rows: Vec<R1csRow>,
+    /// `Z_0 .. Z_n`, each in the quintic polynomial basis.
+    pub z: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
+}
+
+impl PrimeRamR1cs {
+    /// Emit the fixed-variable-order rows for `access_count` RAM records.
+    ///
+    /// The table contents, sort witness, and scan values are prover witness
+    /// variables. The adapter adds Fiat--Shamir-dependent extension-field
+    /// grand-product rows after committing these columns.
+    pub fn new(access_count: usize) -> Self {
+        let mut next = 0;
+        let mut rows = Vec::new();
+        let mut execution = Vec::with_capacity(access_count);
+        let mut sorted: Vec<PrimeRamScanLayout> = Vec::with_capacity(access_count);
+        for time in 0..access_count {
+            let record = allocate_record(&mut next, &mut rows);
+            // Execution rows are canonical IR order, so time is not a prover
+            // choice. The permutation transfers these unique times to Q.
+            for (bit, variable) in record.time.iter().enumerate() {
+                rows.push(equal_constant_row(*variable, ((time >> bit) & 1) as i64));
+            }
+            execution.push(record);
+        }
+        for index in 0..access_count {
+            let record = allocate_record(&mut next, &mut rows);
+            let same_cell = allocate_boolean(&mut next, &mut rows);
+            let (
+                cell_bit_equal,
+                cell_prefix_equal,
+                cell_first_difference,
+                time_bit_equal,
+                time_prefix_equal,
+                time_first_difference,
+            ) = if index == 0 {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                let cell = allocate_cell_order_gadget(
+                    &mut next,
+                    &mut rows,
+                    &sorted[index - 1].record,
+                    &record,
+                    same_cell,
+                );
+                let time = allocate_same_cell_time_order_gadget(
+                    &mut next,
+                    &mut rows,
+                    &sorted[index - 1].record,
+                    &record,
+                    same_cell,
+                );
+                (cell.0, cell.1, cell.2, time.0, time.1, time.2)
+            };
+            let first_read = allocate_boolean(&mut next, &mut rows);
+            let later_read = allocate_boolean(&mut next, &mut rows);
+            let first_write = allocate_boolean(&mut next, &mut rows);
+            let later_write = allocate_boolean(&mut next, &mut rows);
+            let prior_latest = allocate_boolean(&mut next, &mut rows);
+            let latest = allocate_boolean(&mut next, &mut rows);
+            // Exact one-hot selector definitions. `kind=0` means read.
+            rows.push(product_row(
+                lc_one_minus(same_cell),
+                lc_one_minus(record.kind),
+                first_read,
+            ));
+            rows.push(product_row(
+                LinearCombination::var(same_cell),
+                lc_one_minus(record.kind),
+                later_read,
+            ));
+            rows.push(product_row(
+                lc_one_minus(same_cell),
+                LinearCombination::var(record.kind),
+                first_write,
+            ));
+            rows.push(product_row(
+                LinearCombination::var(same_cell),
+                LinearCombination::var(record.kind),
+                later_write,
+            ));
+            rows.push(equal_one_row(&[
+                first_read,
+                later_read,
+                first_write,
+                later_write,
+            ]));
+            // The latest-value scan, including the zero default for first reads.
+            rows.push(product_row(
+                LinearCombination::var(first_read),
+                LinearCombination::var(record.value),
+                next,
+            ));
+            next += 1; // zero-constrained temporary for first-read value
+            let zero = next - 1;
+            rows.push(zero_row(zero));
+            rows.push(product_row(
+                LinearCombination::var(later_read),
+                lc_difference(record.value, prior_latest),
+                next,
+            ));
+            next += 1;
+            rows.push(zero_row(next - 1));
+            rows.push(product_row(
+                lc_sum(&[first_read, later_read]),
+                lc_difference(latest, record.value),
+                next,
+            ));
+            next += 1;
+            rows.push(zero_row(next - 1));
+            rows.push(product_row(
+                lc_sum(&[first_write, later_write]),
+                lc_difference(latest, record.value),
+                next,
+            ));
+            next += 1;
+            rows.push(zero_row(next - 1));
+            if index == 0 {
+                rows.push(equal_constant_row(prior_latest, 0));
+                rows.push(equal_constant_row(same_cell, 0));
+            } else {
+                rows.push(equal_variables_row(prior_latest, sorted[index - 1].latest));
+            }
+            sorted.push(PrimeRamScanLayout {
+                record,
+                cell_bit_equal,
+                cell_prefix_equal,
+                cell_first_difference,
+                time_bit_equal,
+                time_prefix_equal,
+                time_first_difference,
+                same_cell,
+                first_read,
+                later_read,
+                first_write,
+                later_write,
+                prior_latest,
+                latest,
+            });
+        }
+        Self {
+            variable_count: next,
+            rows,
+            execution,
+            sorted,
+        }
+    }
+
+    /// Append explicit quintic-extension grand-product rows for transcript
+    /// challenges. This realizes `Z[i+1] * (gamma + R(Q[i])) = Z[i] *
+    /// (gamma + R(E[i]))`, with fixed `Z[0] = Z[n] = 1`.
+    pub fn permutation_rows(
+        &self,
+        challenges: &PrimeRamPermutationChallenges,
+    ) -> PrimeRamPermutationR1cs {
+        let mut next = self.variable_count;
+        let mut rows = Vec::new();
+        let mut z = Vec::with_capacity(self.execution.len() + 1);
+        for _ in 0..=self.execution.len() {
+            z.push(core::array::from_fn(|_| {
+                let variable = next;
+                next += 1;
+                variable
+            }));
+        }
+        constrain_extension_constant(&mut rows, z[0], [1, 0, 0, 0, 0]);
+        constrain_extension_constant(&mut rows, *z.last().expect("nonempty Z"), [1, 0, 0, 0, 0]);
+        for index in 0..self.execution.len() {
+            let sorted = compressed_record_lcs(&self.sorted[index].record, challenges);
+            let execution = compressed_record_lcs(&self.execution[index], challenges);
+            let left = extension_product_rows(&mut next, &mut rows, z[index + 1], sorted);
+            let right = extension_product_rows(&mut next, &mut rows, z[index], execution);
+            for coordinate in 0..KOALABEAR_QUINTIC_DEGREE {
+                rows.push(equal_variables_row(left[coordinate], right[coordinate]));
+            }
+        }
+        PrimeRamPermutationR1cs {
+            variable_count: next,
+            rows,
+            z,
+        }
+    }
+}
+
+fn cell_bits_msb_first(record: &PrimeRamRecordLayout) -> Vec<usize> {
+    let mut bits =
+        Vec::with_capacity(PRIME_RAM_STORAGE_BITS + PRIME_RAM_LANE_BITS + PRIME_RAM_ADDRESS_BITS);
+    bits.extend(record.storage.iter().rev().copied());
+    bits.extend(record.lane.iter().rev().copied());
+    bits.extend(record.address.iter().rev().copied());
+    bits
+}
+
+/// Enforce equality bits, their AND-prefix, and strict lexicographic ordering
+/// when `same_cell` is zero. For the first differing bit, predecessor=0 and
+/// current=1; if all bits match, `same_cell=1`.
+fn allocate_cell_order_gadget(
+    next: &mut usize,
+    rows: &mut Vec<R1csRow>,
+    predecessor: &PrimeRamRecordLayout,
+    current: &PrimeRamRecordLayout,
+    same_cell: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let previous_bits = cell_bits_msb_first(predecessor);
+    let current_bits = cell_bits_msb_first(current);
+    let mut equal = Vec::with_capacity(previous_bits.len());
+    let mut prefix = Vec::with_capacity(previous_bits.len() + 1);
+    let mut first_difference = Vec::with_capacity(previous_bits.len());
+    let one = *next;
+    *next += 1;
+    rows.push(equal_constant_row(one, 1));
+    prefix.push(one);
+    for (previous, current) in previous_bits.into_iter().zip(current_bits) {
+        let product = *next;
+        *next += 1;
+        rows.push(product_row(
+            LinearCombination::var(previous),
+            LinearCombination::var(current),
+            product,
+        ));
+        let equality = allocate_boolean(next, rows);
+        // equality = 1 - previous - current + 2*previous*current.
+        rows.push(R1csRow {
+            a: LinearCombination::constant(1),
+            b: LinearCombination::constant(1),
+            c: LinearCombination {
+                constant: -1,
+                terms: vec![(previous, 1), (current, 1), (product, -2), (equality, 1)],
+            },
+        });
+        equal.push(equality);
+        let next_prefix = allocate_boolean(next, rows);
+        rows.push(product_row(
+            LinearCombination::var(*prefix.last().expect("prefix seed")),
+            LinearCombination::var(equality),
+            next_prefix,
+        ));
+        let first = allocate_boolean(next, rows);
+        rows.push(product_row(
+            LinearCombination::var(prefix[prefix.len() - 1]),
+            lc_one_minus(equality),
+            first,
+        ));
+        // A first difference is permitted only as 0 -> 1.
+        let zero = *next;
+        *next += 1;
+        rows.push(product_row(
+            LinearCombination::var(first),
+            lc_one_minus(current),
+            zero,
+        ));
+        rows.push(zero_row(zero));
+        prefix.push(next_prefix);
+        first_difference.push(first);
+    }
+    rows.push(equal_variables_row(
+        same_cell,
+        *prefix.last().expect("nonempty prefix"),
+    ));
+    let mut selector_sum = lc_sum(&first_difference);
+    selector_sum = selector_sum.add(same_cell, 1);
+    rows.push(R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: LinearCombination {
+            constant: -1,
+            terms: selector_sum.terms,
+        },
+    });
+    (equal, prefix, first_difference)
+}
+
+/// Require increasing time only when the adjacent records are for one cell.
+fn allocate_same_cell_time_order_gadget(
+    next: &mut usize,
+    rows: &mut Vec<R1csRow>,
+    predecessor: &PrimeRamRecordLayout,
+    current: &PrimeRamRecordLayout,
+    same_cell: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut equal = Vec::with_capacity(PRIME_RAM_TIME_BITS);
+    let mut prefix = vec![same_cell];
+    let mut first_difference = Vec::with_capacity(PRIME_RAM_TIME_BITS);
+    for (&previous, &current) in predecessor.time.iter().rev().zip(current.time.iter().rev()) {
+        let product = *next;
+        *next += 1;
+        rows.push(product_row(
+            LinearCombination::var(previous),
+            LinearCombination::var(current),
+            product,
+        ));
+        let equality = allocate_boolean(next, rows);
+        rows.push(R1csRow {
+            a: LinearCombination::constant(1),
+            b: LinearCombination::constant(1),
+            c: LinearCombination {
+                constant: -1,
+                terms: vec![(previous, 1), (current, 1), (product, -2), (equality, 1)],
+            },
+        });
+        equal.push(equality);
+        let next_prefix = allocate_boolean(next, rows);
+        rows.push(product_row(
+            LinearCombination::var(*prefix.last().expect("prefix seed")),
+            LinearCombination::var(equality),
+            next_prefix,
+        ));
+        let first = allocate_boolean(next, rows);
+        rows.push(product_row(
+            LinearCombination::var(*prefix.last().expect("prefix seed")),
+            lc_one_minus(equality),
+            first,
+        ));
+        let zero = *next;
+        *next += 1;
+        rows.push(product_row(
+            LinearCombination::var(first),
+            lc_one_minus(current),
+            zero,
+        ));
+        rows.push(zero_row(zero));
+        prefix.push(next_prefix);
+        first_difference.push(first);
+    }
+    // A same-cell successor must have exactly one increasing first time bit.
+    rows.push(R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: lc_sum(&first_difference).add(same_cell, -1),
+    });
+    (equal, prefix, first_difference)
+}
+
+fn compressed_record_lcs(
+    record: &PrimeRamRecordLayout,
+    challenges: &PrimeRamPermutationChallenges,
+) -> [LinearCombination; KOALABEAR_QUINTIC_DEGREE] {
+    core::array::from_fn(|coordinate| LinearCombination {
+        constant: challenges.gamma[coordinate],
+        terms: vec![
+            (record.key[coordinate], 1),
+            (record.value, challenges.eta[coordinate]),
+        ],
+    })
+}
+
+fn constrain_extension_constant(
+    rows: &mut Vec<R1csRow>,
+    value: [usize; KOALABEAR_QUINTIC_DEGREE],
+    constant: [i64; KOALABEAR_QUINTIC_DEGREE],
+) {
+    for coordinate in 0..KOALABEAR_QUINTIC_DEGREE {
+        rows.push(equal_constant_row(value[coordinate], constant[coordinate]));
+    }
+}
+
+/// Multiply two quintic-basis values. Each base-field product is its own R1CS
+/// row; the final coordinate rows apply `X^5 = 1 - X^2`.
+fn extension_product_rows(
+    next: &mut usize,
+    rows: &mut Vec<R1csRow>,
+    left: [usize; KOALABEAR_QUINTIC_DEGREE],
+    right: [LinearCombination; KOALABEAR_QUINTIC_DEGREE],
+) -> [usize; KOALABEAR_QUINTIC_DEGREE] {
+    let mut products = [[0usize; KOALABEAR_QUINTIC_DEGREE]; KOALABEAR_QUINTIC_DEGREE];
+    for i in 0..KOALABEAR_QUINTIC_DEGREE {
+        for j in 0..KOALABEAR_QUINTIC_DEGREE {
+            products[i][j] = *next;
+            *next += 1;
+            rows.push(product_row(
+                LinearCombination::var(left[i]),
+                right[j].clone(),
+                products[i][j],
+            ));
+        }
+    }
+    let output = core::array::from_fn(|_| {
+        let variable = *next;
+        *next += 1;
+        variable
+    });
+    for coordinate in 0..KOALABEAR_QUINTIC_DEGREE {
+        let mut c = LinearCombination::var(output[coordinate]);
+        for i in 0..KOALABEAR_QUINTIC_DEGREE {
+            for j in 0..KOALABEAR_QUINTIC_DEGREE {
+                let coefficient = extension_monomial_reduction(i + j)[coordinate];
+                if coefficient != 0 {
+                    c = c.add(products[i][j], -coefficient);
+                }
+            }
+        }
+        rows.push(R1csRow {
+            a: LinearCombination::constant(1),
+            b: LinearCombination::constant(1),
+            c,
+        });
+    }
+    output
+}
+
+fn extension_monomial_reduction(degree: usize) -> [i64; KOALABEAR_QUINTIC_DEGREE] {
+    let mut polynomial = vec![0_i64; (degree + 1).max(KOALABEAR_QUINTIC_DEGREE)];
+    polynomial[degree] = 1;
+    for current in (KOALABEAR_QUINTIC_DEGREE..=degree).rev() {
+        let coefficient = polynomial[current];
+        if coefficient != 0 {
+            // x^current = x^(current-5) - x^(current-3).
+            polynomial[current - KOALABEAR_QUINTIC_DEGREE] += coefficient;
+            polynomial[current - 3] -= coefficient;
+        }
+    }
+    core::array::from_fn(|index| polynomial[index])
+}
+
+fn allocate_boolean(next: &mut usize, rows: &mut Vec<R1csRow>) -> usize {
+    let variable = *next;
+    *next += 1;
+    rows.push(R1csRow {
+        a: LinearCombination::var(variable),
+        b: lc_one_minus(variable),
+        c: LinearCombination::constant(0),
+    });
+    variable
+}
+fn allocate_record(next: &mut usize, rows: &mut Vec<R1csRow>) -> PrimeRamRecordLayout {
+    let storage = core::array::from_fn(|_| allocate_boolean(next, rows));
+    let lane = core::array::from_fn(|_| allocate_boolean(next, rows));
+    let address = core::array::from_fn(|_| allocate_boolean(next, rows));
+    let time = core::array::from_fn(|_| allocate_boolean(next, rows));
+    let kind = allocate_boolean(next, rows);
+    let value = allocate_boolean(next, rows);
+    let key = core::array::from_fn(|_| {
+        let v = *next;
+        *next += 1;
+        v
+    });
+    for (coordinate, terms) in prime_key_terms(&storage, &lane, &address, &time, kind)
+        .into_iter()
+        .enumerate()
+    {
+        rows.push(R1csRow {
+            a: LinearCombination::constant(1),
+            b: LinearCombination::constant(1),
+            c: LinearCombination::var(key[coordinate])
+                .add_terms(terms.into_iter().map(|(v, c)| (v, -c)).collect()),
+        });
+    }
+    PrimeRamRecordLayout {
+        storage,
+        lane,
+        address,
+        time,
+        kind,
+        value,
+        key,
+    }
+}
+fn lc_one_minus(variable: usize) -> LinearCombination {
+    LinearCombination::constant(1).add(variable, -1)
+}
+fn lc_difference(left: usize, right: usize) -> LinearCombination {
+    LinearCombination::var(left).add(right, -1)
+}
+fn lc_sum(values: &[usize]) -> LinearCombination {
+    values
+        .iter()
+        .fold(LinearCombination::constant(0), |lc, v| lc.add(*v, 1))
+}
+fn product_row(a: LinearCombination, b: LinearCombination, c: usize) -> R1csRow {
+    R1csRow {
+        a,
+        b,
+        c: LinearCombination::var(c),
+    }
+}
+fn zero_row(variable: usize) -> R1csRow {
+    R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: LinearCombination::var(variable),
+    }
+}
+fn equal_constant_row(variable: usize, constant: i64) -> R1csRow {
+    R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: LinearCombination {
+            constant: -constant,
+            terms: vec![(variable, 1)],
+        },
+    }
+}
+fn equal_variables_row(left: usize, right: usize) -> R1csRow {
+    R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: lc_difference(left, right),
+    }
+}
+fn equal_one_row(values: &[usize]) -> R1csRow {
+    R1csRow {
+        a: LinearCombination::constant(1),
+        b: LinearCombination::constant(1),
+        c: LinearCombination {
+            constant: -1,
+            terms: values.iter().map(|v| (*v, 1)).collect(),
+        },
+    }
+}
+fn prime_key_terms(
+    storage: &[usize; PRIME_RAM_STORAGE_BITS],
+    lane: &[usize; PRIME_RAM_LANE_BITS],
+    address: &[usize; PRIME_RAM_ADDRESS_BITS],
+    time: &[usize; PRIME_RAM_TIME_BITS],
+    kind: usize,
+) -> [Vec<(usize, i64)>; KOALABEAR_QUINTIC_DEGREE] {
+    let mut terms: [Vec<(usize, i64)>; KOALABEAR_QUINTIC_DEGREE] =
+        core::array::from_fn(|_| Vec::new());
+    for i in 0..16 {
+        terms[0].push((storage[i], 1_i64 << i));
+    }
+    for i in 0..14 {
+        terms[0].push((lane[i], 1_i64 << (16 + i)));
+    }
+    for i in 14..16 {
+        terms[1].push((lane[i], 1_i64 << (i - 14)));
+    }
+    for i in 0..28 {
+        terms[1].push((address[i], 1_i64 << (2 + i)));
+    }
+    for i in 28..32 {
+        terms[2].push((address[i], 1_i64 << (i - 28)));
+    }
+    for i in 0..26 {
+        terms[2].push((time[i], 1_i64 << (4 + i)));
+    }
+    for i in 26..32 {
+        terms[3].push((time[i], 1_i64 << (i - 26)));
+    }
+    terms[3].push((kind, 1_i64 << 6));
+    terms
 }
 
 impl Ord for RamAccess {

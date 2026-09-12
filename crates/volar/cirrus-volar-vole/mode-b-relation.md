@@ -187,8 +187,12 @@ Z_(i+1) * (gamma + R(Q_i)) = Z_i * (gamma + R(E_i))
 Z_n = 1.
 ```
 
-Each displayed equality is one quadratic R1CS row once `R`, the products, and
-`Z` values are witness variables. The verifier rejects if any denominator
+Each extension-coordinate equality is materialized as base-field R1CS rows:
+the exporter emits all 25 coordinate products for each extension
+multiplication and reduces them using `X^5 = 1-X^2`. `PrimeRamR1cs` freezes the
+static bit/key/sort/scan layout; after commitments and Fiat--Shamir challenge
+derivation, `PrimeRamR1cs::permutation_rows` emits the `Z` variables and these
+challenge-bound extension multiplication/equality rows. The verifier rejects if any denominator
 `gamma + R(Q_i)` is zero (or the prover samples again using a transcript-bound
 counter and records it); this policy must be identical in prover, Rust
 verifier, and Solidity verifier. The recurrence plus endpoints proves multiset equality except with the usual
@@ -197,16 +201,16 @@ so ordering and RAM rows remain mandatory.
 
 ### Sorted-table and latest-value rows
 
-For adjacent sorted records, derive Boolean equality flags for storage, lane,
-and each address bit; their product is `same_cell_i`. Derive a first-differing
-bit selector for the lexicographic tuple `(storage, lane, address, time, kind)`
-and constrain it to select a `0 -> 1` difference. This proves strict
-lexicographic ordering without comparison gadgets over unconstrained field
-values. The concrete exporter must use the declared most-significant-first
-comparison order; address bits are stored little-endian but compared in reverse
-bit order. A duplicate complete record is forbidden because the order is
-strict; if duplicate accesses are permitted, use a stable position column in
-`K` and prove its progression instead.
+For adjacent sorted records, `PrimeRamR1cs` emits Boolean equality flags for
+storage, lane, and each address bit, their AND-prefix, and a first-differing
+bit selector. `same_cell_i` equals the final prefix. When it is zero, the
+selectors sum to one and constrain that first difference to be `0 -> 1`; this
+proves strict lexicographic ordering of the cell tuple without a comparison
+operation over unconstrained field values. The concrete exporter uses the
+declared most-significant-first comparison order; address bits are stored
+little-endian but compared in reverse bit order. Same-cell ordering is then by
+the time column, which is bound by the permutation to unique canonical
+execution times. A duplicate complete record is therefore impossible.
 
 Let `same_i` mean `Q_i` and `Q_(i-1)` address the same cell, `read_i=1-kind_i`,
 and let `V_i` be the running latest value. Define the four Boolean, one-hot

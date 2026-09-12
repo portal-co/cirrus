@@ -1,6 +1,6 @@
 use cirrus_volar_vole::{
     KOALABEAR_MODULUS, KOALABEAR_QUINTIC_DEGREE, ModeBRelation, ModeBRelationError,
-    PRIME_RAM_ADDRESS_BITS, PrimeFieldRamConfig,
+    PRIME_RAM_ADDRESS_BITS, PrimeFieldRamConfig, PrimeRamPermutationChallenges, PrimeRamR1cs,
 };
 use volar_ir::{
     boolar::{BIrStmt, LaneId},
@@ -176,6 +176,33 @@ fn relation_rejects_ram_values_outside_the_fixed_extension_abi() {
             ..
         })
     ));
+}
+
+#[test]
+fn prime_ram_r1cs_has_a_deterministic_static_scan_layout() {
+    let a = PrimeRamR1cs::new(2);
+    let b = PrimeRamR1cs::new(2);
+    assert_eq!(a, b);
+    assert_eq!(a.execution.len(), 2);
+    assert_eq!(a.sorted.len(), 2);
+    assert!(!a.rows.is_empty());
+    assert!(a.variable_count > 2 * (16 + 16 + 32 + 32 + 2));
+    assert_eq!(a.sorted[0].cell_bit_equal.len(), 0);
+    assert_eq!(a.sorted[1].cell_bit_equal.len(), 64);
+    assert_eq!(a.sorted[1].cell_first_difference.len(), 64);
+    let permutation = a.permutation_rows(&PrimeRamPermutationChallenges {
+        gamma: [1, 2, 3, 4, 5],
+        eta: [6, 7, 8, 9, 10],
+    });
+    assert_eq!(permutation.z.len(), 3);
+    assert!(permutation.variable_count > a.variable_count);
+    assert!(!permutation.rows.is_empty());
+    // The initial scan row has the required fixed zero predecessor.
+    assert!(
+        a.rows
+            .iter()
+            .any(|row| { row.c.terms == vec![(a.sorted[0].same_cell, 1)] && row.c.constant == 0 })
+    );
 }
 
 #[test]
