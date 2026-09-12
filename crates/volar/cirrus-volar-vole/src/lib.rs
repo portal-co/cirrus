@@ -34,6 +34,7 @@ mod mode_b_relation;
 #[cfg(feature = "spartan-whir-adapter")]
 mod spartan_whir_adapter;
 mod trace_audit;
+mod trace_to_proof;
 mod typed;
 
 pub use hook::{NoopVoleVerifierHook, VoleVerifierHook};
@@ -58,6 +59,10 @@ pub use spartan_whir_adapter::{SpartanWhirAdapterShape, SpartanWhirAdapterWitnes
 pub use trace_audit::{
     BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
     TraceDigest, WireAuthPath, WireOpening, commit_boolar_trace,
+};
+pub use trace_to_proof::{
+    RamChallengeInput, TraceProofArtifacts, TraceToProofError, TraceToProofInput,
+    build_trace_proof_artifacts,
 };
 pub use typed::TypedVoleValue;
 
