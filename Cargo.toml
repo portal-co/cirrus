@@ -13,7 +13,7 @@ portal-solutions-asm-x86-64 = { version = "0.1.0", git = "https://github.com/por
 portal-solutions-asm-riscv64 = { version = "0.1.0", git = "https://github.com/portal-co/asm-arch.git" }
 portal-solutions-asm-aarch64 = { version = "0.1.0", git = "https://github.com/portal-co/asm-arch.git" }
 portal-solutions-asm-jvm = { version = "0.1.0", git = "https://github.com/portal-co/asm-arch.git" }
-portal-solutions-asm-regalloc = { git = "https://github.com/portal-co/asm-arch", package = "portal-solutions-asm-regalloc" }
+portal-solutions-asm-regalloc = { git = "https://github.com/portal-co/asm-arch.git", package = "portal-solutions-asm-regalloc" }
 
 rv-asm = { version = "*", git = "https://github.com/portal-co/rv-utils.git" }
 

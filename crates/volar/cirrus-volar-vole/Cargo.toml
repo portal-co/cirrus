@@ -15,6 +15,9 @@ hybrid-array.workspace = true
 cipher.workspace = true
 spin = { version = "0.10.1", default-features = false, features = ["mutex", "spin_mutex", "portable-atomic"] }
 volar-iop = { version = "0.1.0", git = "https://github.com/portal-co/volar.git", optional = true }
+sha3 = { version = "0.11.0-rc.2", default-features = false }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "arm"))'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
@@ -24,6 +27,4 @@ cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recomp
 cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
 rv-asm.workspace = true
 cirrus-volar-boolar = { path = "../cirrus-volar-boolar" }
-volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
-volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 volar-lir-test-corpus = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }

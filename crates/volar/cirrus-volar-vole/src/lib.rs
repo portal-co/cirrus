@@ -30,6 +30,8 @@ mod hook;
 #[cfg(feature = "iop-accumulator")]
 pub mod iop_accumulator;
 mod locked;
+mod mode_b_relation;
+mod trace_audit;
 mod typed;
 
 pub use hook::{NoopVoleVerifierHook, VoleVerifierHook};
@@ -37,6 +39,17 @@ pub use locked::{
     LockedVoleProverContext, LockedVoleProverStorage, LockedVoleProverStorageContext,
     LockedVoleVerifierContext, LockedVoleVerifierStorage, LockedVoleVerifierStorageContext,
     MutexPuller, MutexPusher, PullerByRef,
+};
+pub use mode_b_relation::{
+    CircuitId, KOALABEAR_MODULUS, KOALABEAR_QUINTIC_DEGREE, LinearCombination,
+    MODE_B_RELATION_VERSION, ModeBPublicInstance, ModeBRelation, ModeBRelationError,
+    PRIME_RAM_ADDRESS_BITS, PRIME_RAM_FORMAT, PRIME_RAM_LANE_BITS, PRIME_RAM_STORAGE_BITS,
+    PRIME_RAM_TIME_BITS, PrimeFieldRamConfig, PublicBinding, R1csRow, RamAccess, RamAccessKind,
+    RamWitness, StorageRelation,
+};
+pub use trace_audit::{
+    BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
+    TraceDigest, WireAuthPath, WireOpening, commit_boolar_trace,
 };
 pub use typed::TypedVoleValue;
 
