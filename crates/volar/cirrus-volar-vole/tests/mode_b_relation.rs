@@ -179,6 +179,68 @@ fn relation_rejects_ram_values_outside_the_fixed_extension_abi() {
 }
 
 #[test]
+fn unified_exporter_has_one_non_overlapping_coordinate_system() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let challenges = PrimeRamPermutationChallenges {
+        gamma: [1, 2, 3, 4, 5],
+        eta: [6, 7, 8, 9, 10],
+    };
+    let export = relation
+        .export_unified_r1cs(&circuit, Some(&challenges))
+        .unwrap();
+    let ram = export.ram.as_ref().unwrap();
+    let permutation = export.permutation.as_ref().unwrap();
+    assert_eq!(export.primary_offset, PrimeRamR1cs::new(2).variable_count);
+    assert_eq!(permutation.variable_count, export.variable_count);
+    assert!(export.public_bindings.iter().all(|binding| match binding {
+        cirrus_volar_vole::PublicBinding::Input { wire, .. }
+        | cirrus_volar_vole::PublicBinding::Output { wire, .. } => *wire >= export.primary_offset,
+    }));
+    assert!(ram.rows.iter().all(|row| {
+        row.a
+            .terms
+            .iter()
+            .chain(row.b.terms.iter())
+            .chain(row.c.terms.iter())
+            .all(|(variable, _)| *variable < export.variable_count)
+    }));
+    assert!(matches!(
+        relation.export_unified_r1cs(&circuit, None),
+        Err(ModeBRelationError::MissingRamPermutationChallenges)
+    ));
+}
+
+#[test]
+fn unified_exporter_rejects_ram_challenges_without_storage() {
+    let circuit = half_adder();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let challenges = PrimeRamPermutationChallenges {
+        gamma: [0; 5],
+        eta: [0; 5],
+    };
+    assert!(matches!(
+        relation.export_unified_r1cs(&circuit, Some(&challenges)),
+        Err(ModeBRelationError::UnexpectedRamPermutationChallenges)
+    ));
+    let export = relation.export_unified_r1cs(&circuit, None).unwrap();
+    assert_eq!(export.primary_offset, 0);
+    assert_eq!(export.variable_count, relation.witness_count);
+}
+
+#[test]
+fn prime_ram_r1cs_binds_execution_records_to_boolar_wires() {
+    let circuit = storage_write_then_read();
+    let static_layout = PrimeRamR1cs::new(2);
+    let layout = PrimeRamR1cs::for_boolar(&circuit, static_layout.variable_count).unwrap();
+    assert!(layout.variable_count >= static_layout.variable_count + 4);
+    assert!(matches!(
+        PrimeRamR1cs::for_boolar(&circuit, 0),
+        Err(ModeBRelationError::RamVariableLayoutOverlap)
+    ));
+}
+
+#[test]
 fn prime_ram_r1cs_has_a_deterministic_static_scan_layout() {
     let a = PrimeRamR1cs::new(2);
     let b = PrimeRamR1cs::new(2);

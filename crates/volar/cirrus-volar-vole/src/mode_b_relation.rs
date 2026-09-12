@@ -279,6 +279,28 @@ pub struct PrimeRamPermutationR1cs {
     pub z: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
 }
 
+/// One frozen, backend-ready variable layout for the complete supported
+/// Boolar relation. RAM variables begin at zero, followed by the primary
+/// Boolar wires and gate helpers, followed by permutation-product variables.
+/// All rows use this one coordinate system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnifiedR1cs {
+    /// Structural circuit binding for the exported relation.
+    pub circuit_id: CircuitId,
+    /// Total number of variables addressed by the rows.
+    pub variable_count: usize,
+    /// Static Boolar, RAM, and challenge-bound permutation constraints.
+    pub rows: Vec<R1csRow>,
+    /// Public bindings rewritten into this unified coordinate system.
+    pub public_bindings: Vec<PublicBinding>,
+    /// First unified slot assigned to Boolar primary wires/helpers.
+    pub primary_offset: usize,
+    /// RAM layout, when the circuit has storage.
+    pub ram: Option<PrimeRamR1cs>,
+    /// Challenge-bound RAM permutation layout, when storage is present.
+    pub permutation: Option<PrimeRamPermutationR1cs>,
+}
+
 impl PrimeRamR1cs {
     /// Emit the fixed-variable-order rows for `access_count` RAM records.
     ///
@@ -429,6 +451,88 @@ impl PrimeRamR1cs {
         }
     }
 
+    /// Build the RAM rows and bind each execution-table record to the actual
+    /// Boolar circuit statement. `primary_wire_offset` is the first Boolar
+    /// wire in the enclosing R1CS variable ordering; it prevents a backend
+    /// from proving a detached RAM table.
+    pub fn for_boolar<P: Clone>(
+        circuit: &BCircuit<P>,
+        primary_wire_offset: usize,
+    ) -> Result<Self, ModeBRelationError> {
+        let storage =
+            storage_relation(circuit).expect("caller only uses RAM layout for storage circuits");
+        validate_prime_ram_bounds(circuit, &storage, &PrimeFieldRamConfig::default())?;
+        let mut layout = Self::new(storage.access_count);
+        if primary_wire_offset < layout.variable_count {
+            return Err(ModeBRelationError::RamVariableLayoutOverlap);
+        }
+        let mut index = 0;
+        for segment in &circuit.pre_init {
+            for (offset, value) in segment.data.iter().copied().enumerate() {
+                bind_execution_record_constants(
+                    &mut layout.rows,
+                    &layout.execution[index],
+                    segment.storage,
+                    segment.lane,
+                    &increment_address(&segment.addr, offset),
+                    index,
+                    RamAccessKind::Write,
+                    value,
+                );
+                index += 1;
+            }
+        }
+        for (statement, node) in circuit.stmts.iter().enumerate() {
+            let wire = circuit.params as usize + statement;
+            match &node.kind {
+                BIrStmt::StorageRead {
+                    storage,
+                    lane,
+                    addr,
+                } => {
+                    bind_execution_record_wires(
+                        &mut layout.rows,
+                        &layout.execution[index],
+                        *storage,
+                        *lane,
+                        addr,
+                        index,
+                        RamAccessKind::Read,
+                        primary_wire_offset,
+                        wire,
+                    )?;
+                    index += 1;
+                }
+                BIrStmt::StorageWrite {
+                    storage,
+                    lane,
+                    addr,
+                    src,
+                } => {
+                    let source = value_wire(0, wire, *src)?;
+                    bind_execution_record_wires(
+                        &mut layout.rows,
+                        &layout.execution[index],
+                        *storage,
+                        *lane,
+                        addr,
+                        index,
+                        RamAccessKind::Write,
+                        primary_wire_offset,
+                        source,
+                    )?;
+                    index += 1;
+                }
+                _ => {}
+            }
+        }
+        debug_assert_eq!(index, layout.execution.len());
+        layout.variable_count = layout
+            .variable_count
+            .max(primary_wire_offset + circuit.params as usize + circuit.stmts.len());
+        Ok(layout)
+    }
+
     /// Append explicit quintic-extension grand-product rows for transcript
     /// challenges. This realizes `Z[i+1] * (gamma + R(Q[i])) = Z[i] *
     /// (gamma + R(E[i]))`, with fixed `Z[0] = Z[n] = 1`.
@@ -463,6 +567,87 @@ impl PrimeRamR1cs {
             z,
         }
     }
+}
+
+fn bind_execution_record_constants(
+    rows: &mut Vec<R1csRow>,
+    record: &PrimeRamRecordLayout,
+    storage: StorageId,
+    lane: LaneId,
+    address: &[bool],
+    time: usize,
+    kind: RamAccessKind,
+    value: bool,
+) {
+    bind_constant_bits(rows, &record.storage, storage.0 as u64);
+    bind_constant_bits(rows, &record.lane, lane.0 as u64);
+    bind_address_constants(rows, &record.address, address);
+    bind_constant_bits(rows, &record.time, time as u64);
+    rows.push(equal_constant_row(
+        record.kind,
+        i64::from(kind == RamAccessKind::Write),
+    ));
+    rows.push(equal_constant_row(record.value, i64::from(value)));
+}
+
+fn bind_execution_record_wires(
+    rows: &mut Vec<R1csRow>,
+    record: &PrimeRamRecordLayout,
+    storage: StorageId,
+    lane: LaneId,
+    address: &[IRVarId],
+    time: usize,
+    kind: RamAccessKind,
+    primary_wire_offset: usize,
+    value: usize,
+) -> Result<(), ModeBRelationError> {
+    bind_constant_bits(rows, &record.storage, storage.0 as u64);
+    bind_constant_bits(rows, &record.lane, lane.0 as u64);
+    for (destination, source) in record.address.iter().zip(address) {
+        rows.push(equal_variables_row(
+            *destination,
+            value_wire(primary_wire_offset, usize::MAX, *source)?,
+        ));
+    }
+    for destination in record.address.iter().skip(address.len()) {
+        rows.push(equal_constant_row(*destination, 0));
+    }
+    bind_constant_bits(rows, &record.time, time as u64);
+    rows.push(equal_constant_row(
+        record.kind,
+        i64::from(kind == RamAccessKind::Write),
+    ));
+    rows.push(equal_variables_row(
+        record.value,
+        primary_wire_offset + value,
+    ));
+    Ok(())
+}
+
+fn bind_constant_bits(rows: &mut Vec<R1csRow>, variables: &[usize], value: u64) {
+    for (bit, variable) in variables.iter().enumerate() {
+        rows.push(equal_constant_row(*variable, ((value >> bit) & 1) as i64));
+    }
+}
+
+fn bind_address_constants(rows: &mut Vec<R1csRow>, variables: &[usize], address: &[bool]) {
+    for (bit, variable) in variables.iter().enumerate() {
+        rows.push(equal_constant_row(
+            *variable,
+            i64::from(address.get(bit).copied().unwrap_or(false)),
+        ));
+    }
+}
+
+fn value_wire(offset: usize, current: usize, value: IRVarId) -> Result<usize, ModeBRelationError> {
+    let value = value.0 as usize;
+    if value >= current {
+        return Err(ModeBRelationError::InvalidWireReference {
+            wire: current,
+            referenced: value as u32,
+        });
+    }
+    Ok(offset + value)
 }
 
 fn cell_bits_msb_first(record: &PrimeRamRecordLayout) -> Vec<usize> {
@@ -738,6 +923,25 @@ fn allocate_record(next: &mut usize, rows: &mut Vec<R1csRow>) -> PrimeRamRecordL
         key,
     }
 }
+fn shift_row(row: &R1csRow, offset: usize) -> R1csRow {
+    R1csRow {
+        a: shift_linear_combination(&row.a, offset),
+        b: shift_linear_combination(&row.b, offset),
+        c: shift_linear_combination(&row.c, offset),
+    }
+}
+
+fn shift_linear_combination(value: &LinearCombination, offset: usize) -> LinearCombination {
+    LinearCombination {
+        constant: value.constant,
+        terms: value
+            .terms
+            .iter()
+            .map(|(variable, coefficient)| (offset + variable, *coefficient))
+            .collect(),
+    }
+}
+
 fn lc_one_minus(variable: usize) -> LinearCombination {
     LinearCombination::constant(1).add(variable, -1)
 }
@@ -900,6 +1104,12 @@ pub enum ModeBRelationError {
     CircuitIdMismatch,
     /// A materialized prime-RAM row does not match the canonical RAM witness.
     RamMaterializationMismatch,
+    /// RAM auxiliaries and primary Boolar wires were assigned overlapping slots.
+    RamVariableLayoutOverlap,
+    /// A storage-bearing unified export requires transcript-derived RAM challenges.
+    MissingRamPermutationChallenges,
+    /// A storage-free unified export must not receive RAM challenges.
+    UnexpectedRamPermutationChallenges,
     /// A circuit exceeds the fixed KoalaBear-quintic RAM ABI bounds.
     RamBoundsExceeded {
         /// Bounded RAM field that exceeded its configured width or count.
@@ -943,6 +1153,15 @@ impl fmt::Display for ModeBRelationError {
             Self::CircuitIdMismatch => f.write_str("circuit does not match relation circuit_id"),
             Self::RamMaterializationMismatch => {
                 f.write_str("prime-RAM materialization does not match canonical RAM witness")
+            }
+            Self::RamVariableLayoutOverlap => {
+                f.write_str("prime-RAM and primary-wire R1CS slots overlap")
+            }
+            Self::MissingRamPermutationChallenges => {
+                f.write_str("storage-bearing unified export requires RAM permutation challenges")
+            }
+            Self::UnexpectedRamPermutationChallenges => {
+                f.write_str("storage-free unified export received RAM permutation challenges")
             }
             Self::RamBoundsExceeded {
                 field,
@@ -1072,6 +1291,72 @@ impl ModeBRelation {
             public_bindings,
             prime_ram: storage.as_ref().map(|_| PrimeFieldRamConfig::default()),
             storage,
+        })
+    }
+
+    /// Export all supported Boolar, RAM, and permutation constraints in one
+    /// variable coordinate system. Challenges must be derived after committing
+    /// the RAM columns; this method deliberately accepts them rather than
+    /// deriving prover-selectable values.
+    pub fn export_unified_r1cs<P: Clone>(
+        &self,
+        circuit: &BCircuit<P>,
+        challenges: Option<&PrimeRamPermutationChallenges>,
+    ) -> Result<UnifiedR1cs, ModeBRelationError> {
+        if self.circuit_id != structural_circuit_id(circuit) {
+            return Err(ModeBRelationError::CircuitIdMismatch);
+        }
+        match (&self.storage, challenges) {
+            (Some(_), None) => return Err(ModeBRelationError::MissingRamPermutationChallenges),
+            (None, Some(_)) => return Err(ModeBRelationError::UnexpectedRamPermutationChallenges),
+            _ => {}
+        }
+
+        let mut rows;
+        let (primary_offset, ram, permutation) = if self.storage.is_some() {
+            let static_ram =
+                PrimeRamR1cs::new(self.storage.as_ref().expect("checked").access_count);
+            let primary_offset = static_ram.variable_count;
+            let mut ram = PrimeRamR1cs::for_boolar(circuit, primary_offset)?;
+            // `for_boolar` knows the primary wire span; helpers are allocated
+            // by the Boolar lowering and immediately follow that span.
+            ram.variable_count = primary_offset + self.witness_count;
+            let permutation = ram.permutation_rows(challenges.expect("checked above"));
+            rows = ram.rows.clone();
+            rows.extend(permutation.rows.iter().cloned());
+            (primary_offset, Some(ram), Some(permutation))
+        } else {
+            rows = Vec::new();
+            (0, None, None)
+        };
+        rows.extend(self.rows.iter().map(|row| shift_row(row, primary_offset)));
+        let public_bindings = self
+            .public_bindings
+            .iter()
+            .map(|binding| match *binding {
+                PublicBinding::Input { index, wire } => PublicBinding::Input {
+                    index,
+                    wire: primary_offset + wire,
+                },
+                PublicBinding::Output { index, wire } => PublicBinding::Output {
+                    index,
+                    wire: primary_offset + wire,
+                },
+            })
+            .collect();
+        let variable_count = permutation
+            .as_ref()
+            .map_or(primary_offset + self.witness_count, |layout| {
+                layout.variable_count
+            });
+        Ok(UnifiedR1cs {
+            circuit_id: self.circuit_id,
+            variable_count,
+            rows,
+            public_bindings,
+            primary_offset,
+            ram,
+            permutation,
         })
     }
 
