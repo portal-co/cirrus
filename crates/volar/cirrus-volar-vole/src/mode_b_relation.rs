@@ -7,7 +7,7 @@
 //! Boolar semantics.
 
 use alloc::{vec, vec::Vec};
-use core::fmt;
+use core::{cmp::Ordering, fmt};
 use sha3::{Digest, Sha3_256};
 use volar_ir::{
     boolar::{BIrStmt, LaneId},
@@ -150,7 +150,7 @@ pub enum RamAccessKind {
 
 /// A canonical RAM access record. Addresses remain bit vectors so a target
 /// field cannot silently truncate an address during lowering.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RamAccess {
     pub storage: StorageId,
     pub lane: LaneId,
@@ -166,6 +166,65 @@ pub struct RamAccess {
 pub struct RamWitness {
     pub execution: Vec<RamAccess>,
     pub address_sorted: Vec<RamAccess>,
+}
+
+/// A RAM record represented in the canonical KoalaBear-quintic polynomial
+/// basis. Coefficients are always canonical base-field representatives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamRecord {
+    /// `(K0, K1, K2, K3, K4)` for the packed record key.
+    pub key: [u32; KOALABEAR_QUINTIC_DEGREE],
+    /// The separately constrained Boolean value column.
+    pub value: bool,
+}
+
+/// One materialized row of the sorted-table latest-value scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamScanRow {
+    /// Canonical packed sorted-table record.
+    pub record: PrimeRamRecord,
+    /// Whether this row has the same `(storage, lane, address)` as its predecessor.
+    pub same_cell: bool,
+    /// `(!same_cell) & read`.
+    pub first_read: bool,
+    /// `same_cell & read`.
+    pub later_read: bool,
+    /// `(!same_cell) & write`.
+    pub first_write: bool,
+    /// `same_cell & write`.
+    pub later_write: bool,
+    /// Latest value before this row (zero for a new cell).
+    pub prior_latest: bool,
+    /// Latest value after this row.
+    pub latest: bool,
+}
+
+/// Concrete prime-RAM witness layout emitted before backend-specific field
+/// encoding. It materializes permutation inputs and every selector/value in
+/// the sorted latest-value scan; it is not itself a Spartan-WHIR proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimeRamMaterialization {
+    /// Execution table after quintic key packing.
+    pub execution: Vec<PrimeRamRecord>,
+    /// Address/time sorted table plus explicit scan auxiliaries.
+    pub sorted: Vec<PrimeRamScanRow>,
+}
+
+impl Ord for RamAccess {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.storage
+            .cmp(&other.storage)
+            .then_with(|| self.lane.cmp(&other.lane))
+            .then_with(|| self.address.iter().rev().cmp(other.address.iter().rev()))
+            .then_with(|| self.time.cmp(&other.time))
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| self.value.cmp(&other.value))
+    }
+}
+impl PartialOrd for RamAccess {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Canonical public statement for a relation invocation.
@@ -225,6 +284,17 @@ pub enum ModeBRelationError {
     InvalidRamRead { time: usize },
     /// The relation/circuit pair is not the one from which the relation arose.
     CircuitIdMismatch,
+    /// A materialized prime-RAM row does not match the canonical RAM witness.
+    RamMaterializationMismatch,
+    /// A circuit exceeds the fixed KoalaBear-quintic RAM ABI bounds.
+    RamBoundsExceeded {
+        /// Bounded RAM field that exceeded its configured width or count.
+        field: &'static str,
+        /// Inclusive maximum allowed by the fixed ABI.
+        maximum: u64,
+        /// Value requested by the circuit.
+        found: u64,
+    },
 }
 impl fmt::Display for ModeBRelationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -257,6 +327,17 @@ impl fmt::Display for ModeBRelationError {
             }
             Self::InvalidRamRead { time } => write!(f, "RAM read at time {time} is invalid"),
             Self::CircuitIdMismatch => f.write_str("circuit does not match relation circuit_id"),
+            Self::RamMaterializationMismatch => {
+                f.write_str("prime-RAM materialization does not match canonical RAM witness")
+            }
+            Self::RamBoundsExceeded {
+                field,
+                maximum,
+                found,
+            } => write!(
+                f,
+                "RAM {field} value {found} exceeds configured maximum {maximum}"
+            ),
         }
     }
 }
@@ -364,6 +445,10 @@ impl ModeBRelation {
                 wire: v.0 as usize,
             }
         }));
+        let storage = storage_relation(circuit);
+        if let Some(storage) = &storage {
+            validate_prime_ram_bounds(circuit, storage, &PrimeFieldRamConfig::default())?;
+        }
         Ok(Self {
             version: MODE_B_RELATION_VERSION,
             circuit_id: structural_circuit_id(circuit),
@@ -371,8 +456,8 @@ impl ModeBRelation {
             witness_count: helpers,
             rows,
             public_bindings,
-            storage: storage_relation(circuit),
-            prime_ram: storage_relation(circuit).map(|_| PrimeFieldRamConfig::default()),
+            prime_ram: storage.as_ref().map(|_| PrimeFieldRamConfig::default()),
+            storage,
         })
     }
 
@@ -555,6 +640,87 @@ impl ModeBPublicInstance {
     }
 }
 
+impl PrimeRamMaterialization {
+    /// Materialize the fixed KoalaBear-quintic RAM ABI from a canonical RAM
+    /// witness. `ram` must already satisfy the execution/permutation/read
+    /// reference relation; this method independently checks the scan values.
+    pub fn from_ram_witness(ram: &RamWitness) -> Result<Self, ModeBRelationError> {
+        verify_ram(ram)?;
+        let execution = ram
+            .execution
+            .iter()
+            .map(pack_prime_ram_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sorted = Vec::with_capacity(ram.address_sorted.len());
+        let mut previous: Option<&RamAccess> = None;
+        let mut latest = false;
+        for access in &ram.address_sorted {
+            let same_cell = previous.is_some_and(|prior| same_ram_cell(prior, access));
+            let prior_latest = if same_cell { latest } else { false };
+            let read = access.kind == RamAccessKind::Read;
+            let first_read = !same_cell && read;
+            let later_read = same_cell && read;
+            let first_write = !same_cell && !read;
+            let later_write = same_cell && !read;
+            latest = if read { prior_latest } else { access.value };
+            sorted.push(PrimeRamScanRow {
+                record: pack_prime_ram_record(access)?,
+                same_cell,
+                first_read,
+                later_read,
+                first_write,
+                later_write,
+                prior_latest,
+                latest,
+            });
+            previous = Some(access);
+        }
+        let materialized = Self { execution, sorted };
+        materialized.validate_against(ram)?;
+        Ok(materialized)
+    }
+
+    /// Validate the materialized permutation keys, selectors, and latest-value
+    /// scan against the canonical RAM tables.
+    pub fn validate_against(&self, ram: &RamWitness) -> Result<(), ModeBRelationError> {
+        if self.execution.len() != ram.execution.len()
+            || self.sorted.len() != ram.address_sorted.len()
+        {
+            return Err(ModeBRelationError::RamMaterializationMismatch);
+        }
+        for (record, access) in self.execution.iter().zip(&ram.execution) {
+            if record != &pack_prime_ram_record(access)? {
+                return Err(ModeBRelationError::RamMaterializationMismatch);
+            }
+        }
+        let mut prior: Option<&RamAccess> = None;
+        for (index, (row, access)) in self.sorted.iter().zip(&ram.address_sorted).enumerate() {
+            let same = prior.is_some_and(|p| same_ram_cell(p, access));
+            let read = access.kind == RamAccessKind::Read;
+            let prior_latest = if same {
+                self.sorted[index - 1].latest
+            } else {
+                false
+            };
+            let expected_latest = if read { prior_latest } else { access.value };
+            if row.record != pack_prime_ram_record(access)?
+                || row.same_cell != same
+                || row.first_read != (!same && read)
+                || row.later_read != (same && read)
+                || row.first_write != (!same && !read)
+                || row.later_write != (same && !read)
+                || row.prior_latest != prior_latest
+                || row.latest != expected_latest
+                || (read && access.value != prior_latest)
+            {
+                return Err(ModeBRelationError::RamMaterializationMismatch);
+            }
+            prior = Some(access);
+        }
+        Ok(())
+    }
+}
+
 impl RamWitness {
     /// Derive the execution and canonical sorted table from a Boolar witness.
     pub fn from_boolar<P: Clone>(
@@ -568,7 +734,7 @@ impl RamWitness {
                 execution.push(RamAccess {
                     storage: segment.storage,
                     lane: segment.lane,
-                    address: increment_address(&segment.addr, offset),
+                    address: normalize_address(increment_address(&segment.addr, offset)),
                     time,
                     kind: RamAccessKind::Write,
                     value,
@@ -587,7 +753,7 @@ impl RamWitness {
                     execution.push(RamAccess {
                         storage: *storage,
                         lane: *lane,
-                        address: address_value(values, wire, addr)?,
+                        address: normalize_address(address_value(values, wire, addr)?),
                         time,
                         kind: RamAccessKind::Read,
                         value: values[wire],
@@ -603,7 +769,7 @@ impl RamWitness {
                     execution.push(RamAccess {
                         storage: *storage,
                         lane: *lane,
-                        address: address_value(values, wire, addr)?,
+                        address: normalize_address(address_value(values, wire, addr)?),
                         time,
                         kind: RamAccessKind::Write,
                         value: value_at(values, wire, *src)?,
@@ -628,6 +794,37 @@ fn eval(l: &LinearCombination, values: &[bool]) -> i64 {
             .iter()
             .map(|(v, c)| if values[*v] { *c } else { 0 })
             .sum::<i64>()
+}
+
+fn pack_prime_ram_record(access: &RamAccess) -> Result<PrimeRamRecord, ModeBRelationError> {
+    if access.address.len() != PRIME_RAM_ADDRESS_BITS || access.time > u32::MAX as usize {
+        return Err(ModeBRelationError::RamMaterializationMismatch);
+    }
+    let address = bits_to_u32(&access.address);
+    let kind = u32::from(access.kind == RamAccessKind::Write);
+    let lane = access.lane.0;
+    let key = [
+        access.storage.0 | ((lane & 0x3fff) << 16),
+        ((lane >> 14) & 0x3) | ((address & 0x0fffffff) << 2),
+        ((address >> 28) & 0xf) | ((access.time as u32 & 0x03ff_ffff) << 4),
+        ((access.time as u32 >> 26) & 0x3f) | (kind << 6),
+        0,
+    ];
+    Ok(PrimeRamRecord {
+        key,
+        value: access.value,
+    })
+}
+
+fn bits_to_u32(bits: &[bool]) -> u32 {
+    bits.iter()
+        .take(32)
+        .enumerate()
+        .fold(0, |value, (i, bit)| value | (u32::from(*bit) << i))
+}
+
+fn same_ram_cell(a: &RamAccess, b: &RamAccess) -> bool {
+    a.storage == b.storage && a.lane == b.lane && a.address == b.address
 }
 
 fn verify_ram(ram: &RamWitness) -> Result<(), ModeBRelationError> {
@@ -675,6 +872,11 @@ fn value_at(values: &[bool], current: usize, value: IRVarId) -> Result<bool, Mod
         Ok(values[i])
     }
 }
+fn normalize_address(mut address: Vec<bool>) -> Vec<bool> {
+    address.resize(PRIME_RAM_ADDRESS_BITS, false);
+    address
+}
+
 fn increment_address(address: &[bool], mut offset: usize) -> Vec<bool> {
     let mut result = Vec::with_capacity(address.len());
     let mut carry = false;
@@ -685,6 +887,51 @@ fn increment_address(address: &[bool], mut offset: usize) -> Vec<bool> {
         offset >>= 1;
     }
     result
+}
+
+fn validate_prime_ram_bounds<P: Clone>(
+    circuit: &BCircuit<P>,
+    storage: &StorageRelation,
+    config: &PrimeFieldRamConfig,
+) -> Result<(), ModeBRelationError> {
+    debug_assert!(config.validate());
+    let max_storage = (1_u64 << config.storage_bits) - 1;
+    let max_lane = (1_u64 << config.lane_bits) - 1;
+    let max_accesses = 1_u64 << config.time_bits;
+    for (storage_id, lane_id) in &storage.domains {
+        if u64::from(storage_id.0) > max_storage {
+            return Err(ModeBRelationError::RamBoundsExceeded {
+                field: "storage ID",
+                maximum: max_storage,
+                found: u64::from(storage_id.0),
+            });
+        }
+        if u64::from(lane_id.0) > max_lane {
+            return Err(ModeBRelationError::RamBoundsExceeded {
+                field: "lane ID",
+                maximum: max_lane,
+                found: u64::from(lane_id.0),
+            });
+        }
+    }
+    if storage.max_address_bits > config.address_bits {
+        return Err(ModeBRelationError::RamBoundsExceeded {
+            field: "address width",
+            maximum: config.address_bits as u64,
+            found: storage.max_address_bits as u64,
+        });
+    }
+    if (storage.access_count as u64) > max_accesses {
+        return Err(ModeBRelationError::RamBoundsExceeded {
+            field: "access count",
+            maximum: max_accesses,
+            found: storage.access_count as u64,
+        });
+    }
+    // `storage_relation` is computed from exactly these circuit fields. Keep
+    // this argument to make the validation boundary explicit and future-proof.
+    let _ = circuit;
+    Ok(())
 }
 
 fn storage_relation<P: Clone>(circuit: &BCircuit<P>) -> Option<StorageRelation> {

@@ -149,23 +149,25 @@ exceeds these bounds. Every bit below has `b(b-1)=0`; integers are represented
 by little-endian bit vectors, not host integers. The `kind` bit encodes
 `read=0`, `write=1`.
 
-Split the 97-bit key prefix across extension coefficients, all below `p`:
+Split the 97-bit key prefix across extension coefficients, with every packed
+coefficient below `2^30 < p` (a 32-bit coefficient would overflow KoalaBear):
 
 ```text
-K0 = storage + 2^16 lane                       # 32 bits
-K1 = address_low_32                            # 32 bits
-K2 = time_low_32                               # 32 bits
-K3 = kind                                      # 1 bit
+K0 = storage[0..16] + 2^16 lane[0..14]         # 30 bits
+K1 = lane[14..16] + 2^2 address[0..28]         # 30 bits
+K2 = address[28..32] + 2^4 time[0..26]         # 30 bits
+K3 = time[26..32] + 2^6 kind                   # 7 bits
 K4 = 0
 K(r) = (K0, K1, K2, K3, K4) in F
 ```
 
-This is injective in the extension's canonical polynomial basis and avoids
-both a base-field overflow and a field-element reduction. The remaining
-extension-coordinate capacity is **not** implicitly repurposed. `value`
-remains a Boolean column and is compressed with an independently sampled
-extension challenge. The field polynomial, modulus, bounds, coefficient order,
-bit order, and format string are circuit-ID/exporter ABI.
+The ranges are little-endian half-open bit ranges. This is injective in the
+extension's canonical polynomial basis and avoids both base-field overflow and
+field-element reduction. The remaining extension-coordinate capacity is **not**
+implicitly repurposed. `value` remains a Boolean column and is compressed with
+an independently sampled extension challenge. The field polynomial, modulus,
+bounds, coefficient order, bit order, and format string are circuit-ID/exporter
+ABI.
 
 ### Permutation rows
 

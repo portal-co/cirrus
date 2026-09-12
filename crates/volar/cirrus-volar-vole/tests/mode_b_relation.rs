@@ -83,6 +83,13 @@ fn ram_relation_accepts_canonical_witness_and_rejects_bad_read() {
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
     let witness = [true, true, false, true];
     let ram = cirrus_volar_vole::RamWitness::from_boolar(&circuit, &witness).unwrap();
+    let materialized = cirrus_volar_vole::PrimeRamMaterialization::from_ram_witness(&ram).unwrap();
+    assert_eq!(materialized.execution.len(), 2);
+    assert_eq!(materialized.sorted.len(), 2);
+    assert!(materialized.sorted[0].first_write);
+    assert!(materialized.sorted[1].later_read);
+    assert!(materialized.sorted[1].prior_latest);
+    assert!(materialized.sorted[1].latest);
     relation
         .evaluate_bool_with_ram(&circuit, &witness, &[true, true], &[true], Some(&ram))
         .unwrap();
@@ -123,6 +130,52 @@ fn koalabear_quintic_ram_format_has_a_full_32_bit_address_space() {
     let mut invalid = config;
     invalid.address_bits = 31;
     assert!(!invalid.validate());
+}
+
+fn storage_bound_circuit(storage: StorageId, lane: LaneId, address_bits: usize) -> BCircuit {
+    BCircuit {
+        params: address_bits as u32 + 1,
+        stmts: vec![Node::new(
+            BIrStmt::StorageWrite {
+                storage,
+                lane,
+                src: IRVarId(address_bits as u32),
+                addr: (0..address_bits as u32).map(IRVarId).collect(),
+            },
+            (),
+            None,
+        )],
+        pre_init: vec![],
+        outputs: vec![],
+    }
+}
+
+#[test]
+fn relation_rejects_ram_values_outside_the_fixed_extension_abi() {
+    let bad_storage = storage_bound_circuit(StorageId(1 << 16), LaneId(0), 1);
+    assert!(matches!(
+        ModeBRelation::from_boolar(&bad_storage),
+        Err(ModeBRelationError::RamBoundsExceeded {
+            field: "storage ID",
+            ..
+        })
+    ));
+    let bad_lane = storage_bound_circuit(StorageId(0), LaneId(1 << 16), 1);
+    assert!(matches!(
+        ModeBRelation::from_boolar(&bad_lane),
+        Err(ModeBRelationError::RamBoundsExceeded {
+            field: "lane ID",
+            ..
+        })
+    ));
+    let bad_address = storage_bound_circuit(StorageId(0), LaneId(0), 33);
+    assert!(matches!(
+        ModeBRelation::from_boolar(&bad_address),
+        Err(ModeBRelationError::RamBoundsExceeded {
+            field: "address width",
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -44,8 +44,8 @@ pub use mode_b_relation::{
     CircuitId, KOALABEAR_MODULUS, KOALABEAR_QUINTIC_DEGREE, LinearCombination,
     MODE_B_RELATION_VERSION, ModeBPublicInstance, ModeBRelation, ModeBRelationError,
     PRIME_RAM_ADDRESS_BITS, PRIME_RAM_FORMAT, PRIME_RAM_LANE_BITS, PRIME_RAM_STORAGE_BITS,
-    PRIME_RAM_TIME_BITS, PrimeFieldRamConfig, PublicBinding, R1csRow, RamAccess, RamAccessKind,
-    RamWitness, StorageRelation,
+    PRIME_RAM_TIME_BITS, PrimeFieldRamConfig, PrimeRamMaterialization, PrimeRamRecord,
+    PrimeRamScanRow, PublicBinding, R1csRow, RamAccess, RamAccessKind, RamWitness, StorageRelation,
 };
 pub use trace_audit::{
     BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
