@@ -31,6 +31,8 @@ mod hook;
 pub mod iop_accumulator;
 mod locked;
 mod mode_b_relation;
+#[cfg(feature = "spartan-whir-adapter")]
+mod spartan_whir_adapter;
 mod trace_audit;
 mod typed;
 
@@ -49,7 +51,10 @@ pub use mode_b_relation::{
     PrimeRamPermutationR1cs, PrimeRamR1cs, PrimeRamRecord, PrimeRamRecordLayout,
     PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess, RamAccessKind,
     RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation, UnifiedR1cs,
+    UnifiedR1csWitness,
 };
+#[cfg(feature = "spartan-whir-adapter")]
+pub use spartan_whir_adapter::{SpartanWhirAdapterShape, SpartanWhirAdapterWitness};
 pub use trace_audit::{
     BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
     TraceDigest, WireAuthPath, WireOpening, commit_boolar_trace,

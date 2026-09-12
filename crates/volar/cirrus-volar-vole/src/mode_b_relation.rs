@@ -322,6 +322,13 @@ pub struct KoalaBearR1csRow {
     pub c: KoalaBearLinearCombination,
 }
 
+/// A complete assignment in the frozen [`UnifiedR1cs`] variable order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnifiedR1csWitness {
+    /// Canonical KoalaBear values for every unified variable.
+    pub values: Vec<u32>,
+}
+
 /// The unified relation lowered to canonical KoalaBear base-field matrix
 /// coefficients. Extension arithmetic has already been expanded into these
 /// base-field rows; this type performs no extension-field encoding itself.
@@ -492,6 +499,30 @@ fn lower_spartan_lc(
 }
 
 impl UnifiedR1cs {
+    /// Check that a complete assignment satisfies every lowered base-field row.
+    pub fn evaluate_koalabear_witness(
+        &self,
+        witness: &UnifiedR1csWitness,
+    ) -> Result<(), ModeBRelationError> {
+        if witness.values.len() != self.variable_count {
+            return Err(ModeBRelationError::WrongUnifiedWitnessCount {
+                expected: self.variable_count,
+                found: witness.values.len(),
+            });
+        }
+        let lowered = self.lower_koalabear()?;
+        for (row, constraint) in lowered.rows.iter().enumerate() {
+            if kb_lc_value(&constraint.a, &witness.values)
+                * kb_lc_value(&constraint.b, &witness.values)
+                % u64::from(KOALABEAR_MODULUS)
+                != kb_lc_value(&constraint.c, &witness.values)
+            {
+                return Err(ModeBRelationError::UnsatisfiedUnifiedRow { row });
+            }
+        }
+        Ok(())
+    }
+
     /// Reduce signed relation coefficients modulo KoalaBear and canonicalize
     /// each sparse vector for a Spartan-WHIR matrix exporter.
     pub fn lower_koalabear(&self) -> Result<KoalaBearR1cs, ModeBRelationError> {
@@ -903,7 +934,7 @@ fn allocate_cell_order_gadget(
         let equality = allocate_boolean(next, rows);
         // equality = 1 - previous - current + 2*previous*current.
         rows.push(R1csRow {
-            a: LinearCombination::constant(1),
+            a: LinearCombination::constant(0),
             b: LinearCombination::constant(1),
             c: LinearCombination {
                 constant: -1,
@@ -942,7 +973,7 @@ fn allocate_cell_order_gadget(
     let mut selector_sum = lc_sum(&first_difference);
     selector_sum = selector_sum.add(same_cell, 1);
     rows.push(R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: LinearCombination {
             constant: -1,
@@ -973,7 +1004,7 @@ fn allocate_same_cell_time_order_gadget(
         ));
         let equality = allocate_boolean(next, rows);
         rows.push(R1csRow {
-            a: LinearCombination::constant(1),
+            a: LinearCombination::constant(0),
             b: LinearCombination::constant(1),
             c: LinearCombination {
                 constant: -1,
@@ -1006,7 +1037,7 @@ fn allocate_same_cell_time_order_gadget(
     }
     // A same-cell successor must have exactly one increasing first time bit.
     rows.push(R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: lc_sum(&first_difference).add(same_cell, -1),
     });
@@ -1072,7 +1103,7 @@ fn extension_product_rows(
             }
         }
         rows.push(R1csRow {
-            a: LinearCombination::constant(1),
+            a: LinearCombination::constant(0),
             b: LinearCombination::constant(1),
             c,
         });
@@ -1121,7 +1152,7 @@ fn allocate_record(next: &mut usize, rows: &mut Vec<R1csRow>) -> PrimeRamRecordL
         .enumerate()
     {
         rows.push(R1csRow {
-            a: LinearCombination::constant(1),
+            a: LinearCombination::constant(0),
             b: LinearCombination::constant(1),
             c: LinearCombination::var(key[coordinate])
                 .add_terms(terms.into_iter().map(|(v, c)| (v, -c)).collect()),
@@ -1137,6 +1168,290 @@ fn allocate_record(next: &mut usize, rows: &mut Vec<R1csRow>) -> PrimeRamRecordL
         key,
     }
 }
+fn assign_unified_value(
+    values: &mut [Option<u32>],
+    slot: usize,
+    value: u32,
+) -> Result<(), ModeBRelationError> {
+    let value = value % KOALABEAR_MODULUS;
+    match values.get_mut(slot) {
+        Some(existing @ None) => {
+            *existing = Some(value);
+            Ok(())
+        }
+        Some(Some(previous)) if *previous == value => Ok(()),
+        Some(_) => Err(ModeBRelationError::InconsistentUnifiedWitness { variable: slot }),
+        None => Err(ModeBRelationError::R1csVariableOutOfBounds {
+            variable: slot,
+            variable_count: values.len(),
+        }),
+    }
+}
+
+fn assign_ram_record(
+    values: &mut [Option<u32>],
+    layout: &PrimeRamRecordLayout,
+    access: &RamAccess,
+    record: &PrimeRamRecord,
+) -> Result<(), ModeBRelationError> {
+    for (i, slot) in layout.storage.iter().enumerate() {
+        assign_unified_value(values, *slot, (access.storage.0 >> i) & 1)?;
+    }
+    for (i, slot) in layout.lane.iter().enumerate() {
+        assign_unified_value(values, *slot, (access.lane.0 >> i) & 1)?;
+    }
+    for (i, slot) in layout.address.iter().enumerate() {
+        assign_unified_value(values, *slot, u32::from(access.address[i]))?;
+    }
+    for (i, slot) in layout.time.iter().enumerate() {
+        assign_unified_value(values, *slot, ((access.time >> i) & 1) as u32)?;
+    }
+    assign_unified_value(
+        values,
+        layout.kind,
+        u32::from(access.kind == RamAccessKind::Write),
+    )?;
+    assign_unified_value(values, layout.value, u32::from(record.value))?;
+    for (slot, value) in layout.key.iter().zip(record.key) {
+        assign_unified_value(values, *slot, value)?;
+    }
+    Ok(())
+}
+
+fn assign_sort_gadget_values(
+    values: &mut [Option<u32>],
+    layouts: &[PrimeRamScanLayout],
+    accesses: &[RamAccess],
+) -> Result<(), ModeBRelationError> {
+    for index in 1..layouts.len() {
+        let previous = &accesses[index - 1];
+        let current = &accesses[index];
+        let layout = &layouts[index];
+        let cell_previous = cell_bits_msb_first(&layouts[index - 1].record);
+        let cell_current = cell_bits_msb_first(&layout.record);
+        let mut prefix = true;
+        for (((previous_slot, current_slot), equal_slot), (prefix_slot, first_slot)) in
+            cell_previous
+                .iter()
+                .zip(cell_current)
+                .zip(&layout.cell_bit_equal)
+                .zip(
+                    layout
+                        .cell_prefix_equal
+                        .iter()
+                        .skip(1)
+                        .zip(&layout.cell_first_difference),
+                )
+        {
+            let previous_bit = values[*previous_slot] == Some(1);
+            let current_bit = values[current_slot] == Some(1);
+            let equal = previous_bit == current_bit;
+            assign_unified_value(values, *equal_slot, u32::from(equal))?;
+            assign_unified_value(values, *prefix_slot, u32::from(prefix && equal))?;
+            assign_unified_value(values, *first_slot, u32::from(prefix && !equal))?;
+            prefix &= equal;
+        }
+        if let Some(seed) = layout.cell_prefix_equal.first() {
+            assign_unified_value(values, *seed, 1)?;
+        }
+        let mut time_prefix = layout.same_cell != usize::MAX
+            && previous.storage == current.storage
+            && previous.lane == current.lane
+            && previous.address == current.address;
+        for (((previous_slot, current_slot), equal_slot), (prefix_slot, first_slot)) in layouts
+            [index - 1]
+            .record
+            .time
+            .iter()
+            .rev()
+            .zip(layout.record.time.iter().rev())
+            .zip(&layout.time_bit_equal)
+            .zip(
+                layout
+                    .time_prefix_equal
+                    .iter()
+                    .skip(1)
+                    .zip(&layout.time_first_difference),
+            )
+        {
+            let equal = values[*previous_slot] == values[*current_slot];
+            assign_unified_value(values, *equal_slot, u32::from(equal))?;
+            assign_unified_value(values, *prefix_slot, u32::from(time_prefix && equal))?;
+            assign_unified_value(values, *first_slot, u32::from(time_prefix && !equal))?;
+            time_prefix &= equal;
+        }
+    }
+    Ok(())
+}
+
+fn kb_lc_value(lc: &KoalaBearLinearCombination, values: &[u32]) -> u64 {
+    lc.terms
+        .iter()
+        .fold(u64::from(lc.constant), |sum, (slot, coefficient)| {
+            (sum + u64::from(*coefficient) * u64::from(values[*slot]))
+                % u64::from(KOALABEAR_MODULUS)
+        })
+}
+
+fn complete_unified_assignment(
+    rows: &KoalaBearR1cs,
+    values: &mut [Option<u32>],
+) -> Result<(), ModeBRelationError> {
+    let modulus = i64::from(KOALABEAR_MODULUS);
+    loop {
+        let mut progress = false;
+        for row in &rows.rows {
+            let a = known_kb_lc(&row.a, values, modulus);
+            let b = known_kb_lc(&row.b, values, modulus);
+            let c = known_kb_lc(&row.c, values, modulus);
+            if let (Some(a), Some(b), None) = (a, b, c) {
+                if let Some((slot, coefficient)) = single_unknown(&row.c, values) {
+                    let known = known_kb_lc_without(&row.c, values, modulus);
+                    let target = (a * b - known).rem_euclid(modulus);
+                    assign_unified_value(
+                        values,
+                        slot,
+                        (target * kb_inverse(coefficient, modulus)).rem_euclid(modulus) as u32,
+                    )?;
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn known_kb_lc(
+    lc: &KoalaBearLinearCombination,
+    values: &[Option<u32>],
+    modulus: i64,
+) -> Option<i64> {
+    if lc.terms.iter().any(|(slot, _)| values[*slot].is_none()) {
+        None
+    } else {
+        Some(known_kb_lc_without(lc, values, modulus))
+    }
+}
+fn known_kb_lc_without(
+    lc: &KoalaBearLinearCombination,
+    values: &[Option<u32>],
+    modulus: i64,
+) -> i64 {
+    lc.terms.iter().fold(
+        i64::from(lc.constant),
+        |sum, (slot, coefficient)| match values[*slot] {
+            Some(value) => (sum + i64::from(*coefficient) * i64::from(value)) % modulus,
+            None => sum,
+        },
+    )
+}
+fn single_unknown(lc: &KoalaBearLinearCombination, values: &[Option<u32>]) -> Option<(usize, i64)> {
+    let mut unknown = lc.terms.iter().filter(|(slot, _)| values[*slot].is_none());
+    let (slot, coefficient) = unknown.next()?;
+    unknown
+        .next()
+        .is_none()
+        .then_some((*slot, i64::from(*coefficient)))
+}
+fn kb_inverse(value: i64, modulus: i64) -> i64 {
+    let (mut a, mut b, mut x0, mut x1) = (value.rem_euclid(modulus), modulus, 1_i64, 0_i64);
+    while b != 0 {
+        let q = a / b;
+        (a, b, x0, x1) = (b, a - q * b, x1, x0 - q * x1);
+    }
+    x0.rem_euclid(modulus)
+}
+
+fn ram_permutation_products(
+    materialized: &PrimeRamMaterialization,
+    challenges: &PrimeRamPermutationChallenges,
+) -> Result<Vec<[u32; KOALABEAR_QUINTIC_DEGREE]>, ModeBRelationError> {
+    let mut z = vec![[0; KOALABEAR_QUINTIC_DEGREE]; materialized.execution.len() + 1];
+    z[0][0] = 1;
+    for index in 0..materialized.execution.len() {
+        let execution = compressed_record_value(&materialized.execution[index], challenges);
+        let sorted = compressed_record_value(&materialized.sorted[index].record, challenges);
+        z[index + 1] = ext_mul(ext_mul(z[index], execution), ext_inverse(sorted)?);
+    }
+    if z.last() != Some(&[1, 0, 0, 0, 0]) {
+        return Err(ModeBRelationError::RamPermutationEndpointMismatch);
+    }
+    Ok(z)
+}
+fn compressed_record_value(
+    record: &PrimeRamRecord,
+    challenges: &PrimeRamPermutationChallenges,
+) -> [u32; KOALABEAR_QUINTIC_DEGREE] {
+    core::array::from_fn(|i| {
+        (challenges.gamma[i].rem_euclid(i64::from(KOALABEAR_MODULUS)) as u32
+            + record.key[i]
+            + if record.value {
+                challenges.eta[i].rem_euclid(i64::from(KOALABEAR_MODULUS)) as u32
+            } else {
+                0
+            })
+            % KOALABEAR_MODULUS
+    })
+}
+fn ext_mul(
+    left: [u32; KOALABEAR_QUINTIC_DEGREE],
+    right: [u32; KOALABEAR_QUINTIC_DEGREE],
+) -> [u32; KOALABEAR_QUINTIC_DEGREE] {
+    let mut out = [0_u64; KOALABEAR_QUINTIC_DEGREE];
+    for i in 0..KOALABEAR_QUINTIC_DEGREE {
+        for j in 0..KOALABEAR_QUINTIC_DEGREE {
+            for (k, coefficient) in extension_monomial_reduction(i + j).iter().enumerate() {
+                out[k] = (out[k]
+                    + (i64::from(*coefficient) * i64::from(left[i]) * i64::from(right[j]))
+                        .rem_euclid(i64::from(KOALABEAR_MODULUS)) as u64)
+                    % u64::from(KOALABEAR_MODULUS);
+            }
+        }
+    }
+    out.map(|v| v as u32)
+}
+fn ext_inverse(
+    value: [u32; KOALABEAR_QUINTIC_DEGREE],
+) -> Result<[u32; KOALABEAR_QUINTIC_DEGREE], ModeBRelationError> {
+    let mut matrix = [[0_i64; 6]; KOALABEAR_QUINTIC_DEGREE];
+    for column in 0..KOALABEAR_QUINTIC_DEGREE {
+        let basis = core::array::from_fn(|i| u32::from(i == column));
+        let product = ext_mul(value, basis);
+        for row in 0..KOALABEAR_QUINTIC_DEGREE {
+            matrix[row][column] = i64::from(product[row]);
+        }
+    }
+    for row in 0..KOALABEAR_QUINTIC_DEGREE {
+        matrix[row][KOALABEAR_QUINTIC_DEGREE] = i64::from(row == 0);
+    }
+    let modulus = i64::from(KOALABEAR_MODULUS);
+    for pivot in 0..KOALABEAR_QUINTIC_DEGREE {
+        let swap = (pivot..KOALABEAR_QUINTIC_DEGREE)
+            .find(|row| matrix[*row][pivot] != 0)
+            .ok_or(ModeBRelationError::RamPermutationZeroDenominator)?;
+        matrix.swap(pivot, swap);
+        let inverse = kb_inverse(matrix[pivot][pivot], modulus);
+        for entry in &mut matrix[pivot] {
+            *entry = (*entry * inverse).rem_euclid(modulus);
+        }
+        for row in 0..KOALABEAR_QUINTIC_DEGREE {
+            if row != pivot {
+                let factor = matrix[row][pivot];
+                for col in pivot..=KOALABEAR_QUINTIC_DEGREE {
+                    matrix[row][col] =
+                        (matrix[row][col] - factor * matrix[pivot][col]).rem_euclid(modulus);
+                }
+            }
+        }
+    }
+    Ok(core::array::from_fn(|row| {
+        matrix[row][KOALABEAR_QUINTIC_DEGREE] as u32
+    }))
+}
+
 fn lower_linear_combination(
     value: &LinearCombination,
     variable_count: usize,
@@ -1215,14 +1530,14 @@ fn product_row(a: LinearCombination, b: LinearCombination, c: usize) -> R1csRow 
 }
 fn zero_row(variable: usize) -> R1csRow {
     R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: LinearCombination::var(variable),
     }
 }
 fn equal_constant_row(variable: usize, constant: i64) -> R1csRow {
     R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: LinearCombination {
             constant: -constant,
@@ -1232,14 +1547,14 @@ fn equal_constant_row(variable: usize, constant: i64) -> R1csRow {
 }
 fn equal_variables_row(left: usize, right: usize) -> R1csRow {
     R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: lc_difference(left, right),
     }
 }
 fn equal_one_row(values: &[usize]) -> R1csRow {
     R1csRow {
-        a: LinearCombination::constant(1),
+        a: LinearCombination::constant(0),
         b: LinearCombination::constant(1),
         c: LinearCombination {
             constant: -1,
@@ -1343,6 +1658,18 @@ pub enum ModeBRelationError {
     UnsatisfiedRow { row: usize },
     /// A public bit binding disagrees with the witness.
     PublicMismatch { binding: usize },
+    /// A complete unified field witness has the wrong number of values.
+    WrongUnifiedWitnessCount { expected: usize, found: usize },
+    /// A complete unified field witness leaves an internal variable unset.
+    IncompleteUnifiedWitness,
+    /// Two materialization paths assigned different values to one variable.
+    InconsistentUnifiedWitness { variable: usize },
+    /// A lowered unified R1CS row is unsatisfied.
+    UnsatisfiedUnifiedRow { row: usize },
+    /// A permutation denominator was zero in the quintic extension.
+    RamPermutationZeroDenominator,
+    /// The grand product did not end at the required one element.
+    RamPermutationEndpointMismatch,
     /// A RAM witness is absent for a circuit that accesses storage.
     MissingRamWitness,
     /// A RAM witness was supplied for a circuit without storage.
@@ -1403,6 +1730,25 @@ impl fmt::Display for ModeBRelationError {
             Self::UnsatisfiedRow { row } => write!(f, "relation row {row} is unsatisfied"),
             Self::PublicMismatch { binding } => {
                 write!(f, "public binding {binding} is unsatisfied")
+            }
+            Self::WrongUnifiedWitnessCount { expected, found } => {
+                write!(f, "unified witness has {found} values, expected {expected}")
+            }
+            Self::IncompleteUnifiedWitness => {
+                f.write_str("unified witness did not assign every variable")
+            }
+            Self::InconsistentUnifiedWitness { variable } => write!(
+                f,
+                "unified witness assigns variable {variable} inconsistently"
+            ),
+            Self::UnsatisfiedUnifiedRow { row } => {
+                write!(f, "unified R1CS row {row} is unsatisfied")
+            }
+            Self::RamPermutationZeroDenominator => {
+                f.write_str("RAM permutation denominator is zero")
+            }
+            Self::RamPermutationEndpointMismatch => {
+                f.write_str("RAM permutation grand-product endpoint is not one")
             }
             Self::MissingRamWitness => f.write_str("RAM witness is required"),
             Self::UnexpectedRamWitness => {
@@ -1633,6 +1979,106 @@ impl ModeBRelation {
             ram,
             permutation,
         })
+    }
+
+    /// Materialize every variable in the unified KoalaBear field layout.
+    ///
+    /// This is a differential-oracle witness builder. For a RAM circuit its
+    /// challenges must be transcript outputs from a commitment to the RAM
+    /// columns; callers must not let a prover select them.
+    pub fn materialize_unified_witness<P: Clone>(
+        &self,
+        circuit: &BCircuit<P>,
+        primary_witness: &[bool],
+        public_inputs: &[bool],
+        claimed_outputs: &[bool],
+        ram_witness: Option<&RamWitness>,
+        challenges: Option<&PrimeRamPermutationChallenges>,
+    ) -> Result<UnifiedR1csWitness, ModeBRelationError> {
+        self.evaluate_bool_with_ram(
+            circuit,
+            primary_witness,
+            public_inputs,
+            claimed_outputs,
+            ram_witness,
+        )?;
+        let unified = self.export_unified_r1cs(circuit, challenges)?;
+        let mut values = vec![None; unified.variable_count];
+        for (wire, value) in primary_witness.iter().copied().enumerate() {
+            assign_unified_value(&mut values, unified.primary_offset + wire, u32::from(value))?;
+        }
+        if let (Some(layout), Some(ram)) = (&unified.ram, ram_witness) {
+            let materialized = PrimeRamMaterialization::from_ram_witness(ram)?;
+            for ((record_layout, access), record) in layout
+                .execution
+                .iter()
+                .zip(&ram.execution)
+                .zip(&materialized.execution)
+            {
+                assign_ram_record(&mut values, record_layout, access, record)?;
+            }
+            for ((scan_layout, access), scan) in layout
+                .sorted
+                .iter()
+                .zip(&ram.address_sorted)
+                .zip(&materialized.sorted)
+            {
+                assign_ram_record(&mut values, &scan_layout.record, access, &scan.record)?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.same_cell,
+                    u32::from(scan.same_cell),
+                )?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.first_read,
+                    u32::from(scan.first_read),
+                )?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.later_read,
+                    u32::from(scan.later_read),
+                )?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.first_write,
+                    u32::from(scan.first_write),
+                )?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.later_write,
+                    u32::from(scan.later_write),
+                )?;
+                assign_unified_value(
+                    &mut values,
+                    scan_layout.prior_latest,
+                    u32::from(scan.prior_latest),
+                )?;
+                assign_unified_value(&mut values, scan_layout.latest, u32::from(scan.latest))?;
+            }
+            assign_sort_gadget_values(&mut values, &layout.sorted, &ram.address_sorted)?;
+            let permutation = unified
+                .permutation
+                .as_ref()
+                .expect("RAM has permutation layout");
+            let z = ram_permutation_products(
+                &materialized,
+                challenges.expect("RAM challenges checked"),
+            )?;
+            for (slots, value) in permutation.z.iter().zip(z) {
+                for (slot, coordinate) in slots.iter().zip(value) {
+                    assign_unified_value(&mut values, *slot, coordinate)?;
+                }
+            }
+        }
+        complete_unified_assignment(&unified.lower_koalabear()?, &mut values)?;
+        let values = values
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ModeBRelationError::IncompleteUnifiedWitness)?;
+        let witness = UnifiedR1csWitness { values };
+        unified.evaluate_koalabear_witness(&witness)?;
+        Ok(witness)
     }
 
     /// Evaluate the descriptor over a Boolean primary witness and outputs.

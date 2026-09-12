@@ -252,6 +252,57 @@ fn koalabear_lowering_normalizes_signed_and_duplicate_coefficients() {
 }
 
 #[test]
+fn unified_field_witness_materializes_and_satisfies_boolean_rows() {
+    let circuit = half_adder();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let witness = relation
+        .materialize_unified_witness(
+            &circuit,
+            &[true, false, true, false],
+            &[true, false],
+            &[true, false],
+            None,
+            None,
+        )
+        .unwrap();
+    let export = relation.export_unified_r1cs(&circuit, None).unwrap();
+    assert_eq!(witness.values.len(), export.variable_count);
+    export.evaluate_koalabear_witness(&witness).unwrap();
+}
+
+#[test]
+fn unified_field_witness_materializes_and_satisfies_storage_rows() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let primary = [true, true, false, true];
+    let ram = cirrus_volar_vole::RamWitness::from_boolar(&circuit, &primary).unwrap();
+    let witness = relation
+        .materialize_unified_witness(
+            &circuit,
+            &primary,
+            &[true, true],
+            &[true],
+            Some(&ram),
+            Some(&PrimeRamPermutationChallenges {
+                gamma: [11, 12, 13, 14, 15],
+                eta: [16, 17, 18, 19, 20],
+            }),
+        )
+        .unwrap();
+    let export = relation
+        .export_unified_r1cs(
+            &circuit,
+            Some(&PrimeRamPermutationChallenges {
+                gamma: [11, 12, 13, 14, 15],
+                eta: [16, 17, 18, 19, 20],
+            }),
+        )
+        .unwrap();
+    assert_eq!(witness.values.len(), export.variable_count);
+    export.evaluate_koalabear_witness(&witness).unwrap();
+}
+
+#[test]
 fn spartan_whir_shape_uses_witness_one_public_column_order() {
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
@@ -361,5 +412,47 @@ fn circuit_id_binds_more_than_the_gate_tags() {
     assert_ne!(
         ModeBRelation::from_boolar(&a).unwrap().circuit_id,
         ModeBRelation::from_boolar(&b).unwrap().circuit_id
+    );
+}
+
+#[cfg(feature = "spartan-whir-adapter")]
+#[test]
+fn spartan_whir_adapter_preserves_shape_and_witness_layout() {
+    use p3_field::PrimeField32;
+
+    let circuit = half_adder();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let unified = relation.export_unified_r1cs(&circuit, None).unwrap();
+    let witness = relation
+        .materialize_unified_witness(
+            &circuit,
+            &[true, false, true, false],
+            &[true, false],
+            &[true, false],
+            None,
+            None,
+        )
+        .unwrap();
+    let exported = unified
+        .lower_koalabear()
+        .unwrap()
+        .export_spartan_whir_shape()
+        .unwrap();
+    let adapter = exported.to_spartan_whir_adapter();
+    adapter.validate().unwrap();
+    assert_eq!(adapter.circuit_id, relation.circuit_id);
+
+    let split = adapter.split_witness(&witness).unwrap();
+    assert_eq!(split.witness.w.len(), adapter.shape.num_vars);
+    assert_eq!(split.public_values.len(), adapter.shape.num_io);
+    spartan_whir::validate_satisfaction(&adapter.shape, &split.witness, &split.public_values)
+        .unwrap();
+    assert_eq!(
+        split
+            .public_values
+            .iter()
+            .map(|value| value.as_canonical_u32())
+            .collect::<Vec<_>>(),
+        vec![1, 0, 1, 0],
     );
 }
