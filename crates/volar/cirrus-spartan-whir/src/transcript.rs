@@ -150,6 +150,90 @@ impl PoseidonTranscript {
         Ok((self.sample_base().canonical() as usize) & ((1_usize << bits) - 1))
     }
 
+    /// Sample `bits` uniformly via upstream's rejection-sampled
+    /// `sample_uniform_bits::<true>`.
+    ///
+    /// For `bits <= 24` one field element is drawn (and redrawn while its
+    /// canonical value is at least `PRIME & !((1 << bits) - 1)`); wider
+    /// requests draw two half-width chunks and combine them little-endian,
+    /// exactly as upstream's slow path.
+    pub fn sample_uniform_bits(&mut self, bits: usize) -> Result<usize, TranscriptError> {
+        if bits == 0 {
+            return Ok(0);
+        }
+        if bits >= usize::BITS as usize || (bits < 64 && (1_u64 << bits) >= 2_130_706_433) {
+            return Err(TranscriptError::InvalidBitCount);
+        }
+        if bits <= MAX_SINGLE_SAMPLE_BITS {
+            let m = sampling_bits_m(bits);
+            let mut value = self.sample_base().canonical() as u64;
+            while value >= m {
+                value = self.sample_base().canonical() as u64;
+            }
+            Ok(value as usize & ((1_usize << bits) - 1))
+        } else {
+            let half1 = bits / 2;
+            let half2 = bits - half1;
+            let m1 = sampling_bits_m(half1);
+            let mut v1 = self.sample_base().canonical() as u64;
+            while v1 >= m1 {
+                v1 = self.sample_base().canonical() as u64;
+            }
+            let chunk1 = v1 as usize & ((1_usize << half1) - 1);
+            let m2 = sampling_bits_m(half2);
+            let mut v2 = self.sample_base().canonical() as u64;
+            while v2 >= m2 {
+                v2 = self.sample_base().canonical() as u64;
+            }
+            let chunk2 = v2 as usize & ((1_usize << half2) - 1);
+            Ok(chunk1 | (chunk2 << half1))
+        }
+    }
+
+    /// Verify a proof-of-work witness: absorb it, then require the low
+    /// `bits` of the next sample to be zero. Matches upstream's
+    /// `GrindingChallenger::check_witness`.
+    pub fn check_witness(
+        &mut self,
+        bits: usize,
+        witness: KoalaBear,
+    ) -> Result<bool, TranscriptError> {
+        if bits == 0 {
+            return Ok(true);
+        }
+        self.observe(witness);
+        Ok(self.sample_bits(bits)? == 0)
+    }
+
+    /// Grind a proof-of-work witness: find the smallest canonical candidate
+    /// whose check passes, then absorb it and advance the transcript exactly
+    /// as [`Self::check_witness`] does. Matches upstream's serial grind
+    /// semantics (candidates are tried in order `0, 1, 2, ...`).
+    pub fn grind(&mut self, bits: usize) -> Result<KoalaBear, TranscriptError> {
+        if bits == 0 {
+            return Ok(KoalaBear::ZERO);
+        }
+        if bits >= 31 {
+            // Upstream asserts (1 << bits) < ORDER.
+            return Err(TranscriptError::InvalidBitCount);
+        }
+        let mut candidate = 0_u64;
+        loop {
+            let witness = KoalaBear::from_u64(candidate);
+            let mut probe = self.clone();
+            if probe.check_witness(bits, witness)? {
+                // Commit the winning witness to the real transcript.
+                let accepted = self.check_witness(bits, witness)?;
+                debug_assert!(accepted);
+                return Ok(witness);
+            }
+            candidate += 1;
+            if candidate >= 2_130_706_433 {
+                return Err(TranscriptError::InvalidBitCount);
+            }
+        }
+    }
+
     fn duplex(&mut self) {
         let absorbed = self.input_buffer.len();
         debug_assert!(absorbed <= POSEIDON_CHALLENGER_RATE);
@@ -168,6 +252,16 @@ impl PoseidonTranscript {
         self.output_buffer
             .extend_from_slice(&self.sponge_state[..POSEIDON_CHALLENGER_RATE]);
     }
+}
+
+/// Widest single-sample uniform bit draw for KoalaBear, matching upstream's
+/// `UniformSamplingField::MAX_SINGLE_SAMPLE_BITS`.
+const MAX_SINGLE_SAMPLE_BITS: usize = 24;
+
+/// Rejection threshold for `bits`-wide uniform draws, matching upstream's
+/// `SAMPLING_BITS_M`: the prime with its low `bits` cleared.
+const fn sampling_bits_m(bits: usize) -> u64 {
+    (2_130_706_433_u64) & !((1_u64 << bits) - 1)
 }
 
 /// Number of coefficients sampled for one quintic transcript challenge.

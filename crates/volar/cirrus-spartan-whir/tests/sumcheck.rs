@@ -134,6 +134,7 @@ impl core::fmt::Display for DevNullPcsError {
 impl DirectSparsePcs for DevNullPcs {
     type Commitment = PoseidonDigest;
     type Proof = ();
+    type ParsedCommitment = ();
     type Error = DevNullPcsError;
 
     fn commit(
@@ -165,15 +166,16 @@ impl DirectSparsePcs for DevNullPcs {
     fn verify_commitment(
         &self,
         commitment: &Self::Commitment,
+        _proof: &Self::Proof,
         transcript: &mut PoseidonTranscript,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<Self::ParsedCommitment, Self::Error> {
         transcript.observe_slice(commitment);
         Ok(())
     }
 
     fn verify_opening(
         &self,
-        _commitment: &Self::Commitment,
+        _parsed: &Self::ParsedCommitment,
         _point: &[QuinticExtension],
         value: QuinticExtension,
         _proof: &Self::Proof,

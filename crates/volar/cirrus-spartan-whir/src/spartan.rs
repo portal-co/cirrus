@@ -44,6 +44,10 @@ pub trait DirectSparsePcs {
     type Commitment;
     /// Opening proof carried in the Spartan proof.
     type Proof;
+    /// Verifier-side parsed commitment returned by the parse hook and
+    /// consumed by the finalize hook, mirroring upstream's
+    /// `verify_parse_commitment`/`verify_finalize` split.
+    type ParsedCommitment;
     /// PCS-specific failure.
     type Error;
 
@@ -62,17 +66,21 @@ pub trait DirectSparsePcs {
         transcript: &mut PoseidonTranscript,
     ) -> Result<Self::Proof, Self::Error>;
 
-    /// Absorb and structurally validate a commitment on the verifier side.
+    /// Absorb and structurally validate a commitment on the verifier side,
+    /// replaying every transcript step upstream performs before the
+    /// Spartan challenges are sampled.
     fn verify_commitment(
         &self,
         commitment: &Self::Commitment,
+        proof: &Self::Proof,
         transcript: &mut PoseidonTranscript,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<Self::ParsedCommitment, Self::Error>;
 
-    /// Verify an opening of `commitment` at `point` with claimed `value`.
+    /// Verify an opening of the parsed commitment at `point` with claimed
+    /// `value`.
     fn verify_opening(
         &self,
-        commitment: &Self::Commitment,
+        parsed: &Self::ParsedCommitment,
         point: &[QuinticExtension],
         value: QuinticExtension,
         proof: &Self::Proof,
@@ -230,7 +238,8 @@ pub fn verify_direct_sparse<P: DirectSparsePcs>(
 
     observe_context(transcript, context, &instance.public_inputs);
 
-    pcs.verify_commitment(&instance.witness_commitment, transcript)
+    let parsed_commitment = pcs
+        .verify_commitment(&instance.witness_commitment, &proof.pcs_proof, transcript)
         .map_err(DirectSparseError::Pcs)?;
 
     let num_rounds_x = shape.num_cons.ilog2() as usize;
@@ -278,7 +287,7 @@ pub fn verify_direct_sparse<P: DirectSparsePcs>(
     }
 
     pcs.verify_opening(
-        &instance.witness_commitment,
+        &parsed_commitment,
         &r_y.0[1..],
         proof.witness_eval,
         &proof.pcs_proof,

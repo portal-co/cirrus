@@ -19,9 +19,14 @@ oracle-tests = [
     "dep:p3-matrix",
     "dep:p3-merkle-tree",
     "dep:p3-commit",
+    "dep:p3-dft",
+    "dep:p3-whir",
+    "dep:p3-multilinear-util",
+    "dep:p3-sumcheck",
 ]
 
 [dependencies]
+libm = { version = "0.2", default-features = false }
 spartan-whir = { git = "https://github.com/ethereum/spartan-whir.git", rev = "f525cddea38bb605304d3a8e6394dda10ac64b4a", optional = true }
 p3-field = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
 p3-koala-bear = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
@@ -30,3 +35,7 @@ p3-challenger = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15
 p3-matrix = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
 p3-merkle-tree = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
 p3-commit = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-dft = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-whir = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-multilinear-util = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-sumcheck = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }

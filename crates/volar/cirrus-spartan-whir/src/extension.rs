@@ -248,6 +248,12 @@ impl core::ops::Add for QuinticExtension {
     }
 }
 
+impl core::ops::AddAssign for QuinticExtension {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
 impl core::ops::Sub for QuinticExtension {
     type Output = Self;
 

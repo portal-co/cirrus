@@ -5,11 +5,12 @@
 //! canonical integers and is differentially tested against the pinned upstream
 //! Spartan-WHIR/Plonky3 stack as an oracle.
 //!
-//! Slices 0--4 exist at this point: crate policy, KoalaBear and
+//! Slices 0--5 exist at this point: crate policy, KoalaBear and
 //! quintic-extension arithmetic, polynomial/R1CS substrate, the Poseidon
-//! hash/Merkle/transcript profile, and Spartan sumcheck with the DirectSparse
-//! R1CS evaluation reduction. The WHIR polynomial commitment and the
-//! setup/prove/verify key API are later slices and are not claimed here.
+//! hash/Merkle/transcript profile, Spartan sumcheck with the DirectSparse
+//! R1CS evaluation reduction, and the plain (no-ZK) WHIR polynomial
+//! commitment with its DirectSparse adapter. The setup/prove/verify key API
+//! is a later slice and is not claimed here.
 
 #![no_std]
 #![warn(missing_docs)]
@@ -17,6 +18,7 @@
 extern crate alloc;
 
 mod algebra;
+mod dft;
 mod error;
 mod extension;
 mod field;
@@ -29,8 +31,12 @@ mod r1cs;
 mod spartan;
 mod sumcheck;
 mod transcript;
+pub mod whir;
 
 pub use algebra::FieldElement;
+pub use dft::{
+    DftError, KOALABEAR_TWO_ADICITY, dft_base, dft_batch_base, dft_batch_ext, two_adic_generator,
+};
 pub use error::SpartanError;
 pub use extension::{QUINTIC_DEGREE, QuinticExtension, QuinticExtensionError};
 pub use field::{KOALABEAR_MODULUS, KoalaBear, KoalaBearError};
@@ -38,7 +44,7 @@ pub use hash::{
     POSEIDON_CHALLENGER_RATE, POSEIDON_DIGEST_ELEMENTS, POSEIDON_FIELD_HASH_RATE, PoseidonDigest,
     poseidon_compress2, poseidon_hash_fixed,
 };
-pub use merkle::{MerkleError, PoseidonMerklePath, PoseidonMerkleTree};
+pub use merkle::{MerkleError, PoseidonMerklePath, PoseidonMerkleTree, PrunedMerklePaths};
 pub use poly::{
     CubicRoundPoly, EqPolynomial, MultilinearPoint, PolyError, QuadraticRoundPoly,
     evaluate_mle_table,
