@@ -69,6 +69,104 @@ pub fn evaluate_mle_table<F: FieldElement>(table: &[F], point: &[F]) -> Result<F
     Ok(layer[0])
 }
 
+/// A cubic sumcheck round polynomial in upstream compact encoding
+/// `[h(0), h(2), h(3)]`; `h(1)` is recovered from the running claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CubicRoundPoly<F>(pub [F; 3]);
+
+impl<F> AsRef<[F]> for CubicRoundPoly<F> {
+    fn as_ref(&self) -> &[F] {
+        &self.0
+    }
+}
+
+impl<F: FieldElement> CubicRoundPoly<F> {
+    /// `h(0)`.
+    pub fn eval_at_zero(&self) -> F {
+        self.0[0]
+    }
+
+    /// `h(2)`.
+    pub fn eval_at_two(&self) -> F {
+        self.0[1]
+    }
+
+    /// `h(3)`.
+    pub fn eval_at_three(&self) -> F {
+        self.0[2]
+    }
+
+    /// `h(1)`, recovered as `claim - h(0)`.
+    pub fn eval_at_one_from_claim(&self, claim: F) -> F {
+        claim - self.eval_at_zero()
+    }
+
+    /// Lagrange-interpolate `h` over nodes `{0, 1, 2, 3}` and evaluate at
+    /// `r`, recovering `h(1)` from `claim`.
+    pub fn evaluate_at(&self, r: F, claim: F) -> F {
+        let h0 = self.eval_at_zero();
+        let h1 = self.eval_at_one_from_claim(claim);
+        let h2 = self.eval_at_two();
+        let h3 = self.eval_at_three();
+
+        let two = F::from_u32(2);
+        let three = F::from_u32(3);
+        let inv_two = two.inverse().expect("two is nonzero");
+        let inv_six = F::from_u32(6).inverse().expect("six is nonzero");
+
+        let l0 = -(r - F::ONE) * (r - two) * (r - three) * inv_six;
+        let l1 = r * (r - two) * (r - three) * inv_two;
+        let l2 = -r * (r - F::ONE) * (r - three) * inv_two;
+        let l3 = r * (r - F::ONE) * (r - two) * inv_six;
+
+        h0 * l0 + h1 * l1 + h2 * l2 + h3 * l3
+    }
+}
+
+/// A quadratic sumcheck round polynomial in upstream compact encoding
+/// `[h(0), h(2)]`; `h(1)` is recovered from the running claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuadraticRoundPoly<F>(pub [F; 2]);
+
+impl<F> AsRef<[F]> for QuadraticRoundPoly<F> {
+    fn as_ref(&self) -> &[F] {
+        &self.0
+    }
+}
+
+impl<F: FieldElement> QuadraticRoundPoly<F> {
+    /// `h(0)`.
+    pub fn eval_at_zero(&self) -> F {
+        self.0[0]
+    }
+
+    /// `h(2)`.
+    pub fn eval_at_two(&self) -> F {
+        self.0[1]
+    }
+
+    /// `h(1)`, recovered as `claim - h(0)`.
+    pub fn eval_at_one_from_claim(&self, claim: F) -> F {
+        claim - self.eval_at_zero()
+    }
+
+    /// Lagrange-interpolate `h` over nodes `{0, 1, 2}` and evaluate at `r`,
+    /// recovering `h(1)` from `claim`.
+    pub fn evaluate_at(&self, r: F, claim: F) -> F {
+        let h0 = self.eval_at_zero();
+        let h1 = self.eval_at_one_from_claim(claim);
+        let h2 = self.eval_at_two();
+
+        let two = F::from_u32(2);
+        let inv_two = two.inverse().expect("two is nonzero");
+        let l0 = (r - F::ONE) * (r - two) * inv_two;
+        let l1 = -r * (r - two);
+        let l2 = r * (r - F::ONE) * inv_two;
+
+        h0 * l0 + h1 * l1 + h2 * l2
+    }
+}
+
 /// Polynomial substrate errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolyError {

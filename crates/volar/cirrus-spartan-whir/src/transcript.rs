@@ -80,6 +80,14 @@ impl PoseidonTranscript {
         }
     }
 
+    /// Observe a slice of quintic-extension elements in order, matching
+    /// upstream's `observe_algebra_slice`.
+    pub fn observe_quintic_slice(&mut self, values: &[QuinticExtension]) {
+        for &value in values {
+            self.observe_quintic(value);
+        }
+    }
+
     /// Observe an explicit byte tag as `len || bytes`, matching upstream's
     /// Spark tag convention.
     pub fn observe_tag(&mut self, tag: &[u8]) -> Result<(), TranscriptError> {

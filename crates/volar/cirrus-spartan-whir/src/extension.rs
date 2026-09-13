@@ -227,6 +227,19 @@ impl QuinticExtension {
     }
 }
 
+impl From<KoalaBear> for QuinticExtension {
+    /// Embed a base-field element into the extension's constant coefficient.
+    fn from(value: KoalaBear) -> Self {
+        Self::new([
+            value,
+            KoalaBear::ZERO,
+            KoalaBear::ZERO,
+            KoalaBear::ZERO,
+            KoalaBear::ZERO,
+        ])
+    }
+}
+
 impl core::ops::Add for QuinticExtension {
     type Output = Self;
 
