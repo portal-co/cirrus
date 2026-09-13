@@ -312,7 +312,7 @@ impl FoldingFactor {
 
 /// User-facing WHIR protocol parameters, mirroring upstream
 /// `ProtocolParameters`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolParameters {
     /// Initial logarithmic inverse rate for the first committed codeword.
     pub starting_log_inv_rate: usize,
@@ -330,7 +330,7 @@ pub struct ProtocolParameters {
 }
 
 /// Derived configuration for a single intermediate WHIR round.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RoundConfig {
     /// PoW difficulty (bits) for the STIR query phase.
     pub pow_bits: usize,
@@ -472,7 +472,7 @@ fn ceil_pow_bits(gap: f64) -> usize {
 
 /// Fully derived WHIR protocol configuration, mirroring upstream
 /// `WhirConfig::new` for the KoalaBear quintic profile.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WhirConfig {
     /// Number of variables in the original multilinear polynomial.
     pub num_variables: usize,

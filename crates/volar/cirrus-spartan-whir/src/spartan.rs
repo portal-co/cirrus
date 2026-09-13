@@ -119,6 +119,9 @@ pub enum DirectSparseError<PcsError> {
     Spartan(SpartanError),
     /// The polynomial-commitment layer failed.
     Pcs(PcsError),
+    /// The supplied public challenge-slot values differ from the values
+    /// derived from the post-commitment transcript state.
+    ChallengeMismatch,
 }
 
 impl<PcsError: fmt::Display> fmt::Display for DirectSparseError<PcsError> {
@@ -126,8 +129,27 @@ impl<PcsError: fmt::Display> fmt::Display for DirectSparseError<PcsError> {
         match self {
             Self::Spartan(error) => write!(f, "spartan reduction error: {error}"),
             Self::Pcs(error) => write!(f, "pcs error: {error}"),
+            Self::ChallengeMismatch => {
+                f.write_str("public challenge slots do not match the transcript-derived values")
+            }
         }
     }
+}
+
+/// A post-commitment challenge-slot schedule.
+///
+/// Profiles with transcript-derived public challenge slots (the Mode-B RAM
+/// profile's `gamma`/`eta` slots) observe the challenge-independent public
+/// input prefix before the witness commitment, derive the trailing
+/// `slots` public values from the post-commitment transcript state, require
+/// the supplied values to match the derived ones, and only then observe the
+/// challenge tail. With zero slots the transcript schedule is exactly the
+/// upstream one (the whole public vector is observed before the commitment).
+pub struct ChallengeSlotSchedule<'a> {
+    /// Number of trailing public-input slots derived after the commitment.
+    pub slots: usize,
+    /// Derives the slot values from the post-commitment transcript state.
+    pub derive: &'a mut dyn FnMut(&mut PoseidonTranscript) -> Vec<KoalaBear>,
 }
 
 impl<PcsError: fmt::Debug + fmt::Display> core::error::Error for DirectSparseError<PcsError> {}
@@ -155,6 +177,30 @@ pub fn prove_direct_sparse<P: DirectSparsePcs>(
     transcript: &mut PoseidonTranscript,
 ) -> Result<(R1csInstance<P::Commitment>, DirectSparseProof<P::Proof>), DirectSparseError<P::Error>>
 {
+    prove_direct_sparse_with_schedule(
+        shape,
+        context,
+        public_inputs,
+        witness,
+        pcs,
+        transcript,
+        None,
+    )
+}
+
+/// [`prove_direct_sparse`] with an optional post-commitment challenge-slot
+/// schedule; see [`ChallengeSlotSchedule`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_direct_sparse_with_schedule<P: DirectSparsePcs>(
+    shape: &R1csShape<KoalaBear>,
+    context: &[u8],
+    public_inputs: &[KoalaBear],
+    witness: &R1csWitness<KoalaBear>,
+    pcs: &mut P,
+    transcript: &mut PoseidonTranscript,
+    schedule: Option<ChallengeSlotSchedule<'_>>,
+) -> Result<(R1csInstance<P::Commitment>, DirectSparseProof<P::Proof>), DirectSparseError<P::Error>>
+{
     validate_canonical_shape(shape)?;
     if public_inputs.len() != shape.num_io {
         return Err(SpartanError::InvalidPublicInputLength {
@@ -170,13 +216,32 @@ pub fn prove_direct_sparse<P: DirectSparsePcs>(
         }
         .into());
     }
+    let slots = schedule.as_ref().map_or(0, |schedule| schedule.slots);
+    if slots > public_inputs.len() {
+        return Err(SpartanError::InvalidChallengeSlots {
+            slots,
+            public_inputs: public_inputs.len(),
+        }
+        .into());
+    }
+    let prefix_len = public_inputs.len() - slots;
 
-    observe_context(transcript, context, public_inputs);
+    observe_context(transcript, context, &public_inputs[..prefix_len]);
 
     let witness_padded = shape.witness_to_mle(&witness.w).map_err(shape_error)?;
     let witness_commitment = pcs
         .commit(&witness_padded, transcript)
         .map_err(DirectSparseError::Pcs)?;
+
+    if let Some(schedule) = schedule {
+        if slots > 0 {
+            let derived = (schedule.derive)(transcript);
+            if derived != public_inputs[prefix_len..] {
+                return Err(DirectSparseError::ChallengeMismatch);
+            }
+            transcript.observe_slice(&public_inputs[prefix_len..]);
+        }
+    }
 
     let z_full = build_z_full(witness_padded, shape.num_vars, public_inputs);
     let z_short = matrix_z_slice(&z_full, shape.num_vars, public_inputs.len())?;
@@ -227,6 +292,22 @@ pub fn verify_direct_sparse<P: DirectSparsePcs>(
     pcs: &P,
     transcript: &mut PoseidonTranscript,
 ) -> Result<(), DirectSparseError<P::Error>> {
+    verify_direct_sparse_with_schedule(shape, context, instance, proof, pcs, transcript, None)
+}
+
+/// [`verify_direct_sparse`] with an optional post-commitment challenge-slot
+/// schedule; see [`ChallengeSlotSchedule`]. The verifier recomputes the
+/// challenge slots independently and rejects the proof when the supplied
+/// public vector differs from the derived vector.
+pub fn verify_direct_sparse_with_schedule<P: DirectSparsePcs>(
+    shape: &R1csShape<KoalaBear>,
+    context: &[u8],
+    instance: &R1csInstance<P::Commitment>,
+    proof: &DirectSparseProof<P::Proof>,
+    pcs: &P,
+    transcript: &mut PoseidonTranscript,
+    schedule: Option<ChallengeSlotSchedule<'_>>,
+) -> Result<(), DirectSparseError<P::Error>> {
     validate_canonical_shape(shape)?;
     if instance.public_inputs.len() != shape.num_io {
         return Err(SpartanError::InvalidPublicInputLength {
@@ -235,12 +316,31 @@ pub fn verify_direct_sparse<P: DirectSparsePcs>(
         }
         .into());
     }
+    let slots = schedule.as_ref().map_or(0, |schedule| schedule.slots);
+    if slots > instance.public_inputs.len() {
+        return Err(SpartanError::InvalidChallengeSlots {
+            slots,
+            public_inputs: instance.public_inputs.len(),
+        }
+        .into());
+    }
+    let prefix_len = instance.public_inputs.len() - slots;
 
-    observe_context(transcript, context, &instance.public_inputs);
+    observe_context(transcript, context, &instance.public_inputs[..prefix_len]);
 
     let parsed_commitment = pcs
         .verify_commitment(&instance.witness_commitment, &proof.pcs_proof, transcript)
         .map_err(DirectSparseError::Pcs)?;
+
+    if let Some(schedule) = schedule {
+        if slots > 0 {
+            let derived = (schedule.derive)(transcript);
+            if derived != instance.public_inputs[prefix_len..] {
+                return Err(DirectSparseError::ChallengeMismatch);
+            }
+            transcript.observe_slice(&instance.public_inputs[prefix_len..]);
+        }
+    }
 
     let num_rounds_x = shape.num_cons.ilog2() as usize;
     let tau = MultilinearPoint(sample_quintic_vec(transcript, num_rounds_x));

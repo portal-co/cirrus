@@ -304,12 +304,19 @@ impl WhirPcs {
         profile: &SecurityProfile,
     ) -> Result<Self, WhirConfigBuildError> {
         let config = profile.derive_config(num_variables)?;
+        Ok(Self::from_config(config))
+    }
+
+    /// Build the PCS directly from a fully derived configuration (used by
+    /// the setup/prove/verify key layer, which derives the configuration
+    /// with the composed component security levels).
+    pub fn from_config(config: WhirConfig) -> Self {
         let domain_separator = WhirDomainSeparator::new(&config);
-        Ok(Self {
+        Self {
             config,
             domain_separator,
             prover_data: None,
-        })
+        }
     }
 
     /// The derived WHIR configuration.

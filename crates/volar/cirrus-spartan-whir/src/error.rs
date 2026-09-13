@@ -35,6 +35,13 @@ pub enum SpartanError {
     NonInvertibleElement,
     /// The R1CS shape is invalid for this protocol layer.
     InvalidShape,
+    /// A challenge-slot schedule does not fit the public input vector.
+    InvalidChallengeSlots {
+        /// Number of trailing challenge slots requested.
+        slots: usize,
+        /// Number of public inputs available.
+        public_inputs: usize,
+    },
 }
 
 impl fmt::Display for SpartanError {
@@ -59,6 +66,14 @@ impl fmt::Display for SpartanError {
             }
             Self::NonInvertibleElement => f.write_str("field element is not invertible"),
             Self::InvalidShape => f.write_str("invalid R1CS shape for Spartan reduction"),
+            Self::InvalidChallengeSlots {
+                slots,
+                public_inputs,
+            } => write!(
+                f,
+                "challenge schedule requests {slots} slots but only {public_inputs} public \
+                 inputs exist"
+            ),
         }
     }
 }
