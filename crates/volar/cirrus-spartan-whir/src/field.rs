@@ -55,6 +55,32 @@ impl KoalaBear {
         }
     }
 
+    /// Construct a checked constant array. This is intended for embedded
+    /// round constants; it panics at compile time on a noncanonical value.
+    pub(crate) const fn new_array<const N: usize>(input: [u32; N]) -> [Self; N] {
+        let mut out = [Self::ZERO; N];
+        let mut index = 0;
+        while index < N {
+            assert!(input[index] < KOALABEAR_MODULUS);
+            out[index] = Self(input[index]);
+            index += 1;
+        }
+        out
+    }
+
+    /// Construct a checked constant two-dimensional array.
+    pub(crate) const fn new_2d_array<const N: usize, const M: usize>(
+        input: [[u32; N]; M],
+    ) -> [[Self; N]; M] {
+        let mut out = [[Self::ZERO; N]; M];
+        let mut row = 0;
+        while row < M {
+            out[row] = Self::new_array(input[row]);
+            row += 1;
+        }
+        out
+    }
+
     /// Reduce a `u64` modulo the field modulus.
     pub const fn from_u64(value: u64) -> Self {
         Self((value % P) as u32)
@@ -136,6 +162,23 @@ impl KoalaBear {
     /// Multiply by a small unsigned constant.
     pub const fn mul_u32(self, rhs: u32) -> Self {
         self.mul(Self::from_u64(rhs as u64))
+    }
+
+    /// Divide by two modulo the odd field modulus.
+    pub const fn halve(self) -> Self {
+        if self.0 & 1 == 0 {
+            Self(self.0 >> 1)
+        } else {
+            Self(((self.0 as u64 + P) >> 1) as u32)
+        }
+    }
+
+    /// Divide by `2^exponent` modulo the field modulus.
+    pub const fn div_2exp_u64(self, exponent: u64) -> Self {
+        match Self::from_u64(1_u64 << exponent).inverse() {
+            Ok(inverse) => self.mul(inverse),
+            Err(_) => Self::ZERO,
+        }
     }
 
     /// Raise to an unsigned exponent.

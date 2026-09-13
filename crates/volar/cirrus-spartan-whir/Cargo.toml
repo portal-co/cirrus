@@ -9,8 +9,24 @@ default = []
 # std is for tests/tools only; the library itself is no_std+alloc.
 std = []
 # Differential oracle tests against the pinned upstream implementation.
-oracle-tests = ["std", "dep:spartan-whir", "dep:p3-field"]
+oracle-tests = [
+    "std",
+    "dep:spartan-whir",
+    "dep:p3-field",
+    "dep:p3-koala-bear",
+    "dep:p3-symmetric",
+    "dep:p3-challenger",
+    "dep:p3-matrix",
+    "dep:p3-merkle-tree",
+    "dep:p3-commit",
+]
 
 [dependencies]
 spartan-whir = { git = "https://github.com/ethereum/spartan-whir.git", rev = "f525cddea38bb605304d3a8e6394dda10ac64b4a", optional = true }
 p3-field = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-koala-bear = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-symmetric = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-challenger = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-matrix = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-merkle-tree = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
+p3-commit = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
