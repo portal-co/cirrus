@@ -19,7 +19,7 @@ use volar_ir_common::StorageId;
 /// Stable relation version. Changes to wire/row semantics require a new one.
 pub const MODE_B_RELATION_VERSION: u32 = 1;
 /// KoalaBear base-field modulus used by Spartan-WHIR.
-pub const KOALABEAR_MODULUS: u32 = 2_013_265_921;
+pub const KOALABEAR_MODULUS: u32 = 2_130_706_433;
 /// The reference Spartan-WHIR target is KoalaBear's quintic extension.
 pub const KOALABEAR_QUINTIC_DEGREE: usize = 5;
 /// Full 32-bit address width supported by the initial RAM format.

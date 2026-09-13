@@ -135,7 +135,7 @@ high-security `sol-spartan-whir` target:
 
 ```text
 F = KoalaBear[X] / (X^5 + X^2 - 1)
-p = 2^31 - 2^24 + 1 = 2,013,265,921
+p = 2^31 - 2^24 + 1 = 2,130,706,433
 format = "koalabear-ext5-ram-v1"
 ```
 
