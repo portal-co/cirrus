@@ -81,11 +81,23 @@ pub struct R1csRow {
     pub c: LinearCombination,
 }
 
-/// A public bit binding.
+/// A public statement or challenge-slot binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicBinding {
-    Input { index: usize, wire: usize },
-    Output { index: usize, wire: usize },
+    Input {
+        index: usize,
+        wire: usize,
+    },
+    Output {
+        index: usize,
+        wire: usize,
+    },
+    /// One base-field coefficient of the RAM permutation challenges. Indices
+    /// `0..5` are `gamma` coefficients and `5..10` are `eta` coefficients.
+    RamPermutationChallenge {
+        index: usize,
+        wire: usize,
+    },
 }
 
 /// Generic sink used by the canonical Boolar statement scheduler.
@@ -404,8 +416,8 @@ pub struct PrimeRamScanLayout {
 }
 
 /// Frozen variable layout and explicit static R1CS rows for the non-challenge
-/// RAM constraints. The grand-product rows are challenge-bound and must be
-/// appended by the Spartan-WHIR adapter after transcript challenges exist.
+/// RAM constraints. The grand-product rows are emitted separately with public
+/// challenge slots by [`PrimeRamR1cs::permutation_rows`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimeRamR1cs {
     pub variable_count: usize,
@@ -422,11 +434,23 @@ pub struct PrimeRamPermutationChallenges {
     pub eta: [i64; KOALABEAR_QUINTIC_DEGREE],
 }
 
-/// Challenge-bound variables and rows for the extension-field permutation.
+/// Challenge-slot variables and rows for the extension-field permutation.
+/// The same static R1CS shape works for every transcript-derived challenge
+/// value; challenge coefficients are public variables, not baked constants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimeRamPermutationR1cs {
     pub variable_count: usize,
     pub rows: Vec<R1csRow>,
+    /// Public `gamma` challenge coefficients in the quintic basis.
+    pub gamma: [usize; KOALABEAR_QUINTIC_DEGREE],
+    /// Public `eta` challenge coefficients in the quintic basis.
+    pub eta: [usize; KOALABEAR_QUINTIC_DEGREE],
+    /// Per-record `gamma + K + eta * value` execution-table factors.
+    pub compressed_execution: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
+    /// Per-record `gamma + K + eta * value` sorted-table factors.
+    pub compressed_sorted: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
+    /// Extension inverses proving every sorted-table factor is nonzero.
+    pub sorted_denominator_inverse: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
     /// `Z_0 .. Z_n`, each in the quintic polynomial basis.
     pub z: Vec<[usize; KOALABEAR_QUINTIC_DEGREE]>,
 }
@@ -449,7 +473,7 @@ pub struct UnifiedR1cs {
     pub primary_offset: usize,
     /// RAM layout, when the circuit has storage.
     pub ram: Option<PrimeRamR1cs>,
-    /// Challenge-bound RAM permutation layout, when storage is present.
+    /// Public-challenge-slot RAM permutation layout, when storage is present.
     pub permutation: Option<PrimeRamPermutationR1cs>,
 }
 
@@ -535,8 +559,9 @@ pub struct SpartanWhirR1csShape {
 
 impl KoalaBearR1cs {
     /// Re-index the unified layout into Spartan-WHIR's `[W | 1 | X]` columns.
-    /// Public values are deliberately ordered `claimed outputs || inputs`, as
-    /// required by its KoalaBear Circom frontend.
+    /// Public values are ordered `claimed outputs || inputs || RAM challenge
+    /// slots`; the first two groups follow the KoalaBear Circom convention,
+    /// and challenge slots are the transcript-derived tail for storage RAM.
     pub fn export_spartan_whir_shape(&self) -> Result<SpartanWhirR1csShape, ModeBRelationError> {
         let mut public_wires = Vec::with_capacity(self.public_bindings.len());
         for output in self
@@ -544,20 +569,31 @@ impl KoalaBearR1cs {
             .iter()
             .filter_map(|binding| match *binding {
                 PublicBinding::Output { wire, .. } => Some(wire),
-                PublicBinding::Input { .. } => None,
+                PublicBinding::Input { .. } | PublicBinding::RamPermutationChallenge { .. } => None,
             })
         {
             push_public_wire(&mut public_wires, output)?;
         }
-        for input in self
+        for input in
+            self.public_bindings
+                .iter()
+                .filter_map(|binding| match *binding {
+                    PublicBinding::Input { wire, .. } => Some(wire),
+                    PublicBinding::Output { .. }
+                    | PublicBinding::RamPermutationChallenge { .. } => None,
+                })
+        {
+            push_public_wire(&mut public_wires, input)?;
+        }
+        for challenge in self
             .public_bindings
             .iter()
             .filter_map(|binding| match *binding {
-                PublicBinding::Input { wire, .. } => Some(wire),
-                PublicBinding::Output { .. } => None,
+                PublicBinding::RamPermutationChallenge { wire, .. } => Some(wire),
+                PublicBinding::Input { .. } | PublicBinding::Output { .. } => None,
             })
         {
-            push_public_wire(&mut public_wires, input)?;
+            push_public_wire(&mut public_wires, challenge)?;
         }
         let mut private_columns = vec![None; self.variable_count];
         let mut next_private = 0;
@@ -702,8 +738,8 @@ impl PrimeRamR1cs {
     /// Emit the fixed-variable-order rows for `access_count` RAM records.
     ///
     /// The table contents, sort witness, and scan values are prover witness
-    /// variables. The adapter adds Fiat--Shamir-dependent extension-field
-    /// grand-product rows after committing these columns.
+    /// variables. The permutation layout adds public Fiat--Shamir challenge
+    /// slots; a proving transcript assigns them after committing these columns.
     pub fn new(access_count: usize) -> Self {
         let mut next = 0;
         let mut rows = Vec::new();
@@ -930,15 +966,50 @@ impl PrimeRamR1cs {
         Ok(layout)
     }
 
-    /// Append explicit quintic-extension grand-product rows for transcript
-    /// challenges. This realizes `Z[i+1] * (gamma + R(Q[i])) = Z[i] *
-    /// (gamma + R(E[i]))`, with fixed `Z[0] = Z[n] = 1`.
-    pub fn permutation_rows(
-        &self,
-        challenges: &PrimeRamPermutationChallenges,
-    ) -> PrimeRamPermutationR1cs {
+    /// Append explicit quintic-extension grand-product rows with public
+    /// challenge slots. This realizes
+    /// `Z[i+1] * (gamma + R(Q[i])) = Z[i] * (gamma + R(E[i]))`, with fixed
+    /// `Z[0] = Z[n] = 1`, without baking challenge values into the R1CS shape.
+    /// A sound proving lifecycle must assign the slots only after committing
+    /// the relevant RAM columns.
+    pub fn permutation_rows(&self) -> PrimeRamPermutationR1cs {
         let mut next = self.variable_count;
         let mut rows = Vec::new();
+        let gamma = core::array::from_fn(|_| {
+            let variable = next;
+            next += 1;
+            variable
+        });
+        let eta = core::array::from_fn(|_| {
+            let variable = next;
+            next += 1;
+            variable
+        });
+        let compressed_execution = self
+            .execution
+            .iter()
+            .map(|record| allocate_compressed_record(&mut next, &mut rows, record, &gamma, &eta))
+            .collect::<Vec<_>>();
+        let compressed_sorted = self
+            .sorted
+            .iter()
+            .map(|scan| {
+                allocate_compressed_record(&mut next, &mut rows, &scan.record, &gamma, &eta)
+            })
+            .collect::<Vec<_>>();
+        let sorted_denominator_inverse = compressed_sorted
+            .iter()
+            .map(|denominator| {
+                let inverse = core::array::from_fn(|_| {
+                    let variable = next;
+                    next += 1;
+                    variable
+                });
+                let product = extension_product_rows(&mut next, &mut rows, *denominator, inverse);
+                constrain_extension_constant(&mut rows, product, [1, 0, 0, 0, 0]);
+                inverse
+            })
+            .collect::<Vec<_>>();
         let mut z = Vec::with_capacity(self.execution.len() + 1);
         for _ in 0..=self.execution.len() {
             z.push(core::array::from_fn(|_| {
@@ -950,10 +1021,14 @@ impl PrimeRamR1cs {
         constrain_extension_constant(&mut rows, z[0], [1, 0, 0, 0, 0]);
         constrain_extension_constant(&mut rows, *z.last().expect("nonempty Z"), [1, 0, 0, 0, 0]);
         for index in 0..self.execution.len() {
-            let sorted = compressed_record_lcs(&self.sorted[index].record, challenges);
-            let execution = compressed_record_lcs(&self.execution[index], challenges);
-            let left = extension_product_rows(&mut next, &mut rows, z[index + 1], sorted);
-            let right = extension_product_rows(&mut next, &mut rows, z[index], execution);
+            let left = extension_product_rows(
+                &mut next,
+                &mut rows,
+                z[index + 1],
+                compressed_sorted[index],
+            );
+            let right =
+                extension_product_rows(&mut next, &mut rows, z[index], compressed_execution[index]);
             for coordinate in 0..KOALABEAR_QUINTIC_DEGREE {
                 rows.push(equal_variables_row(left[coordinate], right[coordinate]));
             }
@@ -961,6 +1036,11 @@ impl PrimeRamR1cs {
         PrimeRamPermutationR1cs {
             variable_count: next,
             rows,
+            gamma,
+            eta,
+            compressed_execution,
+            compressed_sorted,
+            sorted_denominator_inverse,
             z,
         }
     }
@@ -1196,16 +1276,35 @@ fn allocate_same_cell_time_order_gadget(
     (equal, prefix, first_difference)
 }
 
-fn compressed_record_lcs(
+/// Allocate `gamma + K + eta * value` for one RAM record. The challenge
+/// coefficients are public variables, while `eta_value` is a private auxiliary
+/// constrained as `eta_coordinate * value`.
+fn allocate_compressed_record(
+    next: &mut usize,
+    rows: &mut Vec<R1csRow>,
     record: &PrimeRamRecordLayout,
-    challenges: &PrimeRamPermutationChallenges,
-) -> [LinearCombination; KOALABEAR_QUINTIC_DEGREE] {
-    core::array::from_fn(|coordinate| LinearCombination {
-        constant: challenges.gamma[coordinate],
-        terms: vec![
-            (record.key[coordinate], 1),
-            (record.value, challenges.eta[coordinate]),
-        ],
+    gamma: &[usize; KOALABEAR_QUINTIC_DEGREE],
+    eta: &[usize; KOALABEAR_QUINTIC_DEGREE],
+) -> [usize; KOALABEAR_QUINTIC_DEGREE] {
+    core::array::from_fn(|coordinate| {
+        let eta_value = *next;
+        *next += 1;
+        rows.push(product_row(
+            LinearCombination::var(eta[coordinate]),
+            LinearCombination::var(record.value),
+            eta_value,
+        ));
+        let compressed = *next;
+        *next += 1;
+        rows.push(R1csRow {
+            a: LinearCombination::constant(0),
+            b: LinearCombination::constant(1),
+            c: LinearCombination::var(compressed)
+                .add(gamma[coordinate], -1)
+                .add(record.key[coordinate], -1)
+                .add(eta_value, -1),
+        });
+        compressed
     })
 }
 
@@ -1225,7 +1324,7 @@ fn extension_product_rows(
     next: &mut usize,
     rows: &mut Vec<R1csRow>,
     left: [usize; KOALABEAR_QUINTIC_DEGREE],
-    right: [LinearCombination; KOALABEAR_QUINTIC_DEGREE],
+    right: [usize; KOALABEAR_QUINTIC_DEGREE],
 ) -> [usize; KOALABEAR_QUINTIC_DEGREE] {
     let mut products = [[0usize; KOALABEAR_QUINTIC_DEGREE]; KOALABEAR_QUINTIC_DEGREE];
     for i in 0..KOALABEAR_QUINTIC_DEGREE {
@@ -1234,7 +1333,7 @@ fn extension_product_rows(
             *next += 1;
             rows.push(product_row(
                 LinearCombination::var(left[i]),
-                right[j].clone(),
+                LinearCombination::var(right[j]),
                 products[i][j],
             ));
         }
@@ -1984,21 +2083,16 @@ impl ModeBRelation {
     }
 
     /// Export all supported Boolar, RAM, and permutation constraints in one
-    /// variable coordinate system. Challenges must be derived after committing
-    /// the RAM columns; this method deliberately accepts them rather than
-    /// deriving prover-selectable values.
+    /// static variable coordinate system. For storage circuits, permutation
+    /// challenges are public slots in the R1CS; this exporter deliberately
+    /// does not accept or bake in challenge values. A proving transcript must
+    /// assign those slots only after the required RAM-column commitment.
     pub fn export_unified_r1cs<P: Clone>(
         &self,
         circuit: &BCircuit<P>,
-        challenges: Option<&PrimeRamPermutationChallenges>,
     ) -> Result<UnifiedR1cs, ModeBRelationError> {
         if self.circuit_id != structural_circuit_id(circuit) {
             return Err(ModeBRelationError::CircuitIdMismatch);
-        }
-        match (&self.storage, challenges) {
-            (Some(_), None) => return Err(ModeBRelationError::MissingRamPermutationChallenges),
-            (None, Some(_)) => return Err(ModeBRelationError::UnexpectedRamPermutationChallenges),
-            _ => {}
         }
 
         let mut rows;
@@ -2010,7 +2104,7 @@ impl ModeBRelation {
             // `for_boolar` knows the primary wire span; helpers are allocated
             // by the Boolar lowering and immediately follow that span.
             ram.variable_count = primary_offset + self.witness_count;
-            let permutation = ram.permutation_rows(challenges.expect("checked above"));
+            let permutation = ram.permutation_rows();
             rows = ram.rows.clone();
             rows.extend(permutation.rows.iter().cloned());
             (primary_offset, Some(ram), Some(permutation))
@@ -2019,7 +2113,7 @@ impl ModeBRelation {
             (0, None, None)
         };
         rows.extend(self.rows.iter().map(|row| shift_row(row, primary_offset)));
-        let public_bindings = self
+        let mut public_bindings = self
             .public_bindings
             .iter()
             .map(|binding| match *binding {
@@ -2031,8 +2125,22 @@ impl ModeBRelation {
                     index,
                     wire: primary_offset + wire,
                 },
+                PublicBinding::RamPermutationChallenge { .. } => {
+                    unreachable!("Mode-B relations do not own unified challenge slots")
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if let Some(permutation) = &permutation {
+            public_bindings.extend(permutation.gamma.iter().enumerate().map(|(index, wire)| {
+                PublicBinding::RamPermutationChallenge { index, wire: *wire }
+            }));
+            public_bindings.extend(permutation.eta.iter().enumerate().map(|(index, wire)| {
+                PublicBinding::RamPermutationChallenge {
+                    index: KOALABEAR_QUINTIC_DEGREE + index,
+                    wire: *wire,
+                }
+            }));
+        }
         let variable_count = permutation
             .as_ref()
             .map_or(primary_offset + self.witness_count, |layout| {
@@ -2070,7 +2178,12 @@ impl ModeBRelation {
             claimed_outputs,
             ram_witness,
         )?;
-        let unified = self.export_unified_r1cs(circuit, challenges)?;
+        match (&self.storage, challenges) {
+            (Some(_), None) => return Err(ModeBRelationError::MissingRamPermutationChallenges),
+            (None, Some(_)) => return Err(ModeBRelationError::UnexpectedRamPermutationChallenges),
+            _ => {}
+        }
+        let unified = self.export_unified_r1cs(circuit)?;
         let mut values = vec![None; unified.variable_count];
         for (wire, value) in primary_witness.iter().copied().enumerate() {
             assign_unified_value(&mut values, unified.primary_offset + wire, u32::from(value))?;
@@ -2129,10 +2242,33 @@ impl ModeBRelation {
                 .permutation
                 .as_ref()
                 .expect("RAM has permutation layout");
-            let z = ram_permutation_products(
-                &materialized,
-                challenges.expect("RAM challenges checked"),
-            )?;
+            let challenges = challenges.expect("RAM challenges checked");
+            for (slot, value) in permutation.gamma.iter().zip(challenges.gamma) {
+                assign_unified_value(
+                    &mut values,
+                    *slot,
+                    value.rem_euclid(i64::from(KOALABEAR_MODULUS)) as u32,
+                )?;
+            }
+            for (slot, value) in permutation.eta.iter().zip(challenges.eta) {
+                assign_unified_value(
+                    &mut values,
+                    *slot,
+                    value.rem_euclid(i64::from(KOALABEAR_MODULUS)) as u32,
+                )?;
+            }
+            for (slots, record) in permutation
+                .sorted_denominator_inverse
+                .iter()
+                .zip(&materialized.sorted)
+            {
+                let denominator = compressed_record_value(&record.record, challenges);
+                let inverse = ext_inverse(denominator)?;
+                for (slot, coordinate) in slots.iter().zip(inverse) {
+                    assign_unified_value(&mut values, *slot, coordinate)?;
+                }
+            }
+            let z = ram_permutation_products(&materialized, challenges)?;
             for (slots, value) in permutation.z.iter().zip(z) {
                 for (slot, coordinate) in slots.iter().zip(value) {
                     assign_unified_value(&mut values, *slot, coordinate)?;
@@ -2272,6 +2408,11 @@ impl ModeBRelation {
                 }
                 PublicBinding::Output { index, wire } => {
                     out.push(1);
+                    put_len(&mut out, *index);
+                    put_len(&mut out, *wire);
+                }
+                PublicBinding::RamPermutationChallenge { index, wire } => {
+                    out.push(2);
                     put_len(&mut out, *index);
                     put_len(&mut out, *wire);
                 }

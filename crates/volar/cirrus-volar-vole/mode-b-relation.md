@@ -124,9 +124,10 @@ the field/RAM lowering.
 
 ## Prime-field RAM-permutation lowering v1 (specification)
 
-This subsection is the proposed **relation-level** lowering. It is not yet
-emitted as `R1csRow`s: it needs a chosen field and backend configuration. It
-is the precise target for the companion KoalaBear/Spartan-WHIR exporter.
+This subsection is the implemented **relation-level** lowering target for the
+companion KoalaBear/Spartan-WHIR exporter. The executable exporter emits the
+rows below in a static unified shape; Fiat--Shamir challenge values are public
+slots rather than R1CS constants.
 
 ### Preconditions and fixed bounds
 
@@ -173,10 +174,13 @@ ABI.
 
 Let `E_i` be execution-table records and `Q_i` sorted-table records for
 `0 <= i < n`. The prover commits to every bit/limb column before challenges.
-After both commitments, Fiat--Shamir derives nonzero `gamma` and an
-independent `eta` from a domain-separated transcript including relation bytes,
-public-instance bytes, both commitments, `n`, and the configured bounds.
-Define a complete-record compression:
+After both commitments, Fiat--Shamir derives `gamma` and an independent `eta`
+from a domain-separated transcript including relation bytes, public-instance
+bytes, both commitments, `n`, and the configured bounds. In the R1CS, all ten
+base-field coefficients of `gamma` and `eta` are public variables in a fixed
+slot order: outputs, inputs, `gamma[0..5]`, then `eta[0..5]`. This keeps the
+setup/verifying-key shape static while the verifier recomputes and supplies
+the challenge values for each proof. Define a complete-record compression:
 
 ```text
 R(r) = K(r) + eta * value,
@@ -188,16 +192,23 @@ Z_n = 1.
 ```
 
 Each extension-coordinate equality is materialized as base-field R1CS rows:
-the exporter emits all 25 coordinate products for each extension
-multiplication and reduces them using `X^5 = 1-X^2`. `PrimeRamR1cs` freezes the
-static bit/key/sort/scan layout; after commitments and Fiat--Shamir challenge
-derivation, `PrimeRamR1cs::permutation_rows` emits the `Z` variables and these
-challenge-bound extension multiplication/equality rows. The verifier rejects if any denominator
-`gamma + R(Q_i)` is zero (or the prover samples again using a transcript-bound
-counter and records it); this policy must be identical in prover, Rust
-verifier, and Solidity verifier. The recurrence plus endpoints proves multiset equality except with the usual
-random-compression soundness error. It does **not** prove that `Q` is sorted,
-so ordering and RAM rows remain mandatory.
+the exporter emits explicit `eta_coordinate * value` products, compressed
+`gamma + K + eta * value` variables, all 25 coordinate products for each
+extension multiplication, and reductions using `X^5 = 1-X^2`.
+`PrimeRamR1cs` freezes the static bit/key/sort/scan layout;
+`PrimeRamR1cs::permutation_rows` emits public challenge slots, compressed
+record variables, `Z` variables, and these extension multiplication/equality
+rows without accepting challenge values.
+
+Every sorted-table factor `gamma + R(Q_i)` also receives an extension-inverse
+witness and a product-equals-one constraint. A zero denominator therefore
+makes the relation unsatisfiable instead of allowing a malicious `Z`
+assignment to route around the missing inverse. An honest prover aborts and
+the enclosing transcript must re-randomize/recommit according to the reviewed
+schedule; no prover-selected resampling counter is part of this relation.
+The recurrence, nonzero-denominator rows, plus endpoints proves multiset
+equality except with the usual random-compression soundness error. It does
+**not** prove that `Q` is sorted, so ordering and RAM rows remain mandatory.
 
 ### Sorted-table and latest-value rows
 

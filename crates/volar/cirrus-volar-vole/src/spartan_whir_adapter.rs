@@ -41,7 +41,8 @@ pub struct SpartanWhirAdapterShape {
 pub struct SpartanWhirAdapterWitness {
     /// Private witness columns only.
     pub witness: R1csWitness<F>,
-    /// Public values in `claimed_outputs || public_inputs` order.
+    /// Public values in `claimed_outputs || public_inputs || RAM challenge
+    /// slots` order. Storage-free instances have an empty challenge tail.
     ///
     /// This vector must be independently supplied by the verifier to upstream
     /// verification; it must never be trusted merely because a proof carries a
@@ -112,8 +113,9 @@ pub struct SpartanWhirTraceProof {
 /// Why trace artifacts cannot enter the initial upstream proving lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraceProofBackendError {
-    /// The initial lifecycle supports only storage-free circuits.
-    StorageRequiresChallengeSlots,
+    /// The initial upstream lifecycle supports only storage-free circuits;
+    /// storage needs a post-commitment challenge schedule hook.
+    StorageRequiresTranscriptSchedule,
     /// Upstream setup, proving, or verification failed.
     Upstream(&'static str),
 }
@@ -121,9 +123,9 @@ pub enum TraceProofBackendError {
 impl fmt::Display for TraceProofBackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StorageRequiresChallengeSlots => {
-                f.write_str("storage-bearing trace proofs require transcript challenge slots")
-            }
+            Self::StorageRequiresTranscriptSchedule => f.write_str(
+                "storage-bearing trace proofs require a post-commitment challenge schedule",
+            ),
             Self::Upstream(operation) => write!(f, "upstream spartan-whir {operation} failed"),
         }
     }
@@ -146,7 +148,7 @@ impl TraceProofArtifacts {
         profile: &TraceProofSecurityProfile,
     ) -> Result<SpartanWhirTraceKeys, TraceProofBackendError> {
         if self.unified.ram.is_some() || self.ram_witness.is_some() {
-            return Err(TraceProofBackendError::StorageRequiresChallengeSlots);
+            return Err(TraceProofBackendError::StorageRequiresTranscriptSchedule);
         }
         let adapter = self
             .unified

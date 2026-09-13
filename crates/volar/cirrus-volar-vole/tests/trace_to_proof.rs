@@ -247,7 +247,7 @@ fn storage_free_trace_proves_and_verifies_through_spartan_whir() {
 
 #[cfg(feature = "spartan-whir-adapter")]
 #[test]
-fn storage_trace_is_rejected_until_challenge_slots_exist() {
+fn storage_trace_is_rejected_until_transcript_schedule_exists() {
     let circuit = storage_write_then_read();
     let input = TraceToProofInput {
         audit: commit_boolar_trace(&circuit, &[true, true, false, true]).unwrap(),
@@ -267,6 +267,6 @@ fn storage_trace_is_rejected_until_challenge_slots_exist() {
     };
     assert_eq!(
         error.to_string(),
-        "storage-bearing trace proofs require transcript challenge slots"
+        "storage-bearing trace proofs require a post-commitment challenge schedule"
     );
 }

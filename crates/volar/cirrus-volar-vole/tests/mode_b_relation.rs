@@ -182,20 +182,28 @@ fn relation_rejects_ram_values_outside_the_fixed_extension_abi() {
 fn unified_exporter_has_one_non_overlapping_coordinate_system() {
     let circuit = storage_write_then_read();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
-    let challenges = PrimeRamPermutationChallenges {
-        gamma: [1, 2, 3, 4, 5],
-        eta: [6, 7, 8, 9, 10],
-    };
-    let export = relation
-        .export_unified_r1cs(&circuit, Some(&challenges))
-        .unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
     let ram = export.ram.as_ref().unwrap();
     let permutation = export.permutation.as_ref().unwrap();
     assert_eq!(export.primary_offset, PrimeRamR1cs::new(2).variable_count);
     assert_eq!(permutation.variable_count, export.variable_count);
+    let challenge_wires = export
+        .public_bindings
+        .iter()
+        .filter_map(|binding| match *binding {
+            cirrus_volar_vole::PublicBinding::RamPermutationChallenge { wire, .. } => Some(wire),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(challenge_wires.len(), 2 * KOALABEAR_QUINTIC_DEGREE);
+    assert!(challenge_wires.starts_with(&permutation.gamma));
+    assert!(challenge_wires.ends_with(&permutation.eta));
     assert!(export.public_bindings.iter().all(|binding| match binding {
         cirrus_volar_vole::PublicBinding::Input { wire, .. }
         | cirrus_volar_vole::PublicBinding::Output { wire, .. } => *wire >= export.primary_offset,
+        cirrus_volar_vole::PublicBinding::RamPermutationChallenge { wire, .. } => {
+            *wire >= export.primary_offset
+        }
     }));
     assert!(ram.rows.iter().all(|row| {
         row.a
@@ -205,25 +213,13 @@ fn unified_exporter_has_one_non_overlapping_coordinate_system() {
             .chain(row.c.terms.iter())
             .all(|(variable, _)| *variable < export.variable_count)
     }));
-    assert!(matches!(
-        relation.export_unified_r1cs(&circuit, None),
-        Err(ModeBRelationError::MissingRamPermutationChallenges)
-    ));
 }
 
 #[test]
 fn koalabear_lowering_normalizes_signed_and_duplicate_coefficients() {
     let circuit = storage_write_then_read();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
-    let export = relation
-        .export_unified_r1cs(
-            &circuit,
-            Some(&PrimeRamPermutationChallenges {
-                gamma: [-1, 2, 3, 4, 5],
-                eta: [6, 7, 8, 9, 10],
-            }),
-        )
-        .unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
     let lowered = export.lower_koalabear().unwrap();
     assert_eq!(lowered.modulus, KOALABEAR_MODULUS);
     assert_eq!(lowered.variable_count, export.variable_count);
@@ -265,7 +261,7 @@ fn unified_field_witness_materializes_and_satisfies_boolean_rows() {
             None,
         )
         .unwrap();
-    let export = relation.export_unified_r1cs(&circuit, None).unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
     assert_eq!(witness.values.len(), export.variable_count);
     export.evaluate_koalabear_witness(&witness).unwrap();
 }
@@ -289,15 +285,7 @@ fn unified_field_witness_materializes_and_satisfies_storage_rows() {
             }),
         )
         .unwrap();
-    let export = relation
-        .export_unified_r1cs(
-            &circuit,
-            Some(&PrimeRamPermutationChallenges {
-                gamma: [11, 12, 13, 14, 15],
-                eta: [16, 17, 18, 19, 20],
-            }),
-        )
-        .unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
     assert_eq!(witness.values.len(), export.variable_count);
     export.evaluate_koalabear_witness(&witness).unwrap();
 }
@@ -307,7 +295,7 @@ fn spartan_whir_shape_uses_witness_one_public_column_order() {
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
     let shape = relation
-        .export_unified_r1cs(&circuit, None)
+        .export_unified_r1cs(&circuit)
         .unwrap()
         .lower_koalabear()
         .unwrap()
@@ -334,7 +322,7 @@ fn spartan_whir_shape_uses_witness_one_public_column_order() {
 }
 
 #[test]
-fn unified_exporter_rejects_ram_challenges_without_storage() {
+fn witness_materialization_rejects_ram_challenges_without_storage() {
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
     let challenges = PrimeRamPermutationChallenges {
@@ -342,10 +330,17 @@ fn unified_exporter_rejects_ram_challenges_without_storage() {
         eta: [0; 5],
     };
     assert!(matches!(
-        relation.export_unified_r1cs(&circuit, Some(&challenges)),
+        relation.materialize_unified_witness(
+            &circuit,
+            &[true, false, true, false],
+            &[true, false],
+            &[true, false],
+            None,
+            Some(&challenges),
+        ),
         Err(ModeBRelationError::UnexpectedRamPermutationChallenges)
     ));
-    let export = relation.export_unified_r1cs(&circuit, None).unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
     assert_eq!(export.primary_offset, 0);
     assert_eq!(export.variable_count, relation.witness_count);
 }
@@ -374,10 +369,7 @@ fn prime_ram_r1cs_has_a_deterministic_static_scan_layout() {
     assert_eq!(a.sorted[0].cell_bit_equal.len(), 0);
     assert_eq!(a.sorted[1].cell_bit_equal.len(), 64);
     assert_eq!(a.sorted[1].cell_first_difference.len(), 64);
-    let permutation = a.permutation_rows(&PrimeRamPermutationChallenges {
-        gamma: [1, 2, 3, 4, 5],
-        eta: [6, 7, 8, 9, 10],
-    });
+    let permutation = a.permutation_rows();
     assert_eq!(permutation.z.len(), 3);
     assert!(permutation.variable_count > a.variable_count);
     assert!(!permutation.rows.is_empty());
@@ -422,7 +414,7 @@ fn spartan_whir_adapter_preserves_shape_and_witness_layout() {
 
     let circuit = half_adder();
     let relation = ModeBRelation::from_boolar(&circuit).unwrap();
-    let unified = relation.export_unified_r1cs(&circuit, None).unwrap();
+    let unified = relation.export_unified_r1cs(&circuit).unwrap();
     let witness = relation
         .materialize_unified_witness(
             &circuit,
@@ -587,4 +579,151 @@ fn native_vole_verifier_relation_rejects_bad_hat_and_topology() {
         schedule_boolar_constraints(&unsupported, VoleVerifierSemantics::new([0; 32], 2),),
         Err(ModeBRelationError::UnsupportedStatement { wire: 1 })
     ));
+}
+
+#[test]
+fn ram_challenge_slots_keep_the_r1cs_shape_static() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let primary = [true, true, false, true];
+    let ram = cirrus_volar_vole::RamWitness::from_boolar(&circuit, &primary).unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
+    assert_eq!(export, relation.export_unified_r1cs(&circuit).unwrap());
+
+    let challenges_a = PrimeRamPermutationChallenges {
+        gamma: [11, 12, 13, 14, 15],
+        eta: [16, 17, 18, 19, 20],
+    };
+    let challenges_b = PrimeRamPermutationChallenges {
+        gamma: [21, 22, 23, 24, 25],
+        eta: [26, 27, 28, 29, 30],
+    };
+    let witness_a = relation
+        .materialize_unified_witness(
+            &circuit,
+            &primary,
+            &[true, true],
+            &[true],
+            Some(&ram),
+            Some(&challenges_a),
+        )
+        .unwrap();
+    let witness_b = relation
+        .materialize_unified_witness(
+            &circuit,
+            &primary,
+            &[true, true],
+            &[true],
+            Some(&ram),
+            Some(&challenges_b),
+        )
+        .unwrap();
+    export.evaluate_koalabear_witness(&witness_a).unwrap();
+    export.evaluate_koalabear_witness(&witness_b).unwrap();
+
+    let permutation = export.permutation.as_ref().unwrap();
+    for (index, slot) in permutation.gamma.iter().enumerate() {
+        assert_eq!(witness_a.values[*slot], challenges_a.gamma[index] as u32);
+        assert_eq!(witness_b.values[*slot], challenges_b.gamma[index] as u32);
+    }
+    for (index, slot) in permutation.eta.iter().enumerate() {
+        assert_eq!(witness_a.values[*slot], challenges_a.eta[index] as u32);
+        assert_eq!(witness_b.values[*slot], challenges_b.eta[index] as u32);
+    }
+}
+
+#[test]
+fn spartan_whir_shape_orders_ram_challenges_after_statement_values() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let export = relation.export_unified_r1cs(&circuit).unwrap();
+    let permutation = export.permutation.as_ref().unwrap();
+    let shape = export
+        .lower_koalabear()
+        .unwrap()
+        .export_spartan_whir_shape()
+        .unwrap();
+    let mut expected = vec![
+        export.primary_offset + 3,
+        export.primary_offset,
+        export.primary_offset + 1,
+    ];
+    expected.extend(permutation.gamma);
+    expected.extend(permutation.eta);
+    assert_eq!(shape.public_wires, expected);
+    assert_eq!(shape.public_input_count, 3 + 2 * KOALABEAR_QUINTIC_DEGREE);
+}
+
+#[test]
+fn ram_challenge_slots_reject_a_zero_sorted_factor() {
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let primary = [true, true, false, true];
+    let ram = cirrus_volar_vole::RamWitness::from_boolar(&circuit, &primary).unwrap();
+    let materialized = cirrus_volar_vole::PrimeRamMaterialization::from_ram_witness(&ram).unwrap();
+    let key = materialized.sorted[0].record.key;
+    let challenges = PrimeRamPermutationChallenges {
+        gamma: key.map(|coordinate| -i64::from(coordinate)),
+        eta: [0; KOALABEAR_QUINTIC_DEGREE],
+    };
+    assert!(matches!(
+        relation.materialize_unified_witness(
+            &circuit,
+            &primary,
+            &[true, true],
+            &[true],
+            Some(&ram),
+            Some(&challenges),
+        ),
+        Err(ModeBRelationError::RamPermutationZeroDenominator)
+    ));
+}
+
+#[cfg(feature = "spartan-whir-adapter")]
+#[test]
+fn spartan_whir_adapter_includes_the_ram_challenge_tail() {
+    use p3_field::PrimeField32;
+
+    let circuit = storage_write_then_read();
+    let relation = ModeBRelation::from_boolar(&circuit).unwrap();
+    let primary = [true, true, false, true];
+    let ram = cirrus_volar_vole::RamWitness::from_boolar(&circuit, &primary).unwrap();
+    let challenges = PrimeRamPermutationChallenges {
+        gamma: [11, 12, 13, 14, 15],
+        eta: [16, 17, 18, 19, 20],
+    };
+    let unified = relation.export_unified_r1cs(&circuit).unwrap();
+    let witness = relation
+        .materialize_unified_witness(
+            &circuit,
+            &primary,
+            &[true, true],
+            &[true],
+            Some(&ram),
+            Some(&challenges),
+        )
+        .unwrap();
+    let adapter = unified
+        .lower_koalabear()
+        .unwrap()
+        .export_spartan_whir_shape()
+        .unwrap()
+        .to_spartan_whir_adapter();
+    adapter.validate().unwrap();
+    let split = adapter.split_witness(&witness).unwrap();
+    spartan_whir::validate_satisfaction(&adapter.shape, &split.witness, &split.public_values)
+        .unwrap();
+    let expected = [1, 1, 1]
+        .into_iter()
+        .chain(challenges.gamma.map(|value| value as u32))
+        .chain(challenges.eta.map(|value| value as u32))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        split
+            .public_values
+            .iter()
+            .map(|value| value.as_canonical_u32())
+            .collect::<Vec<_>>(),
+        expected
+    );
 }

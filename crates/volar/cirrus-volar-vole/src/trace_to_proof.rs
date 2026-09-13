@@ -34,17 +34,17 @@ pub struct TraceToProofInput {
     pub claimed_outputs: Vec<bool>,
 }
 
-/// RAM challenge inputs for the current differential-oracle RAM relation.
+/// RAM challenge values for the current differential-oracle witness builder.
 ///
-/// This is **not** a deployed proving lifecycle. The future proof transcript
-/// must derive these values after committing the relevant witness columns and
-/// expose them as public challenge slots in a static R1CS shape.
+/// This is **not** a deployed proving lifecycle. The relation now contains
+/// public challenge slots in a static R1CS shape; a real proof transcript must
+/// derive these values after committing the relevant witness columns and the
+/// verifier must independently recompute them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RamChallengeInput {
     /// The circuit is storage-free.
     NoStorage,
-    /// Test-only externally supplied challenges for the existing
-    /// constant-encoded RAM permutation rows.
+    /// Test-only externally supplied challenge-slot values.
     DifferentialOracle(PrimeRamPermutationChallenges),
 }
 
@@ -166,8 +166,8 @@ pub enum TraceToProofError {
     MissingMemoryAudit,
     /// A RAM witness was present for a storage-free circuit.
     UnexpectedMemoryAudit,
-    /// A storage-bearing preparation requires challenges under the current
-    /// constant-encoded RAM row format.
+    /// A storage-bearing witness materialization requires challenge-slot
+    /// values from the (currently test-only) caller.
     MissingRamChallenges,
     /// Challenges were supplied for a circuit without storage.
     UnexpectedRamChallenges,
@@ -269,7 +269,7 @@ pub fn build_trace_proof_artifacts<P: Clone>(
         input.public_inputs.clone(),
         input.claimed_outputs.clone(),
     );
-    let unified = relation.export_unified_r1cs(circuit, challenges.as_ref())?;
+    let unified = relation.export_unified_r1cs(circuit)?;
     let witness = relation.materialize_unified_witness(
         circuit,
         &trace_values,
