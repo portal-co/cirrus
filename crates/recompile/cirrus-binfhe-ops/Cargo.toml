@@ -7,3 +7,9 @@ description = "Test-only BinFHE V2 Toy operation set for CRBV compact variants"
 [dependencies]
 cirrus-recompile-bytecode = { version = "0.1.0", path = "../cirrus-recompile-bytecode" }
 volar-spec.workspace = true
+
+[dev-dependencies]
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+cirrus-volar-boolar = { version = "0.1.0", path = "../../volar/cirrus-volar-boolar" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }

@@ -210,6 +210,9 @@ pub enum VariantError {
     /// The recomputed source digest does not match the supplied base
     /// executable.
     SourceMismatch,
+    /// A v1 whole-entry variant only binds a pure base region: the base
+    /// executable declares storage banks or static initialization.
+    EffectfulBase,
     /// A v1 whole-entry binding must not import or export RLWE cells.
     UnsupportedCellBinding,
     /// A whole-entry binding does not reproduce the base input/output slot
@@ -782,7 +785,9 @@ impl<'a> VariantProgram<'a> {
     /// Verify the v1 whole-entry binding against a validated base CRBC
     /// executable.
     ///
-    /// This recomputes the source digest and enforces the v1 contract: no
+    /// This recomputes the source digest and enforces the v1 contract: the
+    /// base is a pure region (no storage banks or static initialization, so
+    /// no effect can hide inside a byte-identical executable), there are no
     /// cell imports or exports (base `Program` storage is Boolean-wire, not
     /// the V2 RLWE-cell model), every wire import names a base input slot,
     /// and the wire export destinations reproduce the base output slot table
@@ -791,6 +796,9 @@ impl<'a> VariantProgram<'a> {
     pub fn check_source(&self, base: &CompactProgram<'_>) -> Result<(), VariantError> {
         if compute_source_digest(self.kind, self.version, base.bytes()) != self.source_digest {
             return Err(VariantError::SourceMismatch);
+        }
+        if !base.banks.is_empty() || !base.init.is_empty() {
+            return Err(VariantError::EffectfulBase);
         }
         if self.cell_imports.count != 0 || self.cell_exports.count != 0 {
             return Err(VariantError::UnsupportedCellBinding);
