@@ -5,9 +5,10 @@
 > either repository's WIP API stable.
 >
 > **Source snapshot:** Volar `727ee67be2cd572090cb4d098b60ef13b18da597`
-> (`Add BinFheScheme weaver, cone-fusion plan builder, and plan codegen`). Its
-> working tree was dirty when this plan was written; the commit, not the
-> worktree, is the normative source snapshot.
+> (`Add BinFheScheme weaver, cone-fusion plan builder, and plan codegen`),
+> plus the uncommitted local V2 import-cleanup changes observed during Phase A.
+> The Phase-A Volar adapter additions are committed separately below; unrelated
+> dirty worktree changes remain out of scope.
 >
 > **Decision:** retain Volar as the sole producer of FHE fusion and scheduling.
 > Transcode its validated `BootstrapPlan` plus explicit source bindings into a
@@ -319,15 +320,18 @@ rather than rollback candidates.
 
 ### Phase A — contracts and adapters (Volar-first)
 
-1. In Volar, add a canonical `BootstrapPlan` encoder/decoder or a dedicated
-   adapter-facing view. It must be separate from `rkyv` and cover all fields
-   consumed by CRBV. Add deterministic round-trip and hash/golden tests.
-2. Add a `PlanRegionBinding` result from the weaver: source Boolar IDs,
-   ordered imports/exports, source-region identity, profile, and explicit
-   effect/control barrier result. Do not expose a plan without a binding.
-3. Add a Volar baseline plan interpreter trait that can run `PlanOp` over
-   clear booleans independently of the BinFHE cryptographic executor.
-4. Commit in Volar separately, with its existing V2 marker/status rules.
+1. **Done:** `volar_spec::binfhe::plan_codec` is a fixed-width canonical
+   `VBP1` encoder/decoder, separate from `rkyv`, covering the V2 plan fields
+   CRBV needs. It rejects unknown tags, non-Boolean packed-table padding,
+   oversized collections, invalid plans, and trailing data.
+2. **Done:** `build_bootstrap_plan_with_binding` returns `PlanRegionBinding`
+   with source Boolar input/output IDs, and rejects static pre-initialization.
+   Existing statement/CFG rejection remains in the underlying builder.
+3. **Done:** `BootstrapPlan::execute_clear` is an independent clear semantic
+   oracle, including explicit circuit-bootstrap and RGSW-mux semantics.
+4. Phase A commits separately in Volar with V2 markers retained. It does not
+   invent partial-region identity: the initial binding is intentionally the
+   existing whole pure Boolar circuit contract.
 
 ### Phase B — CRBV format and clear interpreter (Cirrus)
 
@@ -417,9 +421,11 @@ Before implementation, decide:
 - Volar `docs/fhe/binfhe-v2-implementation-plan.md`, §§2, 5, 7–8, 10;
   snapshot `727ee67`. Defines V2 status, one scheduler/data plan decision,
   `BootstrapPlan`, V2 milestones, and security gates.
-- Volar `crates/spec/volar-spec/src/binfhe/plan.rs`; snapshot `727ee67`.
-  Primary code source for `PlanOp`, typed arenas, validation, layers, hash, and
-  `execute_plan` reference semantics.
+- Volar `crates/spec/volar-spec/src/binfhe/plan.rs` and
+  `plan_codec.rs`; snapshot `727ee67` plus Phase-A adapter additions.
+  Primary code source for `PlanOp`, typed arenas, validation, layers, hash,
+  clear semantics, canonical adapter bytes, and `execute_plan` reference
+  semantics.
 - Volar `crates/compiler/volar-weaver/src/fhe_binfhe.rs`; snapshot `727ee67`.
   Primary source for fusion, scheduling, unsupported effect barriers, and
   generated-code consumption.
