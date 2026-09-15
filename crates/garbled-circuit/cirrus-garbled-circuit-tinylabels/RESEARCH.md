@@ -1,5 +1,11 @@
 # TinyLabels Ring-LWE implementation research
 
+> **Implementation ownership:** the typed Ring-LWE implementation described
+> here moved to [`volar_spec::tinylabels`](../../../../../../mpc/volar/crates/spec/volar-spec/src/tinylabels/).
+> This crate now re-exports that shared core and retains only Cirrus-facing
+> adapter responsibilities. Keep this audit history with the shared source;
+> fixes must land in Volar, not as a Cirrus fork.
+
 Status: implementation design input, not a security claim. This note reviews
 the primary paper and the authors' artifact/reference implementation so that a
 Rust backend does not accidentally promote the current local label selector to

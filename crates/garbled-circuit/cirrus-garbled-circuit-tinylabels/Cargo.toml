@@ -5,3 +5,4 @@ version.workspace = true
 description = "TinyLabels-directed input-label batching for cirrus"
 
 [dependencies]
+volar-spec.workspace = true
