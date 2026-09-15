@@ -6,6 +6,11 @@
 //! resource, and bounded-stream framing: a protected deployment still needs
 //! the shared core's reviewed sampler and canonical polynomial codec.
 
+#[cfg(any(target_os = "none", target_arch = "arm", target_arch = "riscv32"))]
+compile_error!(
+    "tinylabels-server is a server-class profile and is unavailable on embedded Cirrus targets"
+);
+
 use volar_spec::tinylabels::frame::FrameBinding;
 
 /// Ordered external labels for one fixed Cirrus interpreter trace.
