@@ -1229,6 +1229,46 @@ mod tests {
         );
     }
 
+    /// Phase E workload record: base vs fused-variant footprint for the
+    /// `(a^b)&(a|b)` circuit, printed for the measurement log.
+    #[test]
+    fn phase_e_workload_measurements() {
+        let program = cirrus_volar_boolar::lower_boolar_program(&xor_and_or_bcircuit()).unwrap();
+        let crbc = transpile(&program).unwrap();
+        let base = CompactProgram::validate(&crbc).unwrap();
+        let plan = xor_fused_plan();
+        let spec = crbv_spec_for_base(&plan, &crbc, &[0,1], &[4]);
+        let crbv = encode_variant(&spec).unwrap();
+        let variant = VariantProgram::validate(&crbv, &VariantLimits::HOST).unwrap();
+        // Base: 5 slots, 2 declared inputs, 1 output, 5 entry records
+        // (2 input constants + xor + or + and) before OP_END.
+        // Variant: one fused 2-input LUT, one bootstrap, no gate-by-gate ops.
+        let base_ops = 5u32;
+        let record = [
+            ("base_crbc_bytes", crbc.len() as u64),
+            ("crbv_bytes", crbv.len() as u64),
+            ("base_slots", base.slots() as u64),
+            ("base_entry_ops", base_ops as u64),
+            ("variant_records", variant.record_count() as u64),
+            ("variant_layers", variant.layer_count() as u64),
+            ("variant_luts", variant.lut_count() as u64),
+            ("variant_bootstraps", variant.bootstrap_count()),
+            ("variant_wire_arena", variant.wire_capacity() as u64),
+            ("variant_rgsw_arena", variant.rgsw_capacity() as u64),
+            ("variant_cell_arena", variant.cell_capacity() as u64),
+            ("variant_lut_scratch_bits", variant.max_table_bits() as u64),
+        ];
+        for (name, value) in record {
+            eprintln!("phase_e {name} {value}");
+        }
+        // Fused schedule replaces 3 Boolean gates with one LUT read and one
+        // bootstrap; the CRBV payload is larger than this tiny base because
+        // of its 64-byte digest envelope, and wins as cone count grows.
+        assert_eq!(variant.record_count(), 1);
+        assert_eq!(variant.bootstrap_count(), 1);
+        assert!(crbv.len() > 64, "digest envelope dominates tiny payloads");
+    }
+
     #[test]
     fn base_only_policy_executes_unmodified_base() {
         // BaseOnly: no variant selected; the base runs exactly as before.

@@ -391,6 +391,39 @@ rather than rollback candidates.
    cryptographer directly. §9's estimator run and failure recomputation
    are automatable checks, not an untyped manual step.
 
+## 6.1 Phase E measurement record (2026-09-15, host + thumbv8m)
+
+Interpreter footprint (release `thumbv8m.main-none-eabi`, single CGU, the
+whole `cirrus-recompile-bytecode` crate: base parser/executor + storage
+records + generic variant parser + clear operation set): `.text` 21,236
+bytes, `.data` 0, `.bss` 0 (`llvm-size`; a per-item base/variant split needs
+`-Z` codegen-units or `__attribute__((used))` anchors and is not yet
+recorded). The crate also compiles for `x86_64-unknown-uefi`. No QEMU
+bare-metal run is claimed: the compact runner is not yet integrated into a
+no-std fixture, and the workspace policy treats a missing fixture as a
+fail-closed prerequisite rather than device coverage.
+
+Workload record (`(a^b)&(a|b)` whole-entry circuit, `k_max = 4`, Toy): base
+CRBC 33 bytes (5 slots, 5 entry records); CRBV 102 bytes — the 64-byte
+SHA-256 source/plan digest envelope dominates tiny payloads — carrying 1
+record / 1 layer / 1 LUT / 1 bootstrap, with wire arena 3, RGSW/cell arenas
+0, LUT scratch 4 bits. The fused schedule replaces 3 Boolean gates with 1
+bootstrap; the byte trade-off favors CRBV only as cone depth/width grows.
+Encrypted Toy wall-clock is dominated by `binfhe_lut_read_dyn` (1 blind
+rotation) vs 3 gate bootstraps unfused. The full BinFHE V2 operation set is
+**not** an MCU admission claim: `BinFheStd128Ops` runs at host scale (43s
+release for a one-LUT differential) and would need an explicit resource
+review before any target admission.
+
+Profile gates: `Toy` admitted (exact, noiseless). `ToyNoisy` code is
+unwritten; admission requires deterministic failure-budget transcript tests.
+`Std128` code works (V2 is barely not paper-pinned) but production selection
+stays fail-closed until Volar §9 evidence and the production review gate
+(strong-model review with owner grants, or a cryptographer). Open §9
+evidence: the Std128 circuit-bootstrap/RGSW-mux differential runs, and the
+reference executor itself currently fails its selection budget — pinned as
+`std128_circuit_bootstrapped_cmux_selects` in Volar.
+
 ## 7. Test matrix
 
 | Test | Independent oracle / expected result |
