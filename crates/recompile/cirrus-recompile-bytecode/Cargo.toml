@@ -7,3 +7,4 @@ description = "Canonical compact bytecode for Cirrus Boolean programs"
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
+sha2 = { version = "0.11.0", default-features = false }

@@ -11,6 +11,9 @@
 
 extern crate alloc;
 
+/// Generic, capability-gated compact variants, including BinFHE V2 schedules.
+pub mod variant;
+
 use alloc::vec::Vec;
 use cirrus_recompile_core::{Idx, Op, Program};
 
