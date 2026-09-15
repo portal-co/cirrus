@@ -347,9 +347,11 @@ fn validate_init(bytes: &[u8], banks: &[u8], bank_count: usize) -> Result<(), De
         if bank as usize >= bank_count { return Err(DecodeError::InvalidSection); }
         let address = reader.u32()?;
         let bits = reader.u32()?;
-        if bits == 0 || bits > bank_address_bits(banks, bank)? { return Err(DecodeError::InvalidSection); }
         let address_bits = bank_address_bits(banks, bank)?;
-        if address_bits < 32 && address >= (1u32 << address_bits) { return Err(DecodeError::InvalidSection); }
+        let capacity = 1u64 << address_bits;
+        if bits == 0 || u64::from(address) >= capacity || u64::from(address) + u64::from(bits) > capacity {
+            return Err(DecodeError::InvalidSection);
+        }
         for _ in 0..bits {
             if reader.byte()? > 1 { return Err(DecodeError::InvalidInstruction); }
         }
