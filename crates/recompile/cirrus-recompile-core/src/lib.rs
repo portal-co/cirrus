@@ -1174,10 +1174,10 @@ impl PreparedOp {
                 out: static_slot(out)?,
                 op: Op::External(external),
             }),
-            Self::Storage { storage, out } => Some(ScheduledOp {
-                out: static_slot(out)?,
-                op: Op::Storage(storage),
-            }),
+            // Storage operations are effectful and require their own
+            // table-aware lowering before loop reabstraction can preserve
+            // bank/address semantics.
+            Self::Storage { .. } => None,
         }
     }
 }
@@ -2167,6 +2167,12 @@ impl PreparedProgram {
     /// stays correct exactly because no computed value is ever assigned an
     /// input's slot.
     pub fn compact_slots(&self) -> Self {
+        // An effect placeholder has no backend value to allocate. Keep the
+        // original slots until storage-aware liveness/rewrite is implemented
+        // rather than accidentally treating it as an ordinary value.
+        if !self.storage_ops.is_empty() {
+            return self.clone();
+        }
         let liveness = self.compute_liveness();
         let assignment = self.assign_compact_slots(&liveness);
         self.rewrite_with(&assignment)
