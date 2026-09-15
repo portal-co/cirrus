@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cirrus-asm", "crates/cirrus-core", "crates/cirrus-coroutine", "crates/cirrus-coroutine-selftest", "crates/ert/cirrus-ert-core", "crates/ert/cirrus-ert", "crates/ert/cirrus-armv8m-ert", "crates/ert/cirrus-ert-rt", "crates/ert/cirrus-ert-sha256-fixture", "crates/ert/cirrus-ert-selftest", "crates/ert/cirrus-armv8m-ert-selftest", "crates/garbled-circuit/cirrus-garbled-circuit", "crates/garbled-circuit/cirrus-garbled-circuit-row-reduced", "crates/garbled-circuit/cirrus-garbled-circuit-tinylabels", "crates/cirrus-mpc-common", "crates/cirrus-vole", "crates/miniot", "crates/recompile/cirrus-recompile-core", "crates/recompile/cirrus-recompile-rt", "crates/recompile/cirrus-llvm", "crates/recompile/cirrus-llvm-frontend", "crates/recompile/cirrus-llvm-pass-api", "crates/recompile/cirrus-llvm-pass", "crates/recompile/cirrus-rust-codegen", "crates/recompile/cirrus-recompile-tests", "crates/zk/cirrus-r1cs-backend", "crates/zk/cirrus-groth16", "crates/zk/cirrus-zk-tests", "crates/volar/cirrus-volar-boolar", "crates/volar/cirrus-volar-garble", "crates/volar/cirrus-volar-vole", "crates/volar/cirrus-spartan-whir"]
+members = ["crates/cirrus-asm", "crates/cirrus-core", "crates/cirrus-coroutine", "crates/cirrus-coroutine-selftest", "crates/ert/cirrus-ert-core", "crates/ert/cirrus-ert", "crates/ert/cirrus-armv8m-ert", "crates/ert/cirrus-ert-rt", "crates/ert/cirrus-ert-sha256-fixture", "crates/ert/cirrus-ert-selftest", "crates/ert/cirrus-armv8m-ert-selftest", "crates/garbled-circuit/cirrus-garbled-circuit", "crates/garbled-circuit/cirrus-garbled-circuit-row-reduced", "crates/garbled-circuit/cirrus-garbled-circuit-tinylabels", "crates/cirrus-mpc-common", "crates/miniot", "crates/recompile/cirrus-recompile-core", "crates/recompile/cirrus-recompile-rt", "crates/recompile/cirrus-llvm", "crates/recompile/cirrus-llvm-frontend", "crates/recompile/cirrus-llvm-pass-api", "crates/recompile/cirrus-llvm-pass", "crates/recompile/cirrus-rust-codegen", "crates/recompile/cirrus-recompile-tests", "crates/zk/cirrus-r1cs-backend", "crates/zk/cirrus-groth16", "crates/zk/cirrus-zk-tests", "crates/volar/cirrus-volar-boolar", "crates/volar/cirrus-volar-garble", "crates/volar/cirrus-volar-vole", "crates/volar/cirrus-spartan-whir"]
 resolver = "3"
 
 [workspace.package]
@@ -43,6 +43,10 @@ ark-std = { version = "0.6.0", default-features = false }
 # variant, unlike volar-ir/waffle-) -- do not add an unqualified-URL patch
 # block for this; nothing needs it.
 volar-spec = { version = "0.1.0", git = "https://github.com/portal-co/volar.git" }
+# Evaluator-side Path-ORAM client for the Cirrus GRAM interpreter. Retained
+# with the feature branch's GRAM host work; it uses the same patched Volar
+# source spelling as `volar-spec`.
+volar-oram = { version = "0.1.0", git = "https://github.com/portal-co/volar.git" }
 # Pinned to match volar-spec's own Cargo.toml exactly.
 cipher = { version = "0.5.1", default-features = false }
 digest = { version = "0.11.3", default-features = false }
