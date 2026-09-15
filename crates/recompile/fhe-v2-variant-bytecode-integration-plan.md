@@ -360,11 +360,18 @@ rather than rollback candidates.
 
 ### Phase D — base-CRBC replacement integration
 
-1. Add whole-entry variant selection plus explicit base/variant execution
-   policy. Keep normal CRBC execution as a supported fallback chosen *before*
-   execution.
-2. Add effect/storage/external barrier tests proving a plan cannot cover such
-   statements. Add source-digest mismatch and capability/profile mismatch tests.
+1. **Done (host-side):** `crbv_spec_for_base` in `cirrus-binfhe-ops`
+   transcodes a validated `BootstrapPlan` into a CRBV spec bound to one base
+   CRBC executable (digest, imports from base input slots, exports from base
+   output slots). Whole-entry base/variant selection is exercised: base-only,
+   clear variant, and encrypted variant agree. **Deferred:** the unified
+   CRBC/CRBV container that carries a variant section *inside* the base
+   executable and drives selection from the payload.
+2. **Done:** effect/storage barrier tests prove a plan cannot cover storage
+   pre-initialization or storage records — v1 whole-entry binding rejects any
+   base that declares storage (a width-0 bank/init can be digest-identical,
+   so the digest alone is not a purity proof). Source-digest mismatch and
+   capability/profile mismatch tests are green.
 3. Only after these pass, design structured partial-region `VARIANT_CALL` and
    its liveness proof format.
 
