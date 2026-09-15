@@ -305,6 +305,7 @@ where
             Op::External(_) => {
                 panic!("execute: external program needs execute_with_externals")
             }
+            Op::Storage(_) => panic!("execute: storage program needs a storage executor"),
         };
         buf[i] = Some(result);
     }
@@ -381,6 +382,9 @@ where
                     .expect("external operation must reference program metadata"),
                 &buf,
             )?,
+            Op::Storage(_) => {
+                panic!("execute_with_externals: storage program needs a storage executor")
+            }
         };
         buf[i] = Some(result);
     }
@@ -599,6 +603,9 @@ where
         Op::External(_) => {
             panic!("execute_prepared: external program needs execute_prepared_with_externals")
         }
+        Op::Storage(_) => {
+            panic!("execute_prepared: storage program needs a storage executor")
+        }
     };
     buf[scheduled.out.get()] = Some(result);
     Ok(())
@@ -711,6 +718,9 @@ where
                 .expect("external operation must reference program metadata"),
             buf,
         )?,
+        Op::Storage(_) => {
+            panic!("execute_prepared_with_externals: storage program needs a storage executor")
+        }
     };
     buf[scheduled.out.get()] = Some(result);
     Ok(())
@@ -827,6 +837,9 @@ mod tests {
                         ),
                         Op::External(_) => {
                             panic!("pinned plaintext executor needs an external registry")
+                        }
+                        Op::Storage(_) => {
+                            panic!("pinned plaintext executor needs a storage executor")
                         }
                     }
                 }
