@@ -57,10 +57,33 @@ Two adapters sit at that seam:
   resource admission. It is host/server-only until a separate embedded
   feasibility proof exists.
 
-The existing `cirrus-garbled-circuit-tinylabels` crate is already the natural
-implementation home. Its `LabelBatch` establishes the allocation-free shape;
-its `ring_lwe::BatchSelect` establishes typed mathematical stages. Neither is
-yet the security protocol.
+The existing `cirrus-garbled-circuit-tinylabels` crate is the migration seed,
+not the long-term cryptographic implementation home. Its `LabelBatch`
+establishes the allocation-free Cirrus adapter shape; its
+`ring_lwe::BatchSelect` establishes typed mathematical stages. Port the latter
+into Volar as the single shared `volar_spec::tinylabels` implementation. After
+shared conformance vectors pass, reduce this Cirrus crate to the
+interpreter-facing delivery adapter/re-export or delete it if that leaves no
+Cirrus-only surface. Neither current form is yet the security protocol.
+
+### Shared core lives in Volar
+
+Volar's `volar-spec` becomes the source of truth at the construction seam,
+with a planned opt-in `volar_spec::tinylabels` module. It owns the
+construction-neutral `no_std + alloc` logic: profile validation, canonical
+16-byte-label/field encoding, Ring-LWE stages, CSPRNG/noise interfaces and
+vetted implementations, canonical stage-frame codecs, and interoperability
+vectors. It must not depend on `cirrus-core`, ERT, coroutine scheduling, or a
+TCP transport.
+
+Cirrus already obtains `volar-spec` through its workspace patch, so it should
+consume that shared module rather than carrying a fork. Cirrus retains only
+what genuinely varies at its seam: input manifests derived from fixed
+interpreter traces, bounded coroutine framing, and policy that rejects the
+mode on embedded profiles. `volar-mpc` separately retains strict-session
+transcript binding. This division gives one mathematical implementation,
+three small adapters, and no forced dependency of embedded execution on the
+server profile.
 
 ### Preserve streaming and interpreter locality
 
@@ -96,28 +119,35 @@ or durable-storage implementation.
    an explicit `TinyLabelsServer` selection.
 2. Make profile construction reject TinyLabels on `target_os = "none"`, ARM,
    and RV32 builds unless a future dedicated embedded profile supplies a
-   measured bound.
+   measured bound. This is an admission-policy rejection, not a reason to fork
+   the shared core into an embedded-specific implementation.
 3. Keep label width fixed at 16 bytes. The profile changes delivery mechanics,
    not `Label<N>` or the global free-XOR relation.
 
-### C1 — finish TinyLabels protocol prerequisites
+### C1 — migrate and complete the shared TinyLabels core
 
-1. Define a canonical injective `Label<16> <-> [Z_p; 3]` encoding, exact
-   inverse, endianness, and malformed-value rejection. Test that selection
-   reconstructs raw labels byte-for-byte and does not alter the free-XOR
-   relation.
-2. Define canonical stage frames for `pp`, reusable `ct1`, per-use `ct2`,
-   selection/key material, and completion/error. Every frame carries a version,
-   parameter fingerprint, stage, exact count, direction, session ID, manifest
-   digest, and authenticated length.
-3. Add bounded streaming encoders/decoders rather than allocating a reference
-   profile's state. Raw SEAL NTT dumps remain forbidden as a wire format.
+1. Port `cirrus-garbled-circuit-tinylabels::ring_lwe` into the planned
+   `volar_spec::tinylabels` module without changing its intentional security
+   status. Move the existing arithmetic/reference-profile tests with it; do
+   not copy the code and create a fork.
+2. Define a canonical injective `Label<16> <-> [Z_p; 3]` encoding, exact
+   inverse, endianness, and malformed-value rejection in the shared core. Test
+   that selection reconstructs raw labels byte-for-byte and does not alter the
+   free-XOR relation.
+3. Define canonical stage frames for `pp`, reusable `ct1`, per-use `ct2`,
+   selection/key material, and completion/error in the shared core. Every
+   frame carries a version, parameter fingerprint, stage, exact count,
+   direction, session ID, manifest digest, and authenticated length.
 4. Integrate a reviewed CSPRNG and exact clipped discrete-Gaussian sampler;
    state and test the decryption-failure bound. Keep `ZeroNoise` test-only.
 5. Build a host-only semantic interoperability runner for the pinned author
    artifact. Follow Construction 1 and sample the LEnc `r` vector; do not
    reproduce the artifact's apparent unsampled-`r` behavior merely for
    byte compatibility.
+6. Replace the local arithmetic module with an adapter/re-export and retain
+   only Cirrus-specific manifest/coroutine tests. A shared deterministic vector
+   suite must exercise both Volar and Cirrus adapters before this migration is
+   accepted.
 
 ### C2 — streaming interpreter integration
 
