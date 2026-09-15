@@ -23,12 +23,13 @@ use cirrus_core::{
 };
 use digest::{Digest, array::Array};
 use volar_spec::{
-    garble::{Eval, Garble, GarbleTable, GlobalSecret, GramOutput, gram_decode_label, gram_regarble},
+    garble::{
+        Eval, Garble, GarbleTable, GlobalSecret, GramOutput, gram_decode_label, gram_regarble,
+    },
     vole::VoleArray,
 };
 
 pub mod cut_and_choose;
-
 
 /// The garbler-side context: streams one [`GarbleTable`] per AND gate to
 /// [`Self::queue`], in circuit order.
@@ -206,7 +207,11 @@ impl<D: Digest, N: VoleArray<u8>> ContextWithValue<bool> for VcGarbleBackend<'_,
 }
 impl<D: Digest, N: VoleArray<u8>> ContextWithCreate<bool> for VcGarbleBackend<'_, '_, D, N> {
     fn create(&mut self, val: bool) -> Result<Garble<N>, Infallible> {
-        Ok(if val { self.one_label() } else { self.zero_label() })
+        Ok(if val {
+            self.one_label()
+        } else {
+            self.zero_label()
+        })
     }
 }
 impl<D: Digest, N: VoleArray<u8>> ContextWithBitXor<bool> for VcGarbleBackend<'_, '_, D, N> {
@@ -464,7 +469,11 @@ where
     C: Iterator<Item = Eval<N>>,
 {
     fn create(&mut self, val: bool) -> Result<Eval<N>, VolarEvalError> {
-        Ok(if val { self.one_label() } else { self.zero_label() })
+        Ok(if val {
+            self.one_label()
+        } else {
+            self.zero_label()
+        })
     }
 }
 impl<D: Digest, I, N: VoleArray<u8>, C> ContextWithBitXor<bool> for VcEvalBackend<D, I, N, C>
@@ -671,7 +680,12 @@ pub struct TreeCryptor {
 impl TreeCryptor {
     /// Fresh cryptor for a `num_nodes`-bucket tree (=`2^levels - 1`) under `key`.
     pub fn new(key: [u8; 16], num_nodes: usize, version_bits: usize, versioned: bool) -> Self {
-        Self { key, versions: alloc::vec![0; num_nodes], version_bits, versioned }
+        Self {
+            key,
+            versions: alloc::vec![0; num_nodes],
+            version_bits,
+            versioned,
+        }
     }
 
     /// The node tweak (matches volar-vc's `slot_tweak_versioned_bytes`).
@@ -709,7 +723,11 @@ impl TreeCryptor {
 
     /// The current version of the heap node `idx`.
     fn version(&self, idx: usize) -> u64 {
-        if self.versioned { self.versions[idx] } else { 0 }
+        if self.versioned {
+            self.versions[idx]
+        } else {
+            0
+        }
     }
 
     /// XOR `e` with the node pad at the given `version` (symmetric).
@@ -738,13 +756,25 @@ impl TreeCryptor {
     }
 
     /// Decrypt: the stored ciphertext is under the node's *current* version.
-    fn decrypt_entry<const B: usize>(&self, depth: usize, pos: u64, idx: usize, e: &volar_oram::OramEntry<B>) -> volar_oram::OramEntry<B> {
+    fn decrypt_entry<const B: usize>(
+        &self,
+        depth: usize,
+        pos: u64,
+        idx: usize,
+        e: &volar_oram::OramEntry<B>,
+    ) -> volar_oram::OramEntry<B> {
         self.crypt_entry(depth, pos, self.version(idx), e)
     }
 
     /// Encrypt: the new ciphertext is under the node's *next* version (the
     /// caller bumps the counter to match after the write).
-    fn encrypt_entry<const B: usize>(&self, depth: usize, pos: u64, idx: usize, e: &volar_oram::OramEntry<B>) -> volar_oram::OramEntry<B> {
+    fn encrypt_entry<const B: usize>(
+        &self,
+        depth: usize,
+        pos: u64,
+        idx: usize,
+        e: &volar_oram::OramEntry<B>,
+    ) -> volar_oram::OramEntry<B> {
         self.crypt_entry(depth, pos, self.version(idx) + 1, e)
     }
 
@@ -870,7 +900,12 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         Self {
             action_host: GramActionHost::new(secret),
             driver: volar_oram::bit_host::OramHost::new(levels, num_addrs),
-            cryptor: Some(TreeCryptor::new(key, num_nodes, version_bits, version_bits > 0)),
+            cryptor: Some(TreeCryptor::new(
+                key,
+                num_nodes,
+                version_bits,
+                version_bits > 0,
+            )),
         }
     }
 
@@ -914,11 +949,7 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         use volar_oram::bit_host::OramHost as Drv;
 
         // 1. Decode the address labels to a plaintext u64 (LSB-first).
-        assert_eq!(
-            addr_labels.len(),
-            64,
-            "GramOramHost: address is 64 bits"
-        );
+        assert_eq!(addr_labels.len(), 64, "GramOramHost: address is 64 bits");
         let addr_bits_decoded = GramActionHost::<N>::decode_args(addr_labels, addr_bases);
         let mut addr = 0u64;
         for (i, b) in addr_bits_decoded.iter().enumerate() {
@@ -954,7 +985,10 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         };
         proc_args.extend_from_slice(&wd);
         proc_args.push(write.is_some());
-        let proc_out = self.driver.process(&proc_args).expect("GramOramHost: process");
+        let proc_out = self
+            .driver
+            .process(&proc_args)
+            .expect("GramOramHost: process");
 
         let path_bits_len = path_bits.len();
         let wb_bits = &proc_out[..path_bits_len];
@@ -968,7 +1002,10 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         let evict2 = Drv::<Z, B>::take_u64(&proc_out, &mut roff, 64);
 
         // 4. Write back the updated path at old_leaf (encrypted if configured).
-        let wb_path = self.driver.take_path(wb_bits, "wb").expect("GramOramHost: wb path");
+        let wb_path = self
+            .driver
+            .take_path(wb_bits, "wb")
+            .expect("GramOramHost: wb path");
         match &mut self.cryptor {
             Some(c) => c.encrypt_path(tree, old_leaf, &wb_path),
             None => tree.write_path(old_leaf, &wb_path),
@@ -997,9 +1034,14 @@ impl<N: VoleArray<u8>, const Z: usize, const B: usize> GramOramHost<N, Z, B> {
         let data_labels = read_data_bits
             .iter()
             .enumerate()
-            .map(|(i, &bit)| match self.action_host.deliver(GramOutput::Regarble, &base_for(i), bit) {
-                GramActionResult::Regarble(labels) => labels[0].clone(),
-                GramActionResult::Cleartext(_) => unreachable!("Regarble mode returns labels"),
+            .map(|(i, &bit)| {
+                match self
+                    .action_host
+                    .deliver(GramOutput::Regarble, &base_for(i), bit)
+                {
+                    GramActionResult::Regarble(labels) => labels[0].clone(),
+                    GramActionResult::Cleartext(_) => unreachable!("Regarble mode returns labels"),
+                }
             })
             .collect();
 

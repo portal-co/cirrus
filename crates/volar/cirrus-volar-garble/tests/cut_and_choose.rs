@@ -67,10 +67,16 @@ impl<T> cirrus_core::Pusher<T> for PusherVec<T> {
 
 /// Garble one copy deterministically from `copy_seed`, and prepare the garbler's
 /// input label for its private input wire (input 0).
-fn garble_copy(program: &Program, copy_seed: &Hash, secret: &GlobalSecret<U16>, garbler_bit: bool) -> GarbledCopy {
+fn garble_copy(
+    program: &Program,
+    copy_seed: &Hash,
+    secret: &GlobalSecret<U16>,
+    garbler_bit: bool,
+) -> GarbledCopy {
     let n_inputs = program.inputs.len();
-    let input_bases: Vec<Garble<U16>> =
-        (0..n_inputs).map(|k| garble_of(&chain(copy_seed, k + 1))).collect();
+    let input_bases: Vec<Garble<U16>> = (0..n_inputs)
+        .map(|k| garble_of(&chain(copy_seed, k + 1)))
+        .collect();
     let mut pusher = PusherVec(Vec::new());
     let mut garbler = VolarGarbleBackend::<Sha256, U16>::new(&mut pusher, secret.clone());
     garbler.seed = chain(copy_seed, n_inputs);
@@ -108,18 +114,27 @@ fn commitment(
 }
 
 fn commitment_of(copy: &GarbledCopy) -> Hash {
-    commitment(&copy.tables, &copy.input_bases, &copy.output_bases, &copy.garbler_input_label)
+    commitment(
+        &copy.tables,
+        &copy.input_bases,
+        &copy.output_bases,
+        &copy.garbler_input_label,
+    )
 }
 
 fn sample_program() -> Program {
     // sum = a^b, carry = a&b, out = mux(sum, carry, a).
     Program {
         ops: vec![
-            Op::Create(false), // slot 0 = input a (garbler)
-            Op::Create(false), // slot 1 = input b (evaluator)
+            Op::Create(false),          // slot 0 = input a (garbler)
+            Op::Create(false),          // slot 1 = input b (evaluator)
             Op::BitXor(Idx(0), Idx(1)), // slot 2 = sum
             Op::BitAnd(Idx(0), Idx(1)), // slot 3 = carry
-            Op::Mux { cond: Idx(2), then: Idx(3), r#else: Idx(0) }, // slot 4
+            Op::Mux {
+                cond: Idx(2),
+                then: Idx(3),
+                r#else: Idx(0),
+            }, // slot 4
         ],
         inputs: vec![Idx(0), Idx(1)],
         outputs: vec![Idx(2), Idx(3), Idx(4)],
@@ -145,7 +160,9 @@ fn derive_seed(master: &Hash, i: usize) -> Hash {
     dg(&[&master[..], b"copy", &[i as u8]])
 }
 fn derive_secret(master: &Hash, i: usize) -> GlobalSecret<U16> {
-    GlobalSecret::new(Array::<u8, U16>::from_fn(|b| dg(&[&master[..], b"delta", &[i as u8]])[b]))
+    GlobalSecret::new(Array::<u8, U16>::from_fn(|b| {
+        dg(&[&master[..], b"delta", &[i as u8]])[b]
+    }))
 }
 
 /// The full cut-and-choose run with authentication. Returns the agreed output
@@ -167,7 +184,12 @@ fn run_protocol(
             } else {
                 garbler_bit
             };
-            garble_copy(program, &derive_seed(&master, i), &derive_secret(&master, i), bit)
+            garble_copy(
+                program,
+                &derive_seed(&master, i),
+                &derive_secret(&master, i),
+                bit,
+            )
         })
         .collect();
     // === ATTACK: dishonest garble (corrupt before commit) ===
@@ -193,7 +215,12 @@ fn run_protocol(
     }
     // === OPEN: garbler reveals the seed; evaluator re-garbles and verifies ===
     for &i in &open_set {
-        let derived = garble_copy(program, &derive_seed(&master, i), &derive_secret(&master, i), garbler_bit);
+        let derived = garble_copy(
+            program,
+            &derive_seed(&master, i),
+            &derive_secret(&master, i),
+            garbler_bit,
+        );
         if commitment_of(&derived) != commitments[i] {
             return Err(format!("opened copy {i} does not match its commitment"));
         }
@@ -205,14 +232,23 @@ fn run_protocol(
     for &i in &use_set {
         let mut copy_labels = vec![
             copies[i].garbler_input_label.clone(),
-            copies[i].secret.encode(&copies[i].input_bases[1], eval_input),
+            copies[i]
+                .secret
+                .encode(&copies[i].input_bases[1], eval_input),
         ];
         // ATTACK: wrong input label (garbler delivers a label it didn't commit to).
         if attack == Attack::WrongInputLabel(i) {
-            copy_labels[0] = copies[i].secret.encode(&copies[i].input_bases[0], !garbler_bit);
+            copy_labels[0] = copies[i]
+                .secret
+                .encode(&copies[i].input_bases[0], !garbler_bit);
         }
         // Verify the use copy's tables/bases/input-label against its commitment.
-        let delivered = commitment(&copies[i].tables, &copies[i].input_bases, &copies[i].output_bases, &copy_labels[0]);
+        let delivered = commitment(
+            &copies[i].tables,
+            &copies[i].input_bases,
+            &copies[i].output_bases,
+            &copy_labels[0],
+        );
         if delivered != commitments[i] {
             return Err(format!("use copy {i} does not match its commitment"));
         }
@@ -250,7 +286,8 @@ fn cut_and_choose_honest_garbler_accepted() {
     let program = sample_program();
     for g in [false, true] {
         for e in [false, true] {
-            let out = run_protocol(&program, 4, g, e, Attack::None).expect("honest garbler accepted");
+            let out =
+                run_protocol(&program, 4, g, e, Attack::None).expect("honest garbler accepted");
             let sum = g ^ e;
             let carry = g & e;
             let mux = if sum { carry } else { g };

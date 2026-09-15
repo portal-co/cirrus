@@ -1112,19 +1112,21 @@ mod tests {
             },
         };
 
-        assert!(ert_emit(
-            &mut handler,
-            &mut vstack,
-            64,
-            RawMemory::from(instructions.as_slice()),
-            &mut rstack,
-            0,
-            &mut registers,
-            &mut constants,
-            garbling_zero,
-            garbling_one,
-        )
-        .is_ok());
+        assert!(
+            ert_emit(
+                &mut handler,
+                &mut vstack,
+                64,
+                RawMemory::from(instructions.as_slice()),
+                &mut rstack,
+                0,
+                &mut registers,
+                &mut constants,
+                garbling_zero,
+                garbling_one,
+            )
+            .is_ok()
+        );
         let counts = handler.inner.context.counts;
         drop(handler);
 

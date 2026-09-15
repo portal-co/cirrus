@@ -9,7 +9,7 @@ use cirrus_core::{
     StorageAddressBit,
 };
 use cirrus_recompile_core::Recorder;
-use cirrus_volar_boolar::{execute as execute_boolar, StorageBank};
+use cirrus_volar_boolar::{StorageBank, execute as execute_boolar};
 use cirrus_volar_vole::{
     LockedVoleProverContext, LockedVoleProverStorage, LockedVoleProverStorageContext,
     LockedVoleVerifierContext, LockedVoleVerifierStorage, LockedVoleVerifierStorageContext,
@@ -22,7 +22,7 @@ use volar_ir::ir::IRVarId;
 use volar_ir_common::{Node, StorageId};
 use volar_spec::{
     field::Galois128,
-    vole::{Delta, Vope, Q},
+    vole::{Delta, Q, Vope},
 };
 
 struct VecPusher<T>(Vec<T>);

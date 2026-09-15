@@ -22,9 +22,7 @@ fn det_secret() -> GlobalSecret<U16> {
 
 fn const_base(tag: u8) -> Garble<U16> {
     Garble {
-        base: Array::<u8, U16>::from_fn(|i| {
-            (i as u8).wrapping_mul(11).wrapping_add(tag) | 1
-        }),
+        base: Array::<u8, U16>::from_fn(|i| (i as u8).wrapping_mul(11).wrapping_add(tag) | 1),
     }
 }
 

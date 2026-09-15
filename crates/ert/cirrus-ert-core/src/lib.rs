@@ -11,15 +11,15 @@
 use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
-use volar_circuit_exec_core::{select as emit_select, SelectEmitter};
+use volar_circuit_exec_core::{SelectEmitter, select as emit_select};
 
 mod compare;
 #[cfg(test)]
 mod tests;
 
 pub use compare::{
-    add_overflow, arm_condition, arm_condition_value, compare_word, subtract_overflow,
-    subtract_word_with_carry_out, zero_word, ComparePredicate,
+    ComparePredicate, add_overflow, arm_condition, arm_condition_value, compare_word,
+    subtract_overflow, subtract_word_with_carry_out, zero_word,
 };
 
 /// The Boolean operations needed by the shared symbolic-word machinery.

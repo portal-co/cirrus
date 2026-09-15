@@ -143,12 +143,8 @@ impl<D: Digest, const L: usize> BaseOt<L> for MlkemBaseOt<D> {
         c: bool,
     ) -> (Self::ReceiverState, Self::RecvMsg) {
         let choice = c as usize;
-        let (eks, decaps) =
-            crate::miniot_start_recv::<2>(&mut SpecAsCrypto(rng), choice);
-        (
-            MlkemRecvState { decaps, choice },
-            MlkemRecvMsg { eks },
-        )
+        let (eks, decaps) = crate::miniot_start_recv::<2>(&mut SpecAsCrypto(rng), choice);
+        (MlkemRecvState { decaps, choice }, MlkemRecvMsg { eks })
     }
 
     fn sender_payload<R: SpecRng>(
@@ -186,7 +182,6 @@ impl<D: Digest, const L: usize> BaseOt<L> for MlkemBaseOt<D> {
         out
     }
 }
-
 
 // ============================================================================
 // Ferret seed-COT derivation over the post-quantum base OT
@@ -230,8 +225,14 @@ pub fn ferret_seed_cots_mlkem<D: Digest, R: SpecRng>(
     debug_assert_eq!(w_rows.len(), m);
 
     (
-        FerretSenderSeed { delta, q: q_rows.into_iter().collect() },
-        FerretReceiverSeed { u, w: w_rows.into_iter().collect() },
+        FerretSenderSeed {
+            delta,
+            q: q_rows.into_iter().collect(),
+        },
+        FerretReceiverSeed {
+            u,
+            w: w_rows.into_iter().collect(),
+        },
     )
 }
 
@@ -340,7 +341,9 @@ mod tests {
         for j in 0..n_out {
             let mut want = out.sender_out[j];
             if out.recv_x[j] {
-                for b in 0..16 { want[b] ^= delta[b]; }
+                for b in 0..16 {
+                    want[b] ^= delta[b];
+                }
             }
             assert_eq!(out.recv_z[j], want, "output row {}", j);
         }
@@ -348,7 +351,9 @@ mod tests {
         for j in 0..out.sender_seed.q.len() {
             let mut want = out.sender_seed.q[j];
             if out.receiver_seed.u[j] {
-                for b in 0..16 { want[b] ^= delta[b]; }
+                for b in 0..16 {
+                    want[b] ^= delta[b];
+                }
             }
             assert_eq!(out.receiver_seed.w[j], want, "seed row {}", j);
         }

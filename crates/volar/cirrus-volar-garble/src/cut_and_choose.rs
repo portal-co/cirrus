@@ -65,7 +65,11 @@ macro_rules! broadcast_binop {
                     .map(|((c, a), b)| c.$method(a, b))
                     .collect()
             }
-            fn $assign(&mut self, a: &mut Self::Wrapped, b: Self::Wrapped) -> Result<(), Self::Error> {
+            fn $assign(
+                &mut self,
+                a: &mut Self::Wrapped,
+                b: Self::Wrapped,
+            ) -> Result<(), Self::Error> {
                 for ((c, a), b) in self.0.iter_mut().zip(a.iter_mut()).zip(b) {
                     c.$assign(a, b)?;
                 }

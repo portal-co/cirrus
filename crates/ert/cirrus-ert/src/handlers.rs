@@ -1,10 +1,10 @@
 use core::array;
 
-use cirrus_ert_core::{compare_word, partial_bitwise_word, BitOp, ComparePredicate};
+use cirrus_ert_core::{BitOp, ComparePredicate, compare_word, partial_bitwise_word};
 use rv_asm::{Imm, Inst, Reg};
 
-use crate::machine::{add_bits, Machine};
-use crate::{machine::LoadAddress, EcallOutcome, ErtError};
+use crate::machine::{Machine, add_bits};
+use crate::{EcallOutcome, ErtError, machine::LoadAddress};
 
 pub(crate) enum Flow {
     Next(u32),

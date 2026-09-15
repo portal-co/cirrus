@@ -8,7 +8,9 @@ use hybrid_array::Array;
 use volar_spec::garble::{Garble, GlobalSecret, gram_decode_label};
 
 fn det_secret() -> GlobalSecret<U16> {
-    GlobalSecret::new(Array::<u8, U16>::from_fn(|i| (i as u8).wrapping_mul(37) | 1))
+    GlobalSecret::new(Array::<u8, U16>::from_fn(|i| {
+        (i as u8).wrapping_mul(37) | 1
+    }))
 }
 
 fn det_garble(seed: u8) -> Garble<U16> {

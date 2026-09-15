@@ -1,9 +1,9 @@
 extern crate std;
 
 use crate::{
-    add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
-    arm_runtime_shift_with_carry, compare_word, subtract_overflow, subtract_word_with_carry_out,
-    zero_word, ComparePredicate, RawMemory, Shift,
+    ComparePredicate, RawMemory, Shift, add_bits_with_carry_out, add_overflow, arm_condition,
+    arm_condition_value, arm_runtime_shift_with_carry, compare_word, subtract_overflow,
+    subtract_word_with_carry_out, zero_word,
 };
 
 fn word(value: u32) -> [bool; 32] {

@@ -5,7 +5,7 @@
 //! comparison as circuit data. This module supplies that result without
 //! weakening either facade's concrete-only branch discipline.
 
-use crate::{add_bits_with_carry_out, bitwise_word, invert_word, BitOp, ContextWithErtOps};
+use crate::{BitOp, ContextWithErtOps, add_bits_with_carry_out, bitwise_word, invert_word};
 
 /// The six RV32/Armv8-M branch/compare conditions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

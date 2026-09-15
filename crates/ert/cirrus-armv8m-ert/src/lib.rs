@@ -68,10 +68,10 @@ use cirrus_core::{
     HasError, StorageAddressBit,
 };
 use cirrus_ert_core::{
-    add_bits, add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
-    arm_runtime_shift_with_carry, bitwise_word, concrete_product, constant_word, fixed_shift,
-    invert_word, partial_and_not_word, partial_bitwise_word, select_word, subtract_overflow,
-    zero_word, BitOp, Product, Shift,
+    BitOp, Product, Shift, add_bits, add_bits_with_carry_out, add_overflow, arm_condition,
+    arm_condition_value, arm_runtime_shift_with_carry, bitwise_word, concrete_product,
+    constant_word, fixed_shift, invert_word, partial_and_not_word, partial_bitwise_word,
+    select_word, subtract_overflow, zero_word,
 };
 #[cfg(feature = "prepared-recording")]
 use cirrus_recompile_core::{Idx, PreparedRecorder};
@@ -3618,11 +3618,7 @@ fn thumb_expand_imm(first: u16, second: u16) -> u32 {
 }
 
 fn nonzero_shift(value: u16) -> u32 {
-    if value == 0 {
-        32
-    } else {
-        value as u32
-    }
+    if value == 0 { 32 } else { value as u32 }
 }
 
 fn sign_extend(value: u32, bits: u32) -> u32 {

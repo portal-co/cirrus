@@ -10,7 +10,7 @@ use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
 use crate::{
-    ert_emit, ert_func, simple_add, DefaultHandler, ErtError, RawMemory, RvDefaultHandler,
+    DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_emit, ert_func, simple_add,
 };
 
 fn word(value: u32) -> [bool; 32] {
@@ -448,9 +448,11 @@ fn slt_forms_materialize_signed_and_unsigned_booleans() {
         assert_eq!(value(&symbolic_regs[register.0 as usize]), expected);
         assert_eq!(symbolic_constants[register.0 as usize], None);
         assert_eq!(symbolic_regs[register.0 as usize][0], expected != 0);
-        assert!(symbolic_regs[register.0 as usize][1..]
-            .iter()
-            .all(|bit| !bit));
+        assert!(
+            symbolic_regs[register.0 as usize][1..]
+                .iter()
+                .all(|bit| !bit)
+        );
     }
 }
 

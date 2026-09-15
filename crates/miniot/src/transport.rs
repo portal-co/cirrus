@@ -32,7 +32,6 @@
 //! all `N` keys); the receiver can decapsulate only its choice index's
 //! ciphertext, so it recovers only that payload.
 
-
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -81,14 +80,20 @@ pub struct DuplexTransport {
 /// Create a connected pair of in-memory transports; `a.send` is `b.recv` and
 /// vice versa.
 pub fn duplex() -> (DuplexTransport, DuplexTransport) {
-    use alloc::rc::Rc;
     use alloc::collections::VecDeque;
+    use alloc::rc::Rc;
     use core::cell::RefCell;
     let ab = Rc::new(RefCell::new(VecDeque::new()));
     let ba = Rc::new(RefCell::new(VecDeque::new()));
     (
-        DuplexTransport { incoming: ba.clone(), outgoing: ab.clone() },
-        DuplexTransport { incoming: ab, outgoing: ba },
+        DuplexTransport {
+            incoming: ba.clone(),
+            outgoing: ab.clone(),
+        },
+        DuplexTransport {
+            incoming: ab,
+            outgoing: ba,
+        },
     )
 }
 
@@ -180,7 +185,8 @@ pub fn ot_send_n<D: Digest, T: FrameTransport, const N: usize>(
 
     let mut f2 = Vec::with_capacity(N * (CT_BYTES + payload_len));
     for i in 0..N {
-        let ek = ek_from_bytes(&f1[i * EK_BYTES..(i + 1) * EK_BYTES]).expect("bad encapsulation key");
+        let ek =
+            ek_from_bytes(&f1[i * EK_BYTES..(i + 1) * EK_BYTES]).expect("bad encapsulation key");
         let (ct, shared) = ek.encapsulate_with_rng(rng);
         let keystream = kdf_expand::<D>(shared.as_slice(), payload_len);
         f2.extend_from_slice(ct.as_slice());
@@ -210,8 +216,14 @@ pub fn channel_pair() -> (ChannelTransport, ChannelTransport) {
     let (ab_tx, ab_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (ba_tx, ba_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     (
-        ChannelTransport { incoming: ba_rx, outgoing: ab_tx },
-        ChannelTransport { incoming: ab_rx, outgoing: ba_tx },
+        ChannelTransport {
+            incoming: ba_rx,
+            outgoing: ab_tx,
+        },
+        ChannelTransport {
+            incoming: ab_rx,
+            outgoing: ba_tx,
+        },
     )
 }
 
@@ -262,7 +274,9 @@ impl FrameTransport for TcpTransport {
     fn send(&mut self, frame: &[u8]) {
         use std::io::Write;
         let len = frame.len() as u32;
-        self.stream.write_all(&len.to_le_bytes()).expect("write len");
+        self.stream
+            .write_all(&len.to_le_bytes())
+            .expect("write len");
         self.stream.write_all(frame).expect("write frame");
         self.stream.flush().expect("flush");
     }

@@ -28,9 +28,7 @@
 //! --ignored --nocapture`.
 
 use cirrus_ert::{DefaultHandler, RawMemory, RvDefaultHandler, ert_emit};
-use cirrus_volar_garble::{
-    GramStorage, GramStorageSpace, VcEvalBackend, VcGarbleBackend,
-};
+use cirrus_volar_garble::{GramStorage, GramStorageSpace, VcEvalBackend, VcGarbleBackend};
 use hybrid_array::{Array, typenum::U16};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use sha2::Sha256;
@@ -66,9 +64,7 @@ fn const_base(secret_tag: u8) -> Garble<U16> {
         };
     }
     Garble {
-        base: Array::from_fn(|i| {
-            (i as u8).wrapping_mul(11).wrapping_add(secret_tag) | 1
-        }),
+        base: Array::from_fn(|i| (i as u8).wrapping_mul(11).wrapping_add(secret_tag) | 1),
     }
 }
 
@@ -128,8 +124,7 @@ fn setup() -> Setup {
 /// and A0 (u32::MAX, the exit signal). All constant, so the garbler and
 /// evaluator agree on every input label with no OT.
 fn seed_regs<W: Clone>(stored: u32, zero: &W, one: &W) -> ([[W; 32]; 32], [Option<u32>; 32]) {
-    let mut regs: [[W; 32]; 32] =
-        core::array::from_fn(|_| core::array::from_fn(|_| zero.clone()));
+    let mut regs: [[W; 32]; 32] = core::array::from_fn(|_| core::array::from_fn(|_| zero.clone()));
     let mut constants = [None; 32];
     let stored_bits: [bool; 32] = core::array::from_fn(|b| stored & (1 << b) != 0);
     for (i, b) in stored_bits.iter().enumerate() {
@@ -234,8 +229,11 @@ fn run_evaluator<I: Iterator<Item = GarbleTable<U16>>>(
     let first_cell = (sp_byte as usize) * 8;
     for i in 0..32 {
         let bit = (s.stored >> i) & 1 != 0;
-        storage_space.cell_bases[first_cell + i] =
-            if bit { s.one_base.clone() } else { s.zero_base.clone() };
+        storage_space.cell_bases[first_cell + i] = if bit {
+            s.one_base.clone()
+        } else {
+            s.zero_base.clone()
+        };
     }
     let gram = GramStorage::<_, Sha256, U16, Z, B>::new(
         eval_backend,
@@ -303,7 +301,10 @@ fn ert_sw_lw_through_gram_storage_two_party_vec_pipe() {
     let eval_out = run_evaluator(&s, &secret, tables.0.into_iter());
 
     let loaded = open_word(&eval_out, &garble_out);
-    assert_eq!(loaded, s.stored, "lw must recover the word sw stored via ORAM");
+    assert_eq!(
+        loaded, s.stored,
+        "lw must recover the word sw stored via ORAM"
+    );
 }
 
 /// Two-party GRAM ERT run over a **threaded pipe**: the garbler runs on a
@@ -358,7 +359,8 @@ fn ert_sw_lw_through_gram_storage_two_party_thread_pipe() {
     garbler.join().expect("garbler thread panicked");
 
     let loaded = open_word(&eval_out, &garble_out);
-    assert_eq!(loaded, s.stored, "lw must recover the word sw stored via ORAM");
+    assert_eq!(
+        loaded, s.stored,
+        "lw must recover the word sw stored via ORAM"
+    );
 }
-
-
