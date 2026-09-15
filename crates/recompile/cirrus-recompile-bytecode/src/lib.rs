@@ -24,6 +24,9 @@ const OP_AND: u8 = 3;
 const OP_OR: u8 = 4;
 const OP_XOR: u8 = 5;
 const OP_MUX: u8 = 6;
+const OP_STORAGE_READ: u8 = 9;
+const OP_STORAGE_WRITE: u8 = 10;
+const OP_INIT_BITS: u8 = 11;
 
 /// Why a `Program` cannot yet be represented by the compact v1 subset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +67,8 @@ pub struct CompactProgram<'a> {
     slots: u32,
     inputs: &'a [u8],
     outputs: &'a [u8],
+    banks: &'a [u8],
+    init: &'a [u8],
     entry: &'a [u8],
 }
 
@@ -90,16 +95,22 @@ impl<'a> CompactProgram<'a> {
         let outputs_len = header.u32()? as usize;
         let outputs = header.take(outputs_len)?;
         validate_slot_table(outputs, slots)?;
+        let banks_len = header.u32()? as usize;
+        let init_len = header.u32()? as usize;
         let entry_len = header.u32()? as usize;
         if !header.is_empty() {
             return Err(DecodeError::InvalidSection);
         }
+        let banks = reader.take(banks_len)?;
+        let bank_count = validate_banks(banks)?;
+        let init = reader.take(init_len)?;
+        validate_init(init, banks, bank_count)?;
         let entry = reader.take(entry_len)?;
         if !reader.is_empty() {
             return Err(DecodeError::InvalidSection);
         }
-        validate_entry(entry, slots, inputs)?;
-        Ok(Self { bytes, slots, inputs, outputs, entry })
+        validate_entry(entry, slots, inputs, banks, bank_count)?;
+        Ok(Self { bytes, slots, inputs, outputs, banks, init, entry })
     }
 
     /// The scratch-slot width required by this executable.
@@ -112,7 +123,7 @@ impl<'a> CompactProgram<'a> {
         self.bytes
     }
 
-    /// Execute the program against a caller-owned scratch buffer.
+    /// Execute a program with no storage records against a caller-owned scratch buffer.
     pub fn execute<Backend>(
         self,
         backend: &mut Backend,
@@ -127,6 +138,7 @@ impl<'a> CompactProgram<'a> {
             + cirrus_core::ContextWithMux<bool>,
         Backend::Wrapped: Clone,
     {
+        assert!(self.banks.is_empty() && self.init.is_empty(), "storage executable needs execute_with_storage");
         assert_eq!(scratch.len(), self.slots as usize, "scratch width must match compact program");
         let input_count = count_slot_table(self.inputs).expect("validated input table");
         assert_eq!(inputs.len(), input_count, "input count must match compact program");
@@ -168,6 +180,7 @@ impl<'a> CompactProgram<'a> {
                         backend, scratch[cond].clone().unwrap(), scratch[then].clone().unwrap(), scratch[r#else].clone().unwrap(),
                     )?);
                 }
+                OP_STORAGE_READ | OP_STORAGE_WRITE => unreachable!("storage executable needs execute_with_storage"),
                 _ => unreachable!("validated compact instruction"),
             }
         }
@@ -183,7 +196,7 @@ impl<'a> CompactProgram<'a> {
 /// Transpile the currently supported flat Boolean `Program` subset.
 pub fn transpile(program: &Program) -> Result<Vec<u8>, TranspileError> {
     program.validate().map_err(|_| TranspileError::InvalidProgram)?;
-    if !program.externals.is_empty() || !program.storage_ops.is_empty() || !program.storage_banks.is_empty() || !program.storage_init.is_empty() {
+    if !program.externals.is_empty() {
         return Err(TranspileError::UnsupportedOperation);
     }
     let slots = u32::try_from(program.ops.len()).map_err(|_| TranspileError::TooLarge)?;
@@ -206,7 +219,21 @@ pub fn transpile(program: &Program) -> Result<Vec<u8>, TranspileError> {
                 entry.push(OP_MUX);
                 for slot in [out, cond, then, r#else] { write_u32(&mut entry, slot.0); }
             }
-            Op::External(_) | Op::Storage(_) => return Err(TranspileError::UnsupportedOperation),
+            Op::External(_) => return Err(TranspileError::UnsupportedOperation),
+            Op::Storage(id) => {
+                let storage = program.storage_ops.get(id as usize).ok_or(TranspileError::InvalidProgram)?;
+                entry.push(match storage.kind {
+                    cirrus_recompile_core::StorageOpKind::Read => OP_STORAGE_READ,
+                    cirrus_recompile_core::StorageOpKind::Write => OP_STORAGE_WRITE,
+                });
+                if storage.kind == cirrus_recompile_core::StorageOpKind::Read {
+                    write_u32(&mut entry, out.0);
+                }
+                write_u32(&mut entry, storage.bank);
+                write_u32(&mut entry, u32::try_from(storage.address.len()).map_err(|_| TranspileError::TooLarge)?);
+                for slot in &storage.address { write_u32(&mut entry, slot.0); }
+                if let Some(value) = storage.value { write_u32(&mut entry, value.0); }
+            }
         }
     }
     entry.push(OP_END);
@@ -216,6 +243,26 @@ pub fn transpile(program: &Program) -> Result<Vec<u8>, TranspileError> {
     header.extend_from_slice(&inputs);
     write_u32(&mut header, u32::try_from(outputs.len()).map_err(|_| TranspileError::TooLarge)?);
     header.extend_from_slice(&outputs);
+    let mut banks = Vec::new();
+    for bank in &program.storage_banks {
+        write_u32(&mut banks, u32::try_from(bank.storage).map_err(|_| TranspileError::TooLarge)?);
+        write_u32(&mut banks, u32::try_from(bank.lane).map_err(|_| TranspileError::TooLarge)?);
+        write_u32(&mut banks, bank.address_bits);
+    }
+    let mut init = Vec::new();
+    for segment in &program.storage_init {
+        init.push(OP_INIT_BITS);
+        write_u32(&mut init, segment.bank);
+        let mut address = 0u32;
+        for (bit, value) in segment.addr.iter().copied().enumerate() {
+            if value { address |= 1u32.checked_shl(bit as u32).ok_or(TranspileError::TooLarge)?; }
+        }
+        write_u32(&mut init, address);
+        write_u32(&mut init, u32::try_from(segment.data.len()).map_err(|_| TranspileError::TooLarge)?);
+        for bit in &segment.data { init.push(u8::from(*bit)); }
+    }
+    write_u32(&mut header, u32::try_from(banks.len()).map_err(|_| TranspileError::TooLarge)?);
+    write_u32(&mut header, u32::try_from(init.len()).map_err(|_| TranspileError::TooLarge)?);
     write_u32(&mut header, u32::try_from(entry.len()).map_err(|_| TranspileError::TooLarge)?);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
@@ -223,6 +270,8 @@ pub fn transpile(program: &Program) -> Result<Vec<u8>, TranspileError> {
     bytes.push(FLAGS);
     write_u32(&mut bytes, u32::try_from(header.len()).map_err(|_| TranspileError::TooLarge)?);
     bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&banks);
+    bytes.extend_from_slice(&init);
     bytes.extend_from_slice(&entry);
     Ok(bytes)
 }
@@ -262,7 +311,53 @@ fn count_slot_table(bytes: &[u8]) -> Result<usize, DecodeError> {
     Ok(count)
 }
 
-fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8]) -> Result<(), DecodeError> {
+fn validate_banks(bytes: &[u8]) -> Result<usize, DecodeError> {
+    let mut reader = Reader::new(bytes);
+    let mut count = 0;
+    let mut previous = None;
+    while !reader.is_empty() {
+        let storage = reader.u32()?;
+        let lane = reader.u32()?;
+        let address_bits = reader.u32()?;
+        if address_bits > 32 || previous.is_some_and(|previous| previous >= (storage, lane)) {
+            return Err(DecodeError::InvalidSection);
+        }
+        previous = Some((storage, lane));
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn bank_address_bits(bytes: &[u8], index: u32) -> Result<u32, DecodeError> {
+    let mut reader = Reader::new(bytes);
+    for current in 0..=index {
+        reader.u32()?;
+        reader.u32()?;
+        let address_bits = reader.u32()?;
+        if current == index { return Ok(address_bits); }
+    }
+    Err(DecodeError::InvalidSection)
+}
+
+fn validate_init(bytes: &[u8], banks: &[u8], bank_count: usize) -> Result<(), DecodeError> {
+    let mut reader = Reader::new(bytes);
+    while !reader.is_empty() {
+        if reader.byte()? != OP_INIT_BITS { return Err(DecodeError::InvalidInstruction); }
+        let bank = reader.u32()?;
+        if bank as usize >= bank_count { return Err(DecodeError::InvalidSection); }
+        let address = reader.u32()?;
+        let bits = reader.u32()?;
+        if bits == 0 || bits > bank_address_bits(banks, bank)? { return Err(DecodeError::InvalidSection); }
+        let address_bits = bank_address_bits(banks, bank)?;
+        if address_bits < 32 && address >= (1u32 << address_bits) { return Err(DecodeError::InvalidSection); }
+        for _ in 0..bits {
+            if reader.byte()? > 1 { return Err(DecodeError::InvalidInstruction); }
+        }
+    }
+    Ok(())
+}
+
+fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8], banks: &[u8], bank_count: usize) -> Result<(), DecodeError> {
     let mut input = Reader::new(inputs);
     let mut defined = alloc::vec![false; slots as usize];
     while !input.is_empty() { defined[input.u32()? as usize] = true; }
@@ -277,6 +372,27 @@ fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8]) -> Result<(), DecodeE
             OP_CONST0 | OP_CONST1 => 1,
             OP_AND | OP_OR | OP_XOR => 3,
             OP_MUX => 4,
+            OP_STORAGE_READ | OP_STORAGE_WRITE => {
+                let has_out = opcode == OP_STORAGE_READ;
+                let out = if has_out { Some(reader.u32()?) } else { None };
+                let bank = reader.u32()?;
+                if bank as usize >= bank_count { return Err(DecodeError::InvalidSection); }
+                let count = reader.u32()?;
+                if count != bank_address_bits(banks, bank)? { return Err(DecodeError::InvalidSection); }
+                if let Some(out) = out {
+                    if out >= slots || defined[out as usize] { return Err(DecodeError::InvalidSlot); }
+                    defined[out as usize] = true;
+                }
+                for _ in 0..count {
+                    let slot = reader.u32()?;
+                    if slot >= slots || !defined[slot as usize] { return Err(DecodeError::InvalidSlot); }
+                }
+                if opcode == OP_STORAGE_WRITE {
+                    let value = reader.u32()?;
+                    if value >= slots || !defined[value as usize] { return Err(DecodeError::InvalidSlot); }
+                }
+                continue;
+            }
             _ => return Err(DecodeError::InvalidInstruction),
         };
         let out = reader.u32()?;
@@ -345,6 +461,45 @@ mod tests {
         let compact = CompactProgram::validate(&bytes).unwrap();
         assert_eq!(compact.execute(&mut (), &mut [None, None, None], &[]), Ok(alloc::vec![true]));
         assert_eq!(transpile(&program).unwrap(), bytes);
+    }
+
+    #[test]
+    fn frames_storage_and_static_initialization() {
+        let program = Program {
+            ops: alloc::vec![Op::Create(false), Op::Create(true), Op::Storage(0), Op::Storage(1)],
+            inputs: alloc::vec![],
+            outputs: alloc::vec![Idx(3)],
+            externals: alloc::vec![],
+            storage_ops: alloc::vec![
+                cirrus_recompile_core::StorageOp {
+                    kind: cirrus_recompile_core::StorageOpKind::Write,
+                    bank: 0,
+                    address: alloc::vec![Idx(0)],
+                    value: Some(Idx(1)),
+                },
+                cirrus_recompile_core::StorageOp {
+                    kind: cirrus_recompile_core::StorageOpKind::Read,
+                    bank: 0,
+                    address: alloc::vec![Idx(0)],
+                    value: None,
+                },
+            ],
+            storage_banks: alloc::vec![cirrus_recompile_core::StorageBank {
+                storage: 9,
+                lane: 2,
+                address_bits: 1,
+            }],
+            storage_init: alloc::vec![cirrus_recompile_core::StorageInitSegment {
+                bank: 0,
+                addr: alloc::vec![false],
+                data: alloc::vec![true],
+            }],
+        };
+        let bytes = transpile(&program).unwrap();
+        let compact = CompactProgram::validate(&bytes).unwrap();
+        assert_eq!(compact.slots(), 4);
+        assert!(!compact.banks.is_empty());
+        assert!(!compact.init.is_empty());
     }
 
     #[test]
