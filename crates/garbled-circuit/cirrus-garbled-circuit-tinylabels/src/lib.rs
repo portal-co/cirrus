@@ -15,6 +15,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "tinylabels-server")]
+pub mod server;
+
 pub use volar_spec::tinylabels::*;
 
 #[cfg(test)]
