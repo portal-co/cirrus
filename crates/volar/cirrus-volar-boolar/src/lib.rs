@@ -21,6 +21,10 @@ pub use typed::{lower_volar_circuit, TypedLowerError};
 pub use types::{lower_volar_types, VolarTypeMap, VolarTypeMapError};
 
 use alloc::{string::String, vec::Vec};
+use cirrus_recompile_core::{
+    Idx, Op, Program, StorageBank as ProgramStorageBank, StorageInitSegment, StorageOp,
+    StorageOpKind,
+};
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitAndByRef, ContextWithBitOr, ContextWithBitOrByRef,
     ContextWithBitXor, ContextWithBitXorByRef, ContextWithCreate, ContextWithCreateByRef,
@@ -37,6 +41,122 @@ use volar_ir::{
 use volar_ir_common::StorageId;
 
 pub(crate) type Wire<C> = <C as ContextWithValue<bool>>::Wrapped;
+
+/// Why a Boolar circuit cannot be represented by the Boolean recompile IR.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramLowerError {
+    /// A statement or output refers to a value unavailable at that point.
+    MissingValue(IRVarId),
+    /// The Boolar statement has no Boolean `Program` equivalent yet.
+    UnsupportedStatement,
+    /// The lowered program violates its own structural contracts.
+    Program(cirrus_recompile_core::ProgramError),
+}
+
+fn program_storage_bank(
+    program: &mut Program,
+    storage: StorageId,
+    lane: LaneId,
+    address_bits: usize,
+) -> Result<u32, ProgramLowerError> {
+    if let Some((index, existing)) = program
+        .storage_banks
+        .iter()
+        .enumerate()
+        .find(|(_, bank)| bank.storage == storage.0 as u64 && bank.lane == lane.0 as u64)
+    {
+        if existing.address_bits != address_bits as u32 {
+            return Err(ProgramLowerError::UnsupportedStatement);
+        }
+        return Ok(index as u32);
+    }
+    let index = u32::try_from(program.storage_banks.len())
+        .map_err(|_| ProgramLowerError::UnsupportedStatement)?;
+    program.storage_banks.push(ProgramStorageBank {
+        storage: storage.0 as u64,
+        lane: lane.0 as u64,
+        address_bits: address_bits as u32,
+    });
+    Ok(index)
+}
+
+/// Lower the supported straight-line Boolar subset into Boolean [`Program`].
+///
+/// Storage reads/writes, bank identities, LSB-first addresses, static segments,
+/// and statement order are preserved. `Not` is expanded as XOR with a fresh
+/// public-one slot, matching the Boolean recompile vocabulary.
+pub fn lower_boolar_program<P: Clone>(
+    circuit: &BCircuit<P>,
+) -> Result<Program, ProgramLowerError> {
+    let mut program = Program::default();
+    let mut values = Vec::with_capacity(circuit.params as usize + circuit.stmts.len());
+
+    for segment in &circuit.pre_init {
+        let bank = program_storage_bank(&mut program, segment.storage, segment.lane, segment.addr.len())?;
+        program.storage_init.push(StorageInitSegment {
+            bank,
+            addr: segment.addr.clone(),
+            data: segment.data.clone(),
+        });
+    }
+
+    for parameter in 0..circuit.params {
+        let slot = Idx(program.ops.len() as u32);
+        program.ops.push(Op::Create(false));
+        values.push(slot);
+        program.inputs.push(slot);
+        debug_assert_eq!(slot, Idx(parameter));
+    }
+    let mut one = None;
+    for node in &circuit.stmts {
+        if matches!(&node.kind, BIrStmt::Not(_)) && one.is_none() {
+            let constant = Idx(program.ops.len() as u32);
+            program.ops.push(Op::Create(true));
+            one = Some(constant);
+        }
+        let value = |value: IRVarId| values.get(value.0 as usize).copied().ok_or(ProgramLowerError::MissingValue(value));
+        let slot = Idx(program.ops.len() as u32);
+        let op = match &node.kind {
+            BIrStmt::Zero => Op::Create(false),
+            BIrStmt::One => Op::Create(true),
+            BIrStmt::And(a, b) => Op::BitAnd(value(*a)?, value(*b)?),
+            BIrStmt::Or(a, b) => Op::BitOr(value(*a)?, value(*b)?),
+            BIrStmt::Xor(a, b) => Op::BitXor(value(*a)?, value(*b)?),
+            BIrStmt::Not(input) => Op::BitXor(value(*input)?, one.expect("not initializes one")),
+            BIrStmt::StorageRead { storage, lane, addr } => {
+                let bank = program_storage_bank(&mut program, *storage, *lane, addr.len())?;
+                let address = addr.iter().map(|address| value(*address)).collect::<Result<Vec<_>, _>>()?;
+                let id = u32::try_from(program.storage_ops.len()).map_err(|_| ProgramLowerError::UnsupportedStatement)?;
+                program.storage_ops.push(StorageOp { kind: StorageOpKind::Read, bank, address, value: None });
+                Op::Storage(id)
+            }
+            BIrStmt::StorageWrite { storage, lane, src, addr } => {
+                let bank = program_storage_bank(&mut program, *storage, *lane, addr.len())?;
+                let address = addr.iter().map(|address| value(*address)).collect::<Result<Vec<_>, _>>()?;
+                let id = u32::try_from(program.storage_ops.len()).map_err(|_| ProgramLowerError::UnsupportedStatement)?;
+                program.storage_ops.push(StorageOp {
+                    kind: StorageOpKind::Write, bank, address, value: Some(value(*src)?),
+                });
+                Op::Storage(id)
+            }
+            _ => return Err(ProgramLowerError::UnsupportedStatement),
+        };
+        program.ops.push(op);
+        values.push(slot);
+    }
+    program.outputs = circuit
+        .outputs
+        .iter()
+        .map(|output| {
+            values
+                .get(output.0 as usize)
+                .copied()
+                .ok_or(ProgramLowerError::MissingValue(*output))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    program.validate().map_err(ProgramLowerError::Program)?;
+    Ok(program)
+}
 
 /// The Boolean operations required by [`execute`].
 pub trait BoolarContext:
@@ -2044,6 +2164,45 @@ mod tests {
             pre_init: vec![],
             outputs,
         }
+    }
+
+    #[test]
+    fn lowers_storage_statements_and_static_segments_to_program() {
+        let mut source = circuit(
+            3,
+            vec![
+                BIrStmt::StorageWrite {
+                    storage: STORAGE,
+                    lane: LANE,
+                    src: IRVarId(0),
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+                BIrStmt::StorageRead {
+                    storage: STORAGE,
+                    lane: LANE,
+                    addr: vec![IRVarId(1), IRVarId(2)],
+                },
+            ],
+            vec![IRVarId(4)],
+        );
+        source.pre_init.push(volar_ir::boolar::BIrPreInitSegment {
+            storage: STORAGE,
+            lane: LANE,
+            addr: vec![false, true],
+            data: vec![true],
+        });
+
+        let program = lower_boolar_program(&source).unwrap();
+        assert_eq!(program.inputs, vec![Idx(0), Idx(1), Idx(2)]);
+        assert_eq!(program.storage_banks, vec![ProgramStorageBank {
+            storage: STORAGE.0 as u64,
+            lane: LANE.0 as u64,
+            address_bits: 2,
+        }]);
+        assert_eq!(program.storage_init.len(), 1);
+        assert!(matches!(program.ops[3], Op::Storage(0)));
+        assert!(matches!(program.ops[4], Op::Storage(1)));
+        assert_eq!(program.outputs, vec![Idx(4)]);
     }
 
     #[test]
