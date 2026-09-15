@@ -40,7 +40,7 @@ pub use cirrus_core;
 
 use cirrus_recompile_core::{
     ExternalKind, Op, PreparedLoop, PreparedProgram, PreparedSlot, Program, ScheduledOp, Statement,
-    StatementRange,
+    StatementRange, StorageOpKind,
 };
 
 /// Define one backend's pinned functions: `create`, `bitand`, `bitor`,
@@ -314,6 +314,336 @@ where
         .iter()
         .map(|idx| buf[idx.get()].clone().unwrap())
         .collect())
+}
+
+/// One caller-owned storage bank available to a storage-aware executor.
+pub struct RuntimeStorageBank<'a, S: ?Sized> {
+    /// Logical storage namespace declared by the program.
+    pub storage: u64,
+    /// One-bit lane declared by the program.
+    pub lane: u64,
+    /// Exact least-significant-first address width.
+    pub address_bits: u32,
+    /// Backend-owned storage value.
+    pub value: &'a mut S,
+}
+
+/// Initialize the declared public storage segments once.
+pub fn initialize_storage<Backend>(
+    backend: &mut Backend,
+    program: &Program,
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<(), Backend::Error>
+where
+    Backend: cirrus_core::ContextWithCreate<bool> + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    validate_banks(program, banks);
+    initialize_storage_parts(backend, &program.storage_banks, &program.storage_init, banks)
+}
+
+fn initialize_storage_parts<Backend>(
+    backend: &mut Backend,
+    declared_banks: &[cirrus_recompile_core::StorageBank],
+    segments: &[cirrus_recompile_core::StorageInitSegment],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<(), Backend::Error>
+where
+    Backend: cirrus_core::ContextWithCreate<bool> + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    let mut zero = None;
+    let mut one = None;
+    for segment in segments {
+        let bank = &declared_banks[segment.bank as usize];
+        let runtime = bank_for(banks, bank.storage, bank.lane, bank.address_bits);
+        let mut address = segment.addr.clone();
+        for (offset, &bit) in segment.data.iter().enumerate() {
+            let wire = if bit {
+                one.get_or_insert(cirrus_core::ContextWithCreate::create(backend, true)?).clone()
+            } else {
+                zero.get_or_insert(cirrus_core::ContextWithCreate::create(backend, false)?).clone()
+            };
+            let bits = address
+                .iter()
+                .copied()
+                .map(|known| cirrus_core::StorageAddressBit { wire: wire.clone(), known: Some(known) })
+                .collect::<Vec<_>>();
+            backend.storage_write(runtime, &bits, wire)?;
+            if offset + 1 < segment.data.len() {
+                increment_address(&mut address);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run a [`Program`] against caller-owned storage, applying public initialization first.
+pub fn execute_with_storage<Backend>(
+    backend: &mut Backend,
+    program: &Program,
+    inputs: &[Backend::Wrapped],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>
+        + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    program.validate().expect("storage program must satisfy structural invariants");
+    initialize_storage(backend, program, banks)?;
+    execute_storage_initialized(backend, program, inputs, banks)
+}
+
+/// Run a [`Program`] against storage that was initialized by [`initialize_storage`].
+pub fn execute_storage_initialized<Backend>(
+    backend: &mut Backend,
+    program: &Program,
+    inputs: &[Backend::Wrapped],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>
+        + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    validate_banks(program, banks);
+    assert_eq!(inputs.len(), program.inputs.len(), "input count must match the recorded program's input slots");
+    let mut buf = vec![None; program.ops.len()];
+    let mut known = vec![None; program.ops.len()];
+    for (&idx, value) in program.inputs.iter().zip(inputs) {
+        buf[idx.get()] = Some(value.clone());
+    }
+    for (i, op) in program.ops.iter().enumerate() {
+        if buf[i].is_some() { continue; }
+        let result = match *op {
+            Op::Create(value) => {
+                known[i] = Some(value);
+                cirrus_core::ContextWithCreate::create(backend, value)?
+            }
+            Op::BitAnd(a, b) => {
+                known[i] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a & b);
+                cirrus_core::ContextWithBitAnd::bitand(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+            }
+            Op::BitOr(a, b) => {
+                known[i] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a | b);
+                cirrus_core::ContextWithBitOr::bitor(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+            }
+            Op::BitXor(a, b) => {
+                known[i] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a ^ b);
+                cirrus_core::ContextWithBitXor::bitxor(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+            }
+            Op::Mux { cond, then, r#else } => {
+                known[i] = known[cond.get()].and_then(|cond| if cond { known[then.get()] } else { known[r#else.get()] });
+                cirrus_core::ContextWithMux::mux(backend, buf[cond.get()].clone().unwrap(), buf[then.get()].clone().unwrap(), buf[r#else.get()].clone().unwrap())?
+            }
+            Op::Storage(id) => {
+                let storage = &program.storage_ops[id as usize];
+                let declared = &program.storage_banks[storage.bank as usize];
+                let runtime = bank_for(banks, declared.storage, declared.lane, declared.address_bits);
+                let address = storage.address.iter().map(|idx| cirrus_core::StorageAddressBit {
+                    wire: buf[idx.get()].clone().unwrap(), known: known[idx.get()],
+                }).collect::<Vec<_>>();
+                match storage.kind {
+                    StorageOpKind::Read => backend.storage_read(runtime, &address)?,
+                    StorageOpKind::Write => {
+                        backend.storage_write(runtime, &address, buf[storage.value.unwrap().get()].clone().unwrap())?;
+                        continue;
+                    }
+                }
+            }
+            Op::External(_) => panic!("execute_with_storage: external program needs a combined executor"),
+        };
+        buf[i] = Some(result);
+    }
+    Ok(program.outputs.iter().map(|idx| buf[idx.get()].clone().unwrap()).collect())
+}
+
+fn validate_banks<S: ?Sized>(program: &Program, banks: &[RuntimeStorageBank<'_, S>]) {
+    validate_declared_banks(&program.storage_banks, banks)
+}
+
+fn validate_declared_banks<S: ?Sized>(
+    declared_banks: &[cirrus_recompile_core::StorageBank],
+    banks: &[RuntimeStorageBank<'_, S>],
+) {
+    for declared in declared_banks {
+        let count = banks.iter().filter(|bank| bank.storage == declared.storage && bank.lane == declared.lane && bank.address_bits == declared.address_bits).count();
+        assert_eq!(count, 1, "every declared storage bank must have one matching runtime bank");
+    }
+}
+
+fn bank_for<'a, S: ?Sized>(
+    banks: &'a mut [RuntimeStorageBank<'_, S>], storage: u64, lane: u64, address_bits: u32,
+) -> &'a mut S {
+    banks
+        .iter_mut()
+        .find(|bank| bank.storage == storage && bank.lane == lane && bank.address_bits == address_bits)
+        .expect("validated runtime storage bank")
+        .value
+}
+
+fn increment_address(address: &mut [bool]) {
+    for bit in address {
+        if !*bit { *bit = true; return; }
+        *bit = false;
+    }
+    panic!("validated storage initialization overflowed its address width");
+}
+
+/// Initialize a prepared program's declared public storage segments once.
+pub fn initialize_prepared_storage<Backend>(
+    backend: &mut Backend,
+    program: &PreparedProgram,
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<(), Backend::Error>
+where
+    Backend: cirrus_core::ContextWithCreate<bool> + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    program.validate().expect("prepared storage program must satisfy structural invariants");
+    validate_declared_banks(&program.storage_banks, banks);
+    initialize_storage_parts(backend, &program.storage_banks, &program.storage_init, banks)
+}
+
+/// Run a [`PreparedProgram`] against storage, applying public initialization first.
+pub fn execute_prepared_with_storage<Backend>(
+    backend: &mut Backend,
+    program: &PreparedProgram,
+    inputs: &[Backend::Wrapped],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>
+        + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    initialize_prepared_storage(backend, program, banks)?;
+    execute_prepared_storage_initialized(backend, program, inputs, banks)
+}
+
+/// Run a [`PreparedProgram`] against storage initialized earlier.
+pub fn execute_prepared_storage_initialized<Backend>(
+    backend: &mut Backend,
+    program: &PreparedProgram,
+    inputs: &[Backend::Wrapped],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>
+        + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    program.validate().expect("prepared storage program must satisfy structural invariants");
+    validate_declared_banks(&program.storage_banks, banks);
+    assert_eq!(inputs.len(), program.inputs.len(), "input count must match the recorded program's input slots");
+    let mut buf = vec![None; program.slots];
+    let mut known = vec![None; program.slots];
+    let mut is_input = vec![false; program.slots];
+    for (&idx, value) in program.inputs.iter().zip(inputs) {
+        buf[idx.get()] = Some(value.clone());
+        is_input[idx.get()] = true;
+    }
+    execute_prepared_storage_range(
+        backend, program, program.entry, &mut buf, &mut known, &is_input, banks, &mut Vec::new(), 0,
+    )?;
+    Ok(program.outputs.iter().map(|idx| buf[idx.get()].clone().unwrap()).collect())
+}
+
+fn execute_prepared_storage_range<'a, Backend>(
+    backend: &mut Backend,
+    program: &'a PreparedProgram,
+    range: StatementRange,
+    buf: &mut [Option<Backend::Wrapped>],
+    known: &mut [Option<bool>],
+    is_input: &[bool],
+    banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+    active: &mut Vec<ActiveLoop<'a>>,
+    invocation: usize,
+) -> Result<(), Backend::Error>
+where
+    Backend: cirrus_core::ContextWithBitAnd<bool>
+        + cirrus_core::ContextWithBitOr<bool>
+        + cirrus_core::ContextWithBitXor<bool>
+        + cirrus_core::ContextWithCreate<bool>
+        + cirrus_core::ContextWithMux<bool>
+        + cirrus_core::ContextWithStorage<bool>,
+    Backend::Wrapped: Clone,
+{
+    for statement in &program.statements[range.start as usize..range.end as usize] {
+        match statement {
+            Statement::Op(op) => {
+                let scheduled = op.resolve(|slot| resolve_slot(slot, active));
+                if is_input[scheduled.out.get()] { continue; }
+                let result = match scheduled.op {
+                    Op::Create(value) => {
+                        known[scheduled.out.get()] = Some(value);
+                        cirrus_core::ContextWithCreate::create(backend, value)?
+                    }
+                    Op::BitAnd(a, b) => {
+                        known[scheduled.out.get()] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a & b);
+                        cirrus_core::ContextWithBitAnd::bitand(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+                    }
+                    Op::BitOr(a, b) => {
+                        known[scheduled.out.get()] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a | b);
+                        cirrus_core::ContextWithBitOr::bitor(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+                    }
+                    Op::BitXor(a, b) => {
+                        known[scheduled.out.get()] = known[a.get()].zip(known[b.get()]).map(|(a, b)| a ^ b);
+                        cirrus_core::ContextWithBitXor::bitxor(backend, buf[a.get()].clone().unwrap(), buf[b.get()].clone().unwrap())?
+                    }
+                    Op::Mux { cond, then, r#else } => {
+                        known[scheduled.out.get()] = known[cond.get()].and_then(|cond| if cond { known[then.get()] } else { known[r#else.get()] });
+                        cirrus_core::ContextWithMux::mux(backend, buf[cond.get()].clone().unwrap(), buf[then.get()].clone().unwrap(), buf[r#else.get()].clone().unwrap())?
+                    }
+                    Op::Storage(id) => {
+                        let storage = &program.storage_ops[id as usize];
+                        let declared = &program.storage_banks[storage.bank as usize];
+                        let runtime = bank_for(banks, declared.storage, declared.lane, declared.address_bits);
+                        let address = storage.address.iter().map(|idx| cirrus_core::StorageAddressBit {
+                            wire: buf[idx.get()].clone().unwrap(), known: known[idx.get()],
+                        }).collect::<Vec<_>>();
+                        match storage.kind {
+                            StorageOpKind::Read => backend.storage_read(runtime, &address)?,
+                            StorageOpKind::Write => {
+                                backend.storage_write(runtime, &address, buf[storage.value.unwrap().get()].clone().unwrap())?;
+                                continue;
+                            }
+                        }
+                    }
+                    Op::External(_) => panic!("execute_prepared_with_storage: external program needs a combined executor"),
+                };
+                buf[scheduled.out.get()] = Some(result);
+            }
+            Statement::Loop(loop_step) => {
+                let descriptor = loop_step.invocations[invocation];
+                for iteration in 0..descriptor.iterations as usize {
+                    let row = descriptor.first_row as usize + iteration;
+                    active.push(ActiveLoop { loop_step, row });
+                    let result = execute_prepared_storage_range(backend, program, loop_step.body, buf, known, is_input, banks, active, row);
+                    active.pop();
+                    result?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run a whole [`Program`] using a host-provided [`ExternalRegistry`].
@@ -772,6 +1102,83 @@ mod tests {
     use super::*;
     use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate};
     use cirrus_recompile_core::Recorder;
+
+    #[test]
+    fn storage_executor_preserves_initialization_and_write_order() {
+        use cirrus_recompile_core::{StorageBank, StorageInitSegment, StorageOp};
+
+        let program = Program {
+            ops: vec![
+                Op::Create(false),
+                Op::Create(true),
+                Op::Storage(0),
+                Op::Storage(1),
+            ],
+            inputs: vec![],
+            outputs: vec![cirrus_recompile_core::Idx(3)],
+            externals: vec![],
+            storage_ops: vec![
+                StorageOp {
+                    kind: StorageOpKind::Write,
+                    bank: 0,
+                    address: vec![cirrus_recompile_core::Idx(0)],
+                    value: Some(cirrus_recompile_core::Idx(1)),
+                },
+                StorageOp {
+                    kind: StorageOpKind::Read,
+                    bank: 0,
+                    address: vec![cirrus_recompile_core::Idx(0)],
+                    value: None,
+                },
+            ],
+            storage_banks: vec![StorageBank {
+                storage: 11,
+                lane: 3,
+                address_bits: 1,
+            }],
+            storage_init: vec![StorageInitSegment {
+                bank: 0,
+                addr: vec![false],
+                data: vec![false, true],
+            }],
+        };
+        let mut cells = [false; 2];
+        let mut banks = [RuntimeStorageBank {
+            storage: 11,
+            lane: 3,
+            address_bits: 1,
+            value: &mut cells[..],
+        }];
+
+        assert_eq!(execute_with_storage(&mut (), &program, &[], &mut banks), Ok(vec![true]));
+        assert_eq!(cells, [true, true]);
+
+        let prepared = program.prepare(&cirrus_recompile_core::OptimizationOptions::default());
+        cells = [false; 2];
+        let mut prepared_banks = [RuntimeStorageBank {
+            storage: 11,
+            lane: 3,
+            address_bits: 1,
+            value: &mut cells[..],
+        }];
+        assert_eq!(
+            execute_prepared_with_storage(&mut (), &prepared, &[], &mut prepared_banks),
+            Ok(vec![true])
+        );
+        assert_eq!(prepared_banks[0].value, [true, true]);
+
+        cells = [false; 2];
+        let mut banks = [RuntimeStorageBank {
+            storage: 11,
+            lane: 3,
+            address_bits: 1,
+            value: &mut cells[..],
+        }];
+        initialize_storage(&mut (), &program, &mut banks).unwrap();
+        assert_eq!(banks[0].value, [false, true]);
+        assert_eq!(execute_storage_initialized(&mut (), &program, &[], &mut banks), Ok(vec![true]));
+        assert_eq!(banks[0].value, [true, true]);
+    }
 
     fn sample_program() -> (
         Program,
