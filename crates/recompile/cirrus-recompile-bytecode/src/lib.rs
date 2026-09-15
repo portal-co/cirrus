@@ -152,19 +152,20 @@ impl<'a> CompactProgram<'a> {
         }
         let mut entry = Reader::new(self.entry);
         loop {
-            match entry.byte().expect("validated instruction stream") {
+            let opcode = entry.byte().expect("validated instruction stream");
+            match opcode {
                 OP_END => break,
                 OP_CONST0 | OP_CONST1 => {
                     let out = entry.u32().expect("validated slot") as usize;
                     if scratch[out].is_none() {
-                        scratch[out] = Some(cirrus_core::ContextWithCreate::create(backend, entry.last_opcode == OP_CONST1)?);
+                        scratch[out] = Some(cirrus_core::ContextWithCreate::create(backend, opcode == OP_CONST1)?);
                     }
                 }
                 OP_AND | OP_OR | OP_XOR => {
                     let out = entry.u32().expect("validated slot") as usize;
                     let a = entry.u32().expect("validated slot") as usize;
                     let b = entry.u32().expect("validated slot") as usize;
-                    let value = match entry.last_opcode {
+                    let value = match opcode {
                         OP_AND => cirrus_core::ContextWithBitAnd::bitand(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
                         OP_OR => cirrus_core::ContextWithBitOr::bitor(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
                         _ => cirrus_core::ContextWithBitXor::bitxor(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
@@ -191,6 +192,201 @@ impl<'a> CompactProgram<'a> {
         }
         Ok(result)
     }
+}
+
+/// One caller-owned storage bank available to a compact executable.
+pub struct RuntimeStorageBank<'a, S: ?Sized> {
+    /// Canonical logical storage namespace from the compact bank table.
+    pub storage: u32,
+    /// Canonical one-bit lane from the compact bank table.
+    pub lane: u32,
+    /// Exact least-significant-first address width.
+    pub address_bits: u32,
+    /// Backend-owned storage value.
+    pub value: &'a mut S,
+}
+
+impl<'a> CompactProgram<'a> {
+    /// Apply the validated static storage initialization range once.
+    pub fn initialize_storage<Backend>(
+        self,
+        backend: &mut Backend,
+        banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+    ) -> Result<(), Backend::Error>
+    where
+        Backend: cirrus_core::ContextWithCreate<bool> + cirrus_core::ContextWithStorage<bool>,
+        Backend::Wrapped: Clone,
+    {
+        validate_runtime_banks(self.banks, banks);
+        let mut zero = None;
+        let mut one = None;
+        let mut init = Reader::new(self.init);
+        while !init.is_empty() {
+            debug_assert_eq!(init.byte().expect("validated init"), OP_INIT_BITS);
+            let bank = init.u32().expect("validated init");
+            let mut address = init.u32().expect("validated init");
+            let count = init.u32().expect("validated init");
+            let (_, _, address_bits) = bank_metadata(self.banks, bank).expect("validated bank");
+            let storage = runtime_bank(banks, self.banks, bank);
+            for offset in 0..count {
+                let bit = init.byte().expect("validated init") != 0;
+                let wire = if bit {
+                    one.get_or_insert(cirrus_core::ContextWithCreate::create(backend, true)?).clone()
+                } else {
+                    zero.get_or_insert(cirrus_core::ContextWithCreate::create(backend, false)?).clone()
+                };
+                let address_bits = (0..address_bits)
+                    .map(|bit| cirrus_core::StorageAddressBit {
+                        wire: wire.clone(),
+                        known: Some((address >> bit) & 1 != 0),
+                    })
+                    .collect::<Vec<_>>();
+                backend.storage_write(storage, &address_bits, wire)?;
+                if offset + 1 < count { address += 1; }
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a compact program and apply static initialization first.
+    pub fn execute_with_storage<Backend>(
+        self,
+        backend: &mut Backend,
+        scratch: &mut [Option<Backend::Wrapped>],
+        inputs: &[Backend::Wrapped],
+        banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+    ) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+    where
+        Backend: cirrus_core::ContextWithBitAnd<bool>
+            + cirrus_core::ContextWithBitOr<bool>
+            + cirrus_core::ContextWithBitXor<bool>
+            + cirrus_core::ContextWithCreate<bool>
+            + cirrus_core::ContextWithMux<bool>
+            + cirrus_core::ContextWithStorage<bool>,
+        Backend::Wrapped: Clone,
+    {
+        self.initialize_storage(backend, banks)?;
+        self.execute_storage_initialized(backend, scratch, inputs, banks)
+    }
+
+    /// Execute a compact program against storage initialized earlier.
+    pub fn execute_storage_initialized<Backend>(
+        self,
+        backend: &mut Backend,
+        scratch: &mut [Option<Backend::Wrapped>],
+        inputs: &[Backend::Wrapped],
+        banks: &mut [RuntimeStorageBank<'_, Backend::Storage>],
+    ) -> Result<Vec<Backend::Wrapped>, Backend::Error>
+    where
+        Backend: cirrus_core::ContextWithBitAnd<bool>
+            + cirrus_core::ContextWithBitOr<bool>
+            + cirrus_core::ContextWithBitXor<bool>
+            + cirrus_core::ContextWithCreate<bool>
+            + cirrus_core::ContextWithMux<bool>
+            + cirrus_core::ContextWithStorage<bool>,
+        Backend::Wrapped: Clone,
+    {
+        assert_eq!(scratch.len(), self.slots as usize, "scratch width must match compact program");
+        validate_runtime_banks(self.banks, banks);
+        for slot in scratch.iter_mut() { *slot = None; }
+        let input_count = count_slot_table(self.inputs).expect("validated input table");
+        assert_eq!(inputs.len(), input_count, "input count must match compact program");
+        let mut facts = alloc::vec![None; self.slots as usize];
+        let mut input_table = Reader::new(self.inputs);
+        for value in inputs {
+            scratch[input_table.u32().expect("validated input") as usize] = Some(value.clone());
+        }
+        let mut entry = Reader::new(self.entry);
+        loop {
+            let opcode = entry.byte().expect("validated instruction stream");
+            match opcode {
+                OP_END => break,
+                OP_CONST0 | OP_CONST1 => {
+                    let out = entry.u32().expect("validated slot") as usize;
+                    let value = opcode == OP_CONST1;
+                    facts[out] = Some(value);
+                    if scratch[out].is_none() {
+                        scratch[out] = Some(cirrus_core::ContextWithCreate::create(backend, value)?);
+                    }
+                }
+                OP_AND | OP_OR | OP_XOR => {
+                    let out = entry.u32().expect("validated slot") as usize;
+                    let a = entry.u32().expect("validated slot") as usize;
+                    let b = entry.u32().expect("validated slot") as usize;
+                    facts[out] = facts[a].zip(facts[b]).map(|(a, b)| match opcode {
+                        OP_AND => a & b, OP_OR => a | b, _ => a ^ b,
+                    });
+                    scratch[out] = Some(match opcode {
+                        OP_AND => cirrus_core::ContextWithBitAnd::bitand(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
+                        OP_OR => cirrus_core::ContextWithBitOr::bitor(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
+                        _ => cirrus_core::ContextWithBitXor::bitxor(backend, scratch[a].clone().unwrap(), scratch[b].clone().unwrap())?,
+                    });
+                }
+                OP_MUX => {
+                    let out = entry.u32().expect("validated slot") as usize;
+                    let cond = entry.u32().expect("validated slot") as usize;
+                    let then = entry.u32().expect("validated slot") as usize;
+                    let r#else = entry.u32().expect("validated slot") as usize;
+                    facts[out] = facts[cond].and_then(|cond| if cond { facts[then] } else { facts[r#else] });
+                    scratch[out] = Some(cirrus_core::ContextWithMux::mux(
+                        backend, scratch[cond].clone().unwrap(), scratch[then].clone().unwrap(), scratch[r#else].clone().unwrap(),
+                    )?);
+                }
+                OP_STORAGE_READ | OP_STORAGE_WRITE => {
+                    let read = opcode == OP_STORAGE_READ;
+                    let out = read.then(|| entry.u32().expect("validated slot") as usize);
+                    let bank = entry.u32().expect("validated bank");
+                    let count = entry.u32().expect("validated address count");
+                    let address = (0..count).map(|_| {
+                        let slot = entry.u32().expect("validated address slot") as usize;
+                        cirrus_core::StorageAddressBit { wire: scratch[slot].clone().unwrap(), known: facts[slot] }
+                    }).collect::<Vec<_>>();
+                    let storage = runtime_bank(banks, self.banks, bank);
+                    if let Some(out) = out {
+                        scratch[out] = Some(backend.storage_read(storage, &address)?);
+                    } else {
+                        let value = entry.u32().expect("validated value slot") as usize;
+                        backend.storage_write(storage, &address, scratch[value].clone().unwrap())?;
+                    }
+                }
+                _ => unreachable!("validated compact instruction"),
+            }
+        }
+        let mut outputs = Reader::new(self.outputs);
+        let mut result = Vec::with_capacity(count_slot_table(self.outputs).expect("validated output table"));
+        while !outputs.is_empty() {
+            result.push(scratch[outputs.u32().expect("validated output table") as usize].clone().unwrap());
+        }
+        Ok(result)
+    }
+}
+
+fn validate_runtime_banks<S: ?Sized>(bytes: &[u8], banks: &[RuntimeStorageBank<'_, S>]) {
+    let mut reader = Reader::new(bytes);
+    while !reader.is_empty() {
+        let storage = reader.u32().expect("validated bank table");
+        let lane = reader.u32().expect("validated bank table");
+        let address_bits = reader.u32().expect("validated bank table");
+        assert_eq!(banks.iter().filter(|bank| bank.storage == storage && bank.lane == lane && bank.address_bits == address_bits).count(), 1, "every compact bank needs one runtime bank");
+    }
+}
+
+fn bank_metadata(bytes: &[u8], index: u32) -> Result<(u32, u32, u32), DecodeError> {
+    let mut reader = Reader::new(bytes);
+    for current in 0..=index {
+        let storage = reader.u32()?;
+        let lane = reader.u32()?;
+        let address_bits = reader.u32()?;
+        if current == index { return Ok((storage, lane, address_bits)); }
+    }
+    Err(DecodeError::InvalidSection)
+}
+
+fn runtime_bank<'a, S: ?Sized>(
+    banks: &'a mut [RuntimeStorageBank<'_, S>], bytes: &[u8], index: u32,
+) -> &'a mut S {
+    let (storage, lane, address_bits) = bank_metadata(bytes, index).expect("validated bank");
+    banks.iter_mut().find(|bank| bank.storage == storage && bank.lane == lane && bank.address_bits == address_bits).expect("validated runtime bank").value
 }
 
 /// Transpile the currently supported flat Boolean `Program` subset.
@@ -383,7 +579,6 @@ fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8], banks: &[u8], bank_co
                 if count != bank_address_bits(banks, bank)? { return Err(DecodeError::InvalidSection); }
                 if let Some(out) = out {
                     if out >= slots || defined[out as usize] { return Err(DecodeError::InvalidSlot); }
-                    defined[out as usize] = true;
                 }
                 for _ in 0..count {
                     let slot = reader.u32()?;
@@ -393,6 +588,7 @@ fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8], banks: &[u8], bank_co
                     let value = reader.u32()?;
                     if value >= slots || !defined[value as usize] { return Err(DecodeError::InvalidSlot); }
                 }
+                if let Some(out) = out { defined[out as usize] = true; }
                 continue;
             }
             _ => return Err(DecodeError::InvalidInstruction),
@@ -411,11 +607,10 @@ fn validate_entry(bytes: &[u8], slots: u32, inputs: &[u8], banks: &[u8], bank_co
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
-    last_opcode: u8,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self { Self { bytes, at: 0, last_opcode: 0xff } }
+    const fn new(bytes: &'a [u8]) -> Self { Self { bytes, at: 0 } }
     const fn is_empty(&self) -> bool { self.at == self.bytes.len() }
     fn take(&mut self, count: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.at.checked_add(count).ok_or(DecodeError::Truncated)?;
@@ -425,7 +620,6 @@ impl<'a> Reader<'a> {
     }
     fn byte(&mut self) -> Result<u8, DecodeError> {
         let byte = *self.take(1)?.first().expect("one requested byte");
-        self.last_opcode = byte;
         Ok(byte)
     }
     fn u32(&mut self) -> Result<u32, DecodeError> {
@@ -502,6 +696,18 @@ mod tests {
         assert_eq!(compact.slots(), 4);
         assert!(!compact.banks.is_empty());
         assert!(!compact.init.is_empty());
+        let mut cells = [false; 2];
+        let mut banks = [RuntimeStorageBank {
+            storage: 9,
+            lane: 2,
+            address_bits: 1,
+            value: &mut cells[..],
+        }];
+        assert_eq!(
+            compact.execute_with_storage(&mut (), &mut [None, None, None, None], &[], &mut banks),
+            Ok(alloc::vec![true])
+        );
+        assert_eq!(banks[0].value, [true, true]);
     }
 
     #[test]
