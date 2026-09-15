@@ -1,0 +1,9 @@
+[package]
+name = "cirrus-recompile-bytecode"
+edition = "2024"
+version.workspace = true
+description = "Canonical compact bytecode for Cirrus Boolean programs"
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-recompile-core = { version = "0.1.0", path = "../cirrus-recompile-core" }
