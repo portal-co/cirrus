@@ -257,7 +257,7 @@ Provide these baseline implementations:
 | `ClearVariantOps` | Plain Boolean `Wire=bool`, clear `Rgsw=bool`, clear cell model; exhaustive/minimal schedule oracle. | Test profiles only. |
 | `BinFheToyOps` | Calls V2 Toy primitives using Volar's `binfhe_lut_read_dyn`, circuit bootstrap, and CMUX. | `Toy` only. |
 | `BinFheToyNoisyOps` | Same operation surface with seeded noisy profile and budget observation. | `ToyNoisy` only. |
-| `BinFheStd128Ops` | Deferred. | Reject until Volar’s V2 M8/parameter gate and a Cirrus deployment review approve it. |
+| `BinFheStd128Ops` | Real operations over the OpenFHE-transcribed `std128` profile (larger/slower; V2 is barely not paper-pinned, so this path works today). | Admits the profile, but every transcript is stamped `UNAPPROVED until Volar §9`; §9's lattice-estimator run and failure recomputation are automatable evidence steps, and production selection then requires review by a much more powerful model with grants from the owner or a cryptographer directly. |
 
 ## 5. Scheduling and interpretation flow
 
@@ -377,7 +377,12 @@ rather than rollback candidates.
    and clear operation set only; the full BinFHE V2 operation set is not an MCU
    admission claim without an explicit resource review.
 3. Admit `ToyNoisy` only after deterministic failure-budget transcript tests.
-   Admit `Std128` only after Volar M8 evidence and a separate Cirrus review.
+   `Std128` operation-set code may land earlier (V2 is barely not
+   paper-pinned), but production selection stays fail-closed until Volar
+   §9 evidence is logged and the production review gate passes: review by
+   a much more powerful model with grants from the owner, or a
+   cryptographer directly. §9's estimator run and failure recomputation
+   are automatable checks, not an untyped manual step.
 
 ## 7. Test matrix
 
@@ -401,7 +406,7 @@ rather than rollback candidates.
 | Duplicated scheduling diverges from Volar. | Volar produces the only plan; Cirrus validates/executes serialized records only. |
 | Plan hash is mistaken for cryptographic binding. | Include a cryptographic source/variant digest; label Volar's FNV hash diagnostic only. |
 | Generic variant turns into an unbounded VM. | Fixed kind/version, three known arenas, closed opcode table, capability-gated operation set, bounded sections. |
-| FHE profile selected without evidence. | `BinFheToyOps` only initially; reject Std128 until both repositories record explicit admission. |
+| FHE profile selected without evidence. | `BinFheToyOps` by default; Std128 transcripts are stamped UNAPPROVED until Volar §9 evidence plus a review by a much more powerful model with owner grants or a cryptographer. |
 | Variant crosses storage/effect boundary. | Region binding carries an effect barrier proof; v1 is pure Boolean and whole-entry only. |
 | Parallel execution changes observable state. | Serial canonical baseline; parallel implementation must be a separately tested operation-set capability. |
 | CRBV duplicates large LUT tables. | Deduplicate only in the Volar plan producer; serialize LUT source order and measure before introducing compression. |

@@ -1,0 +1,9 @@
+[package]
+name = "cirrus-binfhe-ops"
+edition = "2024"
+version.workspace = true
+description = "Test-only BinFHE V2 Toy operation set for CRBV compact variants"
+
+[dependencies]
+cirrus-recompile-bytecode = { version = "0.1.0", path = "../cirrus-recompile-bytecode" }
+volar-spec.workspace = true
