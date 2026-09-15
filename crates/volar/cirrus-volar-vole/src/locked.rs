@@ -25,7 +25,7 @@ use cirrus_core::{
 use hybrid_array::{Array, ArraySize};
 use volar_spec::{
     field::Invert,
-    vole::{prove::vole_and_prover_step, setup::derive_and_q, Delta, VoleArray, Vope, Q},
+    vole::{Delta, Q, VoleArray, Vope, prove::vole_and_prover_step, setup::derive_and_q},
 };
 
 use crate::{

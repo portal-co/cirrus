@@ -70,6 +70,36 @@ impl Idx {
     }
 }
 
+/// One caller-provided Boolean storage bank declared by a [`Program`].
+///
+/// The identifiers are logical names, not pointers or dense-memory offsets.
+/// Address bits are supplied least-significant first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct StorageBank {
+    /// Logical storage namespace.
+    pub storage: u64,
+    /// One-bit lane within [`Self::storage`].
+    pub lane: u64,
+    /// Exact number of least-significant-first address bits accepted by this
+    /// bank.
+    pub address_bits: u32,
+}
+
+/// One ordered run of public initial storage bits.
+///
+/// `data[0]` is written at `addr`, and subsequent bits are written at
+/// consecutive little-endian addresses. Segment order is observable when
+/// segments overlap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageInitSegment {
+    /// Index into [`Program::storage_banks`].
+    pub bank: u32,
+    /// Little-endian start address, with exactly the bank's address width.
+    pub addr: Vec<bool>,
+    /// Consecutive public bits to write.
+    pub data: Vec<bool>,
+}
+
 /// One recorded Boolean-circuit operation.
 ///
 /// Every variant names its operands by [`Idx`]; none carries its own output
@@ -97,6 +127,52 @@ pub enum Op {
     /// operand list live in [`Program::externals`] and are selected by this
     /// stable table index.
     External(u32),
+    /// A storage operation declared in [`Program::storage_ops`].
+    ///
+    /// A storage write's positional output is an effect placeholder and must
+    /// never be consumed as a Boolean value.
+    Storage(u32),
+}
+
+/// Whether a [`StorageOp`] reads or writes its bank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageOpKind {
+    /// Read one Boolean wire.
+    Read,
+    /// Write one Boolean wire.
+    Write,
+}
+
+/// Stable metadata for one storage operation referenced by [`Op::Storage`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageOp {
+    /// Whether this operation reads or writes.
+    pub kind: StorageOpKind,
+    /// Index into [`Program::storage_banks`].
+    pub bank: u32,
+    /// Earlier Boolean slots in least-significant-first address order.
+    pub address: Vec<Idx>,
+    /// Earlier Boolean slot to write, present exactly for [`StorageOpKind::Write`].
+    pub value: Option<Idx>,
+}
+
+/// Why a raw [`Program`] is structurally invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramError {
+    /// An input, output, or operation operand names an invalid slot.
+    InvalidSlot,
+    /// An operation reads a slot reserved for a storage-write effect.
+    EffectValueUsed,
+    /// An external operation refers to missing metadata.
+    InvalidExternal,
+    /// A storage operation or initialization segment refers to a missing bank.
+    InvalidStorageBank,
+    /// A storage address does not match its bank's declared bit width.
+    InvalidStorageAddressWidth,
+    /// A storage write has missing or invalid value metadata.
+    InvalidStorageWrite,
+    /// A static initialization segment overruns its bank's address width.
+    InvalidStorageInit,
 }
 
 /// External primitive class used by [`ExternalOp`].
@@ -140,6 +216,12 @@ pub struct Program {
     pub outputs: Vec<Idx>,
     /// Stable external metadata referenced by [`Op::External`].
     pub externals: Vec<ExternalOp>,
+    /// Stable storage metadata referenced by [`Op::Storage`].
+    pub storage_ops: Vec<StorageOp>,
+    /// Logical storage banks referenced by storage operations.
+    pub storage_banks: Vec<StorageBank>,
+    /// Ordered public storage initialization applied before one-shot execution.
+    pub storage_init: Vec<StorageInitSegment>,
 }
 
 impl Program {
@@ -187,12 +269,119 @@ impl Program {
         slot
     }
 
+    /// Add one storage operation and return its positional slot.
+    pub fn push_storage(&mut self, storage: StorageOp) -> Idx {
+        let id = u32::try_from(self.storage_ops.len()).expect("storage operation table exceeds u32");
+        let slot = Idx(self.ops.len() as u32);
+        self.storage_ops.push(storage);
+        self.ops.push(Op::Storage(id));
+        slot
+    }
+
+    /// Validate all raw operation, external, and storage contracts.
+    pub fn validate(&self) -> Result<(), ProgramError> {
+        let mut effects = alloc::vec![false; self.ops.len()];
+        for (index, op) in self.ops.iter().enumerate() {
+            let out = Idx(index as u32);
+            let value = |slot: Idx| {
+                if slot >= out || slot.get() >= self.ops.len() {
+                    return Err(ProgramError::InvalidSlot);
+                }
+                if effects[slot.get()] {
+                    return Err(ProgramError::EffectValueUsed);
+                }
+                Ok(())
+            };
+            match op {
+                Op::Create(_) => {}
+                Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
+                    value(*a)?;
+                    value(*b)?;
+                }
+                Op::Mux { cond, then, r#else } => {
+                    value(*cond)?;
+                    value(*then)?;
+                    value(*r#else)?;
+                }
+                Op::External(id) => {
+                    let external = self
+                        .externals
+                        .get(*id as usize)
+                        .ok_or(ProgramError::InvalidExternal)?;
+                    for &arg in &external.args {
+                        value(arg)?;
+                    }
+                }
+                Op::Storage(id) => {
+                    let storage = self
+                        .storage_ops
+                        .get(*id as usize)
+                        .ok_or(ProgramError::InvalidStorageBank)?;
+                    let bank = self
+                        .storage_banks
+                        .get(storage.bank as usize)
+                        .ok_or(ProgramError::InvalidStorageBank)?;
+                    if storage.address.len() != bank.address_bits as usize {
+                        return Err(ProgramError::InvalidStorageAddressWidth);
+                    }
+                    for &address in &storage.address {
+                        value(address)?;
+                    }
+                    match (storage.kind, storage.value) {
+                        (StorageOpKind::Read, None) => {}
+                        (StorageOpKind::Read, Some(_)) => return Err(ProgramError::InvalidStorageWrite),
+                        (StorageOpKind::Write, Some(write)) => {
+                            value(write)?;
+                            effects[index] = true;
+                        }
+                        (StorageOpKind::Write, None) => return Err(ProgramError::InvalidStorageWrite),
+                    }
+                }
+            }
+        }
+        for &slot in self.inputs.iter().chain(&self.outputs) {
+            if slot.get() >= self.ops.len() {
+                return Err(ProgramError::InvalidSlot);
+            }
+            if effects[slot.get()] {
+                return Err(ProgramError::EffectValueUsed);
+            }
+        }
+        for segment in &self.storage_init {
+            let bank = self
+                .storage_banks
+                .get(segment.bank as usize)
+                .ok_or(ProgramError::InvalidStorageBank)?;
+            if segment.addr.len() != bank.address_bits as usize || segment.data.is_empty() {
+                return Err(ProgramError::InvalidStorageAddressWidth);
+            }
+            let mut address = segment.addr.clone();
+            for _ in 1..segment.data.len() {
+                if !increment_address(&mut address) {
+                    return Err(ProgramError::InvalidStorageInit);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convert this Boolean trace into a [`TypedProgram`] with explicit `Bit`
     /// metadata on every slot.  The returned program is the migration seam
     /// for typed contexts and preserves all external occurrence metadata.
     pub fn typed(&self) -> Result<TypedProgram, TypedProgramError> {
         TypedProgram::from_boolean(self)
     }
+}
+
+fn increment_address(address: &mut [bool]) -> bool {
+    for bit in address {
+        if !*bit {
+            *bit = true;
+            return true;
+        }
+        *bit = false;
+    }
+    false
 }
 
 /// Tuning knobs for [`Program::prepare`] and [`PreparedProgram::reoptimize`].
@@ -317,6 +506,16 @@ pub enum PreparedOp {
         /// Destination slot.
         out: PreparedSlot,
     },
+    /// A storage operation referenced through [`PreparedProgram::storage_ops`].
+    ///
+    /// A write's destination is an effect placeholder and must not be used as
+    /// a Boolean value.
+    Storage {
+        /// Storage metadata index.
+        storage: u32,
+        /// Positional destination slot.
+        out: PreparedSlot,
+    },
 }
 
 /// One invocation of a [`PreparedLoop`].
@@ -384,6 +583,10 @@ pub enum PreparedProgramError {
     /// An external operation refers to missing metadata or an out-of-range
     /// argument slot.
     InvalidExternal,
+    /// Storage metadata is absent, incompatible, or out of range.
+    InvalidStorage,
+    /// An effect-only storage-write placeholder was consumed as a value.
+    EffectValueUsed,
 }
 
 const UNROLLED_OP_BYTES: usize = 20;
@@ -410,6 +613,12 @@ pub struct PreparedProgram {
     pub outputs: Vec<Idx>,
     /// Stable external metadata referenced by prepared external operations.
     pub externals: Vec<ExternalOp>,
+    /// Stable storage metadata referenced by prepared storage operations.
+    pub storage_ops: Vec<StorageOp>,
+    /// Logical caller-owned storage banks.
+    pub storage_banks: Vec<StorageBank>,
+    /// Ordered public storage initialization segments.
+    pub storage_init: Vec<StorageInitSegment>,
     /// Root statement range executed once.
     pub entry: StatementRange,
     /// Shared pool containing the entry and all loop bodies.
@@ -439,6 +648,9 @@ impl PreparedProgram {
             inputs,
             outputs,
             externals: Vec::new(),
+            storage_ops: Vec::new(),
+            storage_banks: Vec::new(),
+            storage_init: Vec::new(),
             entry,
             statements,
             estimated_unrolled_bytes: slots.saturating_mul(UNROLLED_OP_BYTES),
@@ -450,6 +662,9 @@ impl PreparedProgram {
     }
 
     fn from_program(program: &Program, options: &OptimizationOptions) -> Self {
+        program
+            .validate()
+            .expect("program must satisfy structural invariants before preparation");
         let statements = program
             .ops
             .iter()
@@ -467,6 +682,9 @@ impl PreparedProgram {
             inputs: program.inputs.clone(),
             outputs: program.outputs.clone(),
             externals: program.externals.clone(),
+            storage_ops: program.storage_ops.clone(),
+            storage_banks: program.storage_banks.clone(),
+            storage_init: program.storage_init.clone(),
             entry: StatementRange::new(0, program.ops.len() as u32),
             statements,
             estimated_unrolled_bytes: program.ops.len().saturating_mul(UNROLLED_OP_BYTES),
@@ -516,6 +734,8 @@ impl PreparedProgram {
         {
             return Err(PreparedProgramError::InvalidExternal);
         }
+        self.validate_storage_metadata()?;
+        self.validate_effect_uses(self.entry, &mut Vec::new(), 0)?;
         Ok(())
     }
 
@@ -618,6 +838,11 @@ impl PreparedProgram {
                             return Err(PreparedProgramError::InvalidExternal);
                         }
                     }
+                    if let PreparedOp::Storage { storage, .. } = op {
+                        if *storage as usize >= self.storage_ops.len() {
+                            return Err(PreparedProgramError::InvalidStorage);
+                        }
+                    }
                 }
                 Statement::Loop(loop_step) => {
                     if loop_step.invocations.len() != expected_invocations {
@@ -657,6 +882,125 @@ impl PreparedProgram {
         }
         active_ranges.pop();
         Ok(())
+    }
+
+    fn validate_storage_metadata(&self) -> Result<(), PreparedProgramError> {
+        for storage in &self.storage_ops {
+            let bank = self
+                .storage_banks
+                .get(storage.bank as usize)
+                .ok_or(PreparedProgramError::InvalidStorage)?;
+            if storage.address.len() != bank.address_bits as usize
+                || matches!(storage.kind, StorageOpKind::Read) != storage.value.is_none()
+            {
+                return Err(PreparedProgramError::InvalidStorage);
+            }
+        }
+        for segment in &self.storage_init {
+            let bank = self
+                .storage_banks
+                .get(segment.bank as usize)
+                .ok_or(PreparedProgramError::InvalidStorage)?;
+            if segment.addr.len() != bank.address_bits as usize || segment.data.is_empty() {
+                return Err(PreparedProgramError::InvalidStorage);
+            }
+            let mut address = segment.addr.clone();
+            for _ in 1..segment.data.len() {
+                if !increment_address(&mut address) {
+                    return Err(PreparedProgramError::InvalidStorage);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_effect_uses<'a>(
+        &'a self,
+        range: StatementRange,
+        active: &mut Vec<ActiveLoop<'a>>,
+        invocation: usize,
+    ) -> Result<(), PreparedProgramError> {
+        for statement in self.range_slice(range).ok_or(PreparedProgramError::InvalidRange)? {
+            match statement {
+                Statement::Op(op) => {
+                    let scheduled = op.resolve(|slot| resolve_prepared_slot(slot, active));
+                    match scheduled.op {
+                        Op::Storage(storage) => {
+                            let storage = &self.storage_ops[storage as usize];
+                            for &slot in &storage.address {
+                                self.require_value_slot(slot, active)?;
+                            }
+                            if let Some(value) = storage.value {
+                                self.require_value_slot(value, active)?;
+                            }
+                        }
+                        Op::External(external) => {
+                            for &slot in &self.externals[external as usize].args {
+                                self.require_value_slot(slot, active)?;
+                            }
+                        }
+                        op => {
+                            for slot in op_operand_slots(op).into_iter().flatten() {
+                                self.require_value_slot(slot, active)?;
+                            }
+                        }
+                    }
+                }
+                Statement::Loop(loop_step) => {
+                    let descriptor = loop_step.invocations[invocation];
+                    for iteration in 0..descriptor.iterations as usize {
+                        let row = descriptor.first_row as usize + iteration;
+                        active.push(ActiveLoop { loop_step, row });
+                        self.validate_effect_uses(loop_step.body, active, row)?;
+                        active.pop();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_value_slot(
+        &self,
+        slot: Idx,
+        active: &[ActiveLoop<'_>],
+    ) -> Result<(), PreparedProgramError> {
+        if self.slot_is_effect(slot, active) {
+            Err(PreparedProgramError::EffectValueUsed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn slot_is_effect(&self, slot: Idx, active: &[ActiveLoop<'_>]) -> bool {
+        self.statement_effect_slot(self.entry, active, 0, slot)
+    }
+
+    fn statement_effect_slot(
+        &self,
+        range: StatementRange,
+        active: &[ActiveLoop<'_>],
+        invocation: usize,
+        needle: Idx,
+    ) -> bool {
+        self.range_slice(range).is_some_and(|statements| {
+            statements.iter().any(|statement| match statement {
+                Statement::Op(op) => {
+                    let scheduled = op.resolve(|slot| resolve_prepared_slot(slot, active));
+                    matches!(scheduled.op, Op::Storage(storage) if self.storage_ops[storage as usize].kind == StorageOpKind::Write)
+                        && scheduled.out == needle
+                }
+                Statement::Loop(loop_step) => {
+                    let descriptor = loop_step.invocations[invocation];
+                    (0..descriptor.iterations as usize).any(|iteration| {
+                        let row = descriptor.first_row as usize + iteration;
+                        let mut nested = active.to_vec();
+                        nested.push(ActiveLoop { loop_step, row });
+                        self.statement_effect_slot(loop_step.body, &nested, row, needle)
+                    })
+                }
+            })
+        })
     }
 
     fn range_has_loops(&self, range: StatementRange) -> bool {
@@ -720,6 +1064,7 @@ impl PreparedOp {
                 out,
             },
             Op::External(external) => Self::External { external, out },
+            Op::Storage(storage) => Self::Storage { storage, out },
         }
     }
 
@@ -744,8 +1089,7 @@ impl PreparedOp {
                 r#else,
                 out,
             } => [cond, then, r#else, out],
-            Self::External { out, .. } => [out, out, out, out],
-        }
+            Self::External { out, .. } | Self::Storage { out, .. } => [out, out, out, out],        }
     }
 
     /// Resolve this template operation through its active loop scopes.
@@ -783,6 +1127,10 @@ impl PreparedOp {
             Self::External { external, out } => ScheduledOp {
                 out: slot(out),
                 op: Op::External(external),
+            },
+            Self::Storage { storage, out } => ScheduledOp {
+                out: slot(out),
+                op: Op::Storage(storage),
             },
         }
     }
@@ -826,6 +1174,10 @@ impl PreparedOp {
                 out: static_slot(out)?,
                 op: Op::External(external),
             }),
+            // Storage operations are effectful and require their own
+            // table-aware lowering before loop reabstraction can preserve
+            // bank/address semantics.
+            Self::Storage { .. } => None,
         }
     }
 }
@@ -960,6 +1312,7 @@ fn same_shape(left: Op, right: Op) -> bool {
         | (Op::BitOr(..), Op::BitOr(..))
         | (Op::BitXor(..), Op::BitXor(..))
         | (Op::Mux { .. }, Op::Mux { .. }) => true,
+        (Op::Storage(left), Op::Storage(right)) => left == right,
         _ => false,
     }
 }
@@ -1005,7 +1358,9 @@ fn build_loop(ops: &[Option<ScheduledOp>], width: usize, repetitions: usize) -> 
                 r#else: operand(2, &mut fields),
                 out,
             },
-            Op::External(_) => unreachable!("external operations are never loop-abstracted"),
+            Op::External(_) | Op::Storage(_) => {
+                unreachable!("effectful operations are never loop-abstracted")
+            }
         };
         body.push(Statement::Op(op));
     }
@@ -1276,6 +1631,9 @@ fn append_rows(
 pub struct Recorder {
     ops: Vec<Op>,
     externals: Vec<ExternalOp>,
+    storage_ops: Vec<StorageOp>,
+    storage_banks: Vec<StorageBank>,
+    storage_init: Vec<StorageInitSegment>,
 }
 
 impl Recorder {
@@ -1284,6 +1642,9 @@ impl Recorder {
         Self {
             ops: Vec::new(),
             externals: Vec::new(),
+            storage_ops: Vec::new(),
+            storage_banks: Vec::new(),
+            storage_init: Vec::new(),
         }
     }
 
@@ -1308,6 +1669,9 @@ impl Recorder {
             inputs,
             outputs,
             externals: self.externals,
+            storage_ops: self.storage_ops,
+            storage_banks: self.storage_banks,
+            storage_init: self.storage_init,
         }
     }
 
@@ -1634,6 +1998,7 @@ pub fn interpret(program: &Program, inputs: &[bool]) -> Vec<bool> {
                 }
             }
             Op::External(_) => panic!("interpret: external program needs an external registry"),
+            Op::Storage(_) => panic!("interpret: storage program needs a storage executor"),
         };
         slots[i] = Some(value);
     }
@@ -1680,6 +2045,7 @@ pub fn interpret_prepared(program: &PreparedProgram, inputs: &[bool]) -> Vec<boo
         .collect()
 }
 
+#[derive(Clone)]
 struct ActiveLoop<'a> {
     loop_step: &'a PreparedLoop,
     row: usize,
@@ -1750,6 +2116,7 @@ fn interpret_scheduled_op(slots: &mut [Option<bool>], is_input: &[bool], schedul
         Op::External(_) => {
             panic!("interpret_prepared: external program needs an external registry")
         }
+        Op::Storage(_) => panic!("interpret_prepared: storage program needs a storage executor"),
     };
     slots[scheduled.out.get()] = Some(value);
 }
@@ -1800,6 +2167,12 @@ impl PreparedProgram {
     /// stays correct exactly because no computed value is ever assigned an
     /// input's slot.
     pub fn compact_slots(&self) -> Self {
+        // An effect placeholder has no backend value to allocate. Keep the
+        // original slots until storage-aware liveness/rewrite is implemented
+        // rather than accidentally treating it as an ordinary value.
+        if !self.storage_ops.is_empty() {
+            return self.clone();
+        }
         let liveness = self.compute_liveness();
         let assignment = self.assign_compact_slots(&liveness);
         self.rewrite_with(&assignment)
@@ -1947,11 +2320,23 @@ impl PreparedProgram {
                 *arg = Idx(assignment.map[arg.get()]);
             }
         }
+        let mut storage_ops = self.storage_ops.clone();
+        for storage in &mut storage_ops {
+            for address in &mut storage.address {
+                *address = Idx(assignment.map[address.get()]);
+            }
+            if let Some(value) = &mut storage.value {
+                *value = Idx(assignment.map[value.get()]);
+            }
+        }
         let mut compacted = Self {
             slots: assignment.new_slots,
             inputs,
             outputs,
             externals,
+            storage_ops,
+            storage_banks: self.storage_banks.clone(),
+            storage_init: self.storage_init.clone(),
             entry: self.entry,
             statements,
             // Compaction never changes how many operations a fully unrolled
@@ -1970,12 +2355,23 @@ impl PreparedProgram {
     }
 }
 
+fn resolve_prepared_slot(slot: PreparedSlot, active: &[ActiveLoop<'_>]) -> Idx {
+    match slot {
+        PreparedSlot::Static(slot) => slot,
+        PreparedSlot::Table { depth, field } => {
+            let active = &active[active.len() - 1 - depth as usize];
+            let offset = active.row * active.loop_step.fields_per_iteration as usize + field as usize;
+            Idx(active.loop_step.table[offset])
+        }
+    }
+}
+
 fn op_operand_slots(op: Op) -> [Option<Idx>; 3] {
     match op {
         Op::Create(_) => [None, None, None],
         Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => [Some(a), Some(b), None],
         Op::Mux { cond, then, r#else } => [Some(cond), Some(then), Some(r#else)],
-        Op::External(_) => [None, None, None],
+        Op::External(_) | Op::Storage(_) => [None, None, None],
     }
 }
 
@@ -2022,12 +2418,52 @@ fn remap_prepared_op(op: PreparedOp, map: &[u32]) -> PreparedOp {
             external,
             out: remap_prepared_slot(out, map),
         },
+        PreparedOp::Storage { storage, out } => PreparedOp::Storage {
+            storage,
+            out: remap_prepared_slot(out, map),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_storage_validation_rejects_effect_value_use() {
+        let mut program = Program {
+            ops: alloc::vec![
+                Op::Create(false),
+                Op::Storage(0),
+                Op::BitXor(Idx(1), Idx(0)),
+            ],
+            inputs: alloc::vec![],
+            outputs: alloc::vec![Idx(2)],
+            externals: alloc::vec![],
+            storage_ops: alloc::vec![StorageOp {
+                kind: StorageOpKind::Write,
+                bank: 0,
+                address: alloc::vec![Idx(0)],
+                value: Some(Idx(0)),
+            }],
+            storage_banks: alloc::vec![StorageBank {
+                storage: 7,
+                lane: 1,
+                address_bits: 1,
+            }],
+            storage_init: alloc::vec![],
+        };
+        assert_eq!(program.validate(), Err(ProgramError::EffectValueUsed));
+
+        program.ops[2] = Op::Storage(1);
+        program.storage_ops.push(StorageOp {
+            kind: StorageOpKind::Read,
+            bank: 0,
+            address: alloc::vec![Idx(0)],
+            value: None,
+        });
+        assert_eq!(program.validate(), Ok(()));
+    }
 
     #[test]
     fn recorder_numbers_ops_by_position() {
@@ -2126,6 +2562,9 @@ mod tests {
             inputs: alloc::vec![Idx(0), Idx(1)],
             outputs: alloc::vec![Idx(2), Idx(3), Idx(4), Idx(5), Idx(6)],
             externals: alloc::vec![],
+            storage_ops: alloc::vec![],
+            storage_banks: alloc::vec![],
+            storage_init: alloc::vec![],
         };
         let prepared = PreparedProgram::new(
             raw.len(),
@@ -2333,6 +2772,9 @@ mod tests {
             inputs: alloc::vec![Idx(0)],
             outputs: alloc::vec![Idx(0)],
             externals: alloc::vec![],
+            storage_ops: alloc::vec![],
+            storage_banks: alloc::vec![],
+            storage_init: alloc::vec![],
         };
         let prepared = raw.prepare(&OptimizationOptions::default());
         assert_eq!(interpret_prepared(&prepared, &[true]), [true]);

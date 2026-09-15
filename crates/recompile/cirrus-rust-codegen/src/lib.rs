@@ -236,7 +236,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
         | PreparedOp::Mux { out, .. }
-        | PreparedOp::External { out, .. } => out,
+        | PreparedOp::External { out, .. }
+        | PreparedOp::Storage { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -291,8 +292,8 @@ fn prepared_call_line(module: &str, op: PreparedOp, active: &[ActiveTable]) -> S
             prepared_slot(r#else, active),
             prepared_slot(out, active)
         ),
-        PreparedOp::External { .. } => {
-            unreachable!("external programs are rejected before source emission")
+        PreparedOp::External { .. } | PreparedOp::Storage { .. } => {
+            unreachable!("effectful programs are rejected before source emission")
         }
     }
 }

@@ -26,15 +26,53 @@
 
 extern crate alloc;
 
+mod hook;
+#[cfg(feature = "iop-accumulator")]
+pub mod iop_accumulator;
 mod locked;
+mod mode_b_relation;
+#[cfg(feature = "spartan-whir-adapter")]
+mod spartan_whir_adapter;
+mod trace_audit;
+mod trace_to_proof;
 mod typed;
+mod vole_verifier_relation;
 
+pub use hook::{NoopVoleVerifierHook, VoleVerifierHook};
 pub use locked::{
     LockedVoleProverContext, LockedVoleProverStorage, LockedVoleProverStorageContext,
     LockedVoleVerifierContext, LockedVoleVerifierStorage, LockedVoleVerifierStorageContext,
     MutexPuller, MutexPusher, PullerByRef,
 };
+pub use mode_b_relation::{
+    ActualBooleanSemantics, CircuitId, ConstraintSemantics, KOALABEAR_MODULUS,
+    KOALABEAR_QUINTIC_DEGREE, KoalaBearLinearCombination, KoalaBearR1cs, KoalaBearR1csRow,
+    LinearCombination, MODE_B_RELATION_VERSION, ModeBPublicInstance, ModeBRelation,
+    ModeBRelationError, PRIME_RAM_ADDRESS_BITS, PRIME_RAM_FORMAT, PRIME_RAM_LANE_BITS,
+    PRIME_RAM_STORAGE_BITS, PRIME_RAM_TIME_BITS, PrimeFieldRamConfig, PrimeRamMaterialization,
+    PrimeRamPermutationChallenges, PrimeRamPermutationR1cs, PrimeRamR1cs, PrimeRamRecord,
+    PrimeRamRecordLayout, PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess,
+    RamAccessKind, RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation,
+    UnifiedR1cs, UnifiedR1csWitness, schedule_boolar_constraints,
+};
+#[cfg(feature = "spartan-whir-adapter")]
+pub use spartan_whir_adapter::{
+    SpartanWhirAdapterShape, SpartanWhirAdapterWitness, SpartanWhirTraceKeys,
+    SpartanWhirTraceProof, TraceProofBackendError, TraceProofSecurityProfile,
+};
+pub use trace_audit::{
+    BoolarTraceAudit, MemoryAccess, MemoryAccessKind, MemoryPermutationAudit, TraceAuditError,
+    TraceDigest, WireAuthPath, WireOpening, commit_boolar_trace,
+};
+pub use trace_to_proof::{
+    RamChallengeInput, TraceProofArtifacts, TraceToProofError, TraceToProofInput,
+    build_trace_proof_artifacts,
+};
 pub use typed::TypedVoleValue;
+pub use vole_verifier_relation::{
+    VOLE_VERIFIER_LANES, VOLE_VERIFIER_RELATION_PROFILE, VoleVerifierRelationLayout,
+    VoleVerifierSemantics, VoleVerifierTrace,
+};
 
 use alloc::vec::Vec;
 use core::{
@@ -52,13 +90,13 @@ use hybrid_array::{Array, ArraySize};
 use volar_spec::{
     field::Invert,
     vole::{
+        Delta, Q, VoleArray, Vope,
         bridge::{
             mem_acc_absorb_q, mem_acc_absorb_vope, mem_drain_check, mem_drain_open, q_scale_const,
             vope_scale_const,
         },
         prove::vole_and_prover_step,
         setup::derive_and_q,
-        Delta, VoleArray, Vope, Q,
     },
 };
 
@@ -190,23 +228,34 @@ impl core::error::Error for VoleVerifyError {}
 /// caller-driven step performed only at claimed/revealed output wires, not
 /// part of the per-gate `Context` operations -- see this crate's own
 /// round-trip test.
-pub struct VoleVerifierContext<N: ArraySize, T, I: Iterator<Item = Array<T, N>>> {
+pub struct VoleVerifierContext<
+    N: ArraySize,
+    T,
+    I: Iterator<Item = Array<T, N>>,
+    H = NoopVoleVerifierHook,
+> {
     /// The verifier's secret global offset.
     pub delta: Delta<N, T>,
     /// The ordered source of `hat` values, one per AND gate.
     pub hats: I,
+    /// Optional observer for successfully replayed AND gates.
+    pub hook: H,
+    /// Number of successfully observed gates.
+    pub gate_index: usize,
 }
 
-impl<N: ArraySize, T, I: Iterator<Item = Array<T, N>>> HasError for VoleVerifierContext<N, T, I> {
+impl<N: ArraySize, T, I: Iterator<Item = Array<T, N>>, H> HasError
+    for VoleVerifierContext<N, T, I, H>
+{
     type Error = VoleVerifyError;
 }
-impl<N: ArraySize, T, I: Iterator<Item = Array<T, N>>> ContextWithValue<bool>
-    for VoleVerifierContext<N, T, I>
+impl<N: ArraySize, T, I: Iterator<Item = Array<T, N>>, H> ContextWithValue<bool>
+    for VoleVerifierContext<N, T, I, H>
 {
     type Wrapped = Q<N, T>;
 }
-impl<N: ArraySize, T: Clone + Default, I: Iterator<Item = Array<T, N>>> ContextWithCreate<bool>
-    for VoleVerifierContext<N, T, I>
+impl<N: ArraySize, T: Clone + Default, I: Iterator<Item = Array<T, N>>, H> ContextWithCreate<bool>
+    for VoleVerifierContext<N, T, I, H>
 {
     fn create(&mut self, val: bool) -> Result<Q<N, T>, VoleVerifyError> {
         Ok(Q {
@@ -218,8 +267,8 @@ impl<N: ArraySize, T: Clone + Default, I: Iterator<Item = Array<T, N>>> ContextW
         })
     }
 }
-impl<N: ArraySize, T: Clone + Add<Output = T>, I: Iterator<Item = Array<T, N>>>
-    ContextWithBitXor<bool> for VoleVerifierContext<N, T, I>
+impl<N: ArraySize, T: Clone + Add<Output = T>, I: Iterator<Item = Array<T, N>>, H>
+    ContextWithBitXor<bool> for VoleVerifierContext<N, T, I, H>
 {
     fn bitxor(&mut self, a: Q<N, T>, b: Q<N, T>) -> Result<Q<N, T>, VoleVerifyError> {
         // `Q` has no dedicated `Add` impl; this pointwise construction is
@@ -235,14 +284,19 @@ impl<N: ArraySize, T: Clone + Add<Output = T>, I: Iterator<Item = Array<T, N>>>
     }
 }
 impl<
-        N: ArraySize,
-        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-        I: Iterator<Item = Array<T, N>>,
-    > ContextWithBitAnd<bool> for VoleVerifierContext<N, T, I>
+    N: ArraySize,
+    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+    I: Iterator<Item = Array<T, N>>,
+    H: VoleVerifierHook<N, T>,
+> ContextWithBitAnd<bool> for VoleVerifierContext<N, T, I, H>
 {
     fn bitand(&mut self, a: Q<N, T>, b: Q<N, T>) -> Result<Q<N, T>, VoleVerifyError> {
         let hat = self.hats.next().ok_or(VoleVerifyError::HatExhausted)?;
-        Ok(derive_and_q(&self.delta, &a, &b, &hat))
+        let c = derive_and_q(&self.delta, &a, &b, &hat);
+        self.hook
+            .on_and(self.gate_index, &self.delta, &a, &b, &c, &hat);
+        self.gate_index += 1;
+        Ok(c)
     }
     fn bitand_assign(&mut self, a: &mut Q<N, T>, b: Q<N, T>) -> Result<(), VoleVerifyError> {
         *a = self.bitand(a.clone(), b)?;
@@ -1127,6 +1181,8 @@ mod tests {
                     delta: Array::from_fn(|_| delta),
                 },
                 hats: alloc::vec::Vec::new().into_iter(),
+                hook: NoopVoleVerifierHook,
+                gate_index: 0,
             },
         };
         let verifier_address = [StorageAddressBit {
@@ -1153,10 +1209,11 @@ mod tests {
     }
 }
 impl<
-        N: ArraySize,
-        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-        I: Iterator<Item = Array<T, N>>,
-    > ContextWithBitOr<bool> for VoleVerifierContext<N, T, I>
+    N: ArraySize,
+    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+    I: Iterator<Item = Array<T, N>>,
+    H: VoleVerifierHook<N, T>,
+> ContextWithBitOr<bool> for VoleVerifierContext<N, T, I, H>
 {
     fn bitor(&mut self, a: Q<N, T>, b: Q<N, T>) -> Result<Q<N, T>, VoleVerifyError> {
         let either = self.bitxor(a.clone(), b.clone())?;
@@ -1169,10 +1226,11 @@ impl<
     }
 }
 impl<
-        N: ArraySize,
-        T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
-        I: Iterator<Item = Array<T, N>>,
-    > ContextWithMux<bool> for VoleVerifierContext<N, T, I>
+    N: ArraySize,
+    T: Clone + Add<Output = T> + Mul<Output = T> + Invert + Default,
+    I: Iterator<Item = Array<T, N>>,
+    H: VoleVerifierHook<N, T>,
+> ContextWithMux<bool> for VoleVerifierContext<N, T, I, H>
 {
     fn mux(
         &mut self,

@@ -4,6 +4,13 @@ edition = "2024"
 version.workspace = true
 description.workspace = true
 
+[features]
+iop-accumulator = ["dep:volar-iop"]
+# Std-only conversion boundary to ethereum/spartan-whir's Rust R1CS types.
+# This does not turn caller-chosen RAM permutation challenges into a
+# Fiat-Shamir protocol; applications must derive those after RAM commitment.
+spartan-whir-adapter = ["dep:spartan-whir", "dep:p3-field"]
+
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
@@ -11,6 +18,12 @@ volar-spec.workspace = true
 hybrid-array.workspace = true
 cipher.workspace = true
 spin = { version = "0.10.1", default-features = false, features = ["mutex", "spin_mutex", "portable-atomic"] }
+volar-iop = { version = "0.1.0", git = "https://github.com/portal-co/volar.git", optional = true }
+sha3 = { version = "0.11.0-rc.2", default-features = false }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+spartan-whir = { git = "https://github.com/ethereum/spartan-whir.git", rev = "f525cddea38bb605304d3a8e6394dda10ac64b4a", optional = true }
+p3-field = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "f64ae15da3807388b1a4e0a89a4fde8fdcdff515", optional = true }
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "arm"))'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
@@ -20,6 +33,4 @@ cirrus-recompile-rt = { version = "0.1.0", path = "../../recompile/cirrus-recomp
 cirrus-ert = { version = "0.1.0", path = "../../ert/cirrus-ert" }
 rv-asm.workspace = true
 cirrus-volar-boolar = { path = "../cirrus-volar-boolar" }
-volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
-volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
 volar-lir-test-corpus = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }

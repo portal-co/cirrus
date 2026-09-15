@@ -23,6 +23,10 @@ label encoding, framed streaming messages, a reviewed discrete Gaussian, and
 independent parameter/security validation remain necessary. Its cited
 construction and an audit of the authors' reference are recorded in
 [`cirrus-garbled-circuit-tinylabels/RESEARCH.md`](cirrus-garbled-circuit-tinylabels/RESEARCH.md).
+The cross-repository adoption and streaming/interpreter port sequence is in
+[`TINYLABELS_CROSS_REPO_PLAN.md`](TINYLABELS_CROSS_REPO_PLAN.md); it records
+why TinyLabels remains an explicit server-only delivery mode rather than the
+embedded default.
 
 All implementations use the Boolean-context seam consumed by the ERT facades.
 Their tests must exercise the same primitive truth tables and locked RV32/Thumb

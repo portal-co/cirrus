@@ -5,3 +5,11 @@ version.workspace = true
 description = "TinyLabels-directed input-label batching for cirrus"
 
 [dependencies]
+volar-spec.workspace = true
+cirrus-coroutine = { path = "../../cirrus-coroutine", optional = true }
+
+[features]
+default = []
+# Explicit server-class manifest/admission and bounded coroutine streaming.
+# This feature is never selected by embedded Cirrus profiles.
+tinylabels-server = ["dep:cirrus-coroutine"]

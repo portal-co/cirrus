@@ -456,7 +456,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
         | PreparedOp::Mux { out, .. }
-        | PreparedOp::External { out, .. } => out,
+        | PreparedOp::External { out, .. }
+        | PreparedOp::Storage { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -680,8 +681,8 @@ fn emit_prepared_op<'ctx>(
                 )
                 .expect("build table-loop mux");
         }
-        PreparedOp::External { .. } => {
-            unreachable!("external programs are rejected before LLVM emission")
+        PreparedOp::External { .. } | PreparedOp::Storage { .. } => {
+            unreachable!("effectful programs are rejected before LLVM emission")
         }
     }
 }

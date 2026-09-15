@@ -21,7 +21,7 @@ use cirrus_recompile_core::{
     TypedExternalRegistry, TypedOp, TypedProgram, VolarType, execute_typed,
 };
 use cirrus_volar_boolar::{MuxTreeContext, execute as execute_boolar};
-use cirrus_volar_vole::{VoleProverContext, VoleVerifierContext};
+use cirrus_volar_vole::{NoopVoleVerifierHook, VoleProverContext, VoleVerifierContext};
 use hybrid_array::Array;
 use volar_ir::circuit::BCircuit;
 use volar_lir_test_corpus::make_biir_half_adder;
@@ -194,6 +194,8 @@ fn prover_and_verifier_agree_and_reject_a_corrupted_transcript() {
         let mut verifier = VoleVerifierContext {
             delta: delta.clone(),
             hats: hats.0.clone().into_iter(),
+            hook: NoopVoleVerifierHook,
+            gate_index: 0,
         };
         let verifier_outputs =
             cirrus_recompile_rt::execute(&mut verifier, &program, &verifier_inputs).unwrap();
@@ -255,6 +257,8 @@ fn typed_u8_addition_uses_the_normal_vole_transcript() {
     let mut verifier = VoleVerifierContext {
         delta: delta.clone(),
         hats: hats.0.clone().into_iter(),
+        hook: NoopVoleVerifierHook,
+        gate_index: 0,
     };
     let verifier_output = execute_typed(&mut verifier, &program, &[], &mut externals).unwrap();
     for (index, (prover_bit, verifier_bit)) in prover_output[0]

@@ -197,6 +197,8 @@ pub enum TypedProgramError {
     InvalidExternal,
     /// An `ActionStore` effect placeholder was consumed as a data value.
     EffectValueUsed,
+    /// Boolean storage operations have no typed-program counterpart yet.
+    StorageUnsupported,
 }
 
 impl TypedProgram {
@@ -245,6 +247,7 @@ impl TypedProgram {
                     }
                     TypedOp::External(external)
                 }
+                crate::Op::Storage(_) => return Err(TypedProgramError::StorageUnsupported),
             });
         }
         let typed = Self {
@@ -1129,6 +1132,9 @@ mod tests {
             inputs: Vec::new(),
             outputs: alloc::vec![Idx(2)],
             externals: Vec::new(),
+            storage_ops: Vec::new(),
+            storage_banks: Vec::new(),
+            storage_init: Vec::new(),
         };
         let typed = boolean.typed().unwrap();
         assert!(typed.slot_tys.iter().all(|ty| typed.types.is_bit(*ty)));

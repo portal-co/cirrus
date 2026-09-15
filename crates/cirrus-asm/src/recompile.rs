@@ -359,7 +359,8 @@ fn writes_input(program: &PreparedProgram, op: PreparedOp) -> bool {
         | PreparedOp::BitOr { out, .. }
         | PreparedOp::BitXor { out, .. }
         | PreparedOp::Mux { out, .. }
-        | PreparedOp::External { out, .. } => out,
+        | PreparedOp::External { out, .. }
+        | PreparedOp::Storage { out, .. } => out,
     };
     matches!(out, PreparedSlot::Static(slot) if program.inputs.contains(&slot))
 }
@@ -630,16 +631,16 @@ fn emit_prepared_call(
                 PreparedArgument::Slot(out),
             ],
         ),
-        PreparedOp::External { .. } => {
-            unreachable!("external programs are rejected before AArch64 emission")
+        PreparedOp::External { .. } | PreparedOp::Storage { .. } => {
+            unreachable!("effectful programs are rejected before AArch64 emission")
         }
     };
     let count = match op {
         PreparedOp::Create { .. } => 2,
         PreparedOp::BitAnd { .. } | PreparedOp::BitOr { .. } | PreparedOp::BitXor { .. } => 3,
         PreparedOp::Mux { .. } => 4,
-        PreparedOp::External { .. } => {
-            unreachable!("external programs are rejected before AArch64 emission")
+        PreparedOp::External { .. } | PreparedOp::Storage { .. } => {
+            unreachable!("effectful programs are rejected before AArch64 emission")
         }
     };
     emit_pinned_arguments(w, address, &arguments[..count], active_depth);
