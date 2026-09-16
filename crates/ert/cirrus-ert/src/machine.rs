@@ -19,6 +19,16 @@ pub(crate) trait Runtime<W, const BITS: usize>:
         one: &W,
     ) -> Result<EcallOutcome, Self::Error>;
 
+    fn call_hook(
+        &mut self,
+        event: crate::CallEvent,
+        regs: &mut [[W; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &W,
+        one: &W,
+    ) -> Result<crate::CallAction, Self::Error>;
+
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, Self::Error>;
 
     fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;

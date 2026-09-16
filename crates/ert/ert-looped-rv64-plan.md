@@ -599,19 +599,30 @@ lives in the new crate over the *shared* core traits, not in
   at HEAD already (pre-existing harness issue, unrelated to this phase; its
   25 unit tests pass).
 
-### Phase B — call interception
+### Phase B — call interception — **DONE**
 
-- [ ] `cirrus-ert-core` (or `cirrus-ert`): `CallEvent`/`CallAction`
-      types; defaulted `call_hook` on `RvHandler` (RV32+RV64), firing
-      from `jump_and_link*`/`return_from_call`; symbolic-target hook
-      consulted before fail-closed.
-- [ ] Feature `call-hooks` (`alloc`) on `cirrus-ert`: `CallRegistry`
-      enum (hash/memcpy/memset/closure-slot), manifest comment per the
-      `prepared-recording` precedent.
-- [ ] Tests: observer counts calls/returns; `ReturnNow` replaces a callee
-      (result equivalence + circuit-size delta); `Divert` to an ecall
-      stub; recorder path records hook emissions.
-- [ ] Arm side: trait reservation only (no firing), documented.
+- [x] `cirrus-ert`: `CallEvent`/`CallAction` types; defaulted `call_hook`
+      on `RvHandler` (RV32+RV64), fired from `jump_and_link`/
+      `jump_and_link_register`/`return_from_call`; the unresolved-indirect
+      event is consulted before the historical fail-closed error. The
+      blanket `RvHandler` impl was replaced with explicit impls
+      (`RvDefaultHandler` delegates, `DefaultHandler` keeps the default) —
+      custom handlers now write a trivial `impl RvHandler for X {}`.
+- [x] Feature `call-hooks` (`alloc`) on `cirrus-ert`: `hooks::CallRegistry`
+      + `CallReplacement::{NoOp, ReturnConstants}` + `apply_replacement`,
+      manifest comment per the `prepared-recording` precedent. (Storage-
+      touching canned replacements like `memcpy`/`memset` were descoped:
+      the hook receives register views only; that would need a storage
+      handle in the hook signature — noted as a follow-up.)
+- [x] Tests (`tests_hooks.rs`): observer counts calls/returns with exact
+      PCs; `ReturnNow` replaces a callee (callee marker untouched, results
+      hold); `Divert` to a stub; `Divert` on return overrides the landing;
+      unresolved `JALR` fails closed by default and resolves when hooked;
+      registry replaces registered targets only; the recording path
+      records hook-emitted gates (64 XOR gates in the trace).
+- [x] Arm side: no hook firing; the shared `Handler` trait is unchanged,
+      and the arm facade's own handler machinery is untouched.
+- [x] Docs: crate docs + `frontend-choice.md`.
 
 ### Phase C — `cirrus-ert-loop` (`no_std`, `alloc`-free; feature `precompute`)
 

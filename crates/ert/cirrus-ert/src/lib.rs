@@ -45,6 +45,14 @@
 //! and `MUL`, `MULH`, `MULHSU`, and `MULHU`; `LB`, `LBU`, `LH`, `LHU`, `LW`,
 //! `SB`, `SH`, `SW`; `JAL`, concrete-target `JALR` calls, the conventional
 //! `jalr x0, 0(ra)` return, and the six integer branches; plus the hash and exit
+//! `ECALL`s. Call and return boundaries (`JAL`, `JALR`, and the conventional
+//! return form) can additionally be observed and replaced through
+//! [`RvHandler::call_hook`]: a handler may count calls, divert a call to a
+//! host-chosen concrete target, resolve an otherwise-rejected indirect call,
+//! or replace the callee entirely (`ReturnNow`) after writing result
+//! registers. The default hook does nothing and preserves historical
+//! behavior. The `call-hooks` feature adds an optional allocation-using
+//! [`hooks::CallRegistry`] of canned per-target replacements.
 //! `ECALL`s. RV64 (`ert64_emit`/`ert64_func`) additionally supports the `*W`
 //! word forms (`ADDIW`, `ADDW`, `SUBW`, the `*W` shifts), `LW` sign-extension,
 //! `LWU`, `LD`, and `SD`, with `LD`/`SD` and 64-bit shifts operating on the
@@ -55,6 +63,9 @@
 //! Symbolic multiplication uses fixed long-multiplication rounds. A concrete
 //! shift amount or multiplicand selects a smaller fixed-shift or constant-product
 //! path, so callers should retain concrete metadata whenever it is known.
+
+#[cfg(feature = "call-hooks")]
+extern crate alloc;
 
 use core::{array, error::Error};
 
@@ -83,8 +94,14 @@ mod tests;
 #[cfg(test)]
 mod tests64;
 
+#[cfg(test)]
+mod tests_hooks;
+
 #[cfg(all(test, feature = "early-exit-loops"))]
 mod early_exit_tests;
+
+#[cfg(feature = "call-hooks")]
+pub mod hooks;
 
 #[cfg(feature = "early-exit-loops")]
 pub use cirrus_ert_core::EarlyExitLoopOptions;
@@ -235,15 +252,98 @@ where
     }
 }
 
-/// An RV32-specific [`Handler`] extension point, currently without
-/// additional requirements beyond [`Handler`] itself. Reserved so a future
-/// RV32 capability can be added here later without changing the shared
-/// [`Handler`] trait.
-pub trait RvHandler<Val, const BITS: usize = 32>: Handler<Val, BITS> + ContextWithStorage<Val> {}
+/// A call/return boundary observed by [`RvHandler::call_hook`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallEvent {
+    /// A `JAL` call: `link` receives the return address and control continues
+    /// at `target`.
+    Jal {
+        /// Address of the call instruction.
+        caller_pc: u64,
+        /// The call target.
+        target: u64,
+        /// The link register (`x0` for a plain jump).
+        link: Reg,
+    },
+    /// A `JALR` call whose target resolved concretely.
+    Jalr {
+        /// Address of the call instruction.
+        caller_pc: u64,
+        /// The resolved call target.
+        target: u64,
+        /// The base register the target was resolved from.
+        base: Reg,
+        /// The instruction's immediate offset.
+        offset: i64,
+        /// The link register.
+        link: Reg,
+    },
+    /// The conventional `jalr x0, 0(ra)` return, which will continue at
+    /// `target` (the private return stack's top).
+    Return {
+        /// Address of the return instruction.
+        from_pc: u64,
+        /// The return target.
+        target: u64,
+    },
+    /// A `JALR` whose base register was not concretely known. The default
+    /// [`CallAction::Proceed`] response fails closed with
+    /// [`ErtError::Unexpected`], preserving historical behavior; a hook may
+    /// resolve the target with [`CallAction::Divert`] or replace the call
+    /// with [`CallAction::ReturnNow`].
+    UnresolvedJalr {
+        /// Address of the `JALR` instruction.
+        caller_pc: u64,
+        /// The unresolved base register.
+        base: Reg,
+        /// The instruction's immediate offset.
+        offset: i64,
+        /// The link register.
+        link: Reg,
+    },
+}
 
-/// Tunnels any [`Handler`] through as an [`RvHandler`], with no added
-/// behavior today — the RV32 half of the extension pattern Arm's
-/// `ArmDefaultHandler` establishes for real.
+/// The hook's decision at a call/return boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAction {
+    /// Execute the call or return normally.
+    Proceed,
+    /// Replace a call without executing the callee: the handler has already
+    /// written any result registers; execution continues at the instruction
+    /// following the call and the private return stack is not pushed.
+    /// Meaningless on a return, where it fails closed with
+    /// [`ErtError::Unexpected`].
+    ReturnNow,
+    /// Continue execution at a different concrete target.
+    Divert(u64),
+}
+
+/// An RV32/RV64-specific [`Handler`] extension point: call/return
+/// interception. The default implementation preserves historical behavior
+/// exactly — no interception, and unresolved indirect calls keep failing
+/// closed — so unaffected callers pay nothing.
+pub trait RvHandler<Val, const BITS: usize = 32>: Handler<Val, BITS> + ContextWithStorage<Val> {
+    /// Observe or replace a call/return boundary. The register-file views
+    /// match [`Handler::ecall`]'s: a `ReturnNow` response is expected to have
+    /// written any result registers already. Returning `Err` aborts execution
+    /// with a caller-emitted error.
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<CallAction, Self::Error> {
+        let _ = (event, regs, reg_consts, offsets, zero, one);
+        Ok(CallAction::Proceed)
+    }
+}
+
+/// Tunnels any [`RvHandler`] through, delegating the environment call and
+/// the call hook to the wrapped handler — the RV half of the extension
+/// pattern Arm's `ArmDefaultHandler` establishes for real.
 pub struct RvDefaultHandler<H> {
     /// The wrapped handler.
     pub inner: H,
@@ -325,9 +425,29 @@ impl<H: Handler<bool, BITS>, const BITS: usize> Handler<bool, BITS> for RvDefaul
     }
 }
 
-impl<T, Val, const BITS: usize> RvHandler<Val, BITS> for T where
-    T: Handler<Val, BITS> + ContextWithStorage<Val>
+impl<C, F, W: Clone, E: Error, const BITS: usize> RvHandler<bool, BITS> for DefaultHandler<C, F>
+where
+    C: ContextWithRvOps<bool, Wrapped = W, Error = E>,
+    F: FnMut(&mut C, &[[W; BITS]]) -> Result<[u8; 32], E>,
 {
+    // The default `call_hook` (no interception) fires; nothing to add.
+}
+
+impl<H, const BITS: usize> RvHandler<bool, BITS> for RvDefaultHandler<H>
+where
+    H: RvHandler<bool, BITS>,
+{
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<CallAction, Self::Error> {
+        self.inner.call_hook(event, regs, reg_consts, offsets, zero, one)
+    }
 }
 
 /// The handler shape used by [`ert_func_prepared`]/[`ert_emit_prepared`] and
@@ -412,6 +532,18 @@ where
         one: &W,
     ) -> Result<EcallOutcome, E> {
         self.handler.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[W; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &W,
+        one: &W,
+    ) -> Result<CallAction, E> {
+        self.handler.call_hook(event, regs, reg_consts, offsets, zero, one)
     }
 
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {

@@ -11,6 +11,9 @@ prepared-recording = ["dep:cirrus-recompile-core", "dep:cirrus-volar-boolar"]
 # Exercises the Volar recording adapter in the heavyweight bare-metal suite.
 # Keep it opt-in while Volar IR evolves independently of ERT semantics.
 volar-tests = ["dep:cirrus-volar-boolar"]
+# Keeps allocator-requiring call-interception registries out of bare-metal
+# ERT users unless they opt in (mirrors `prepared-recording`).
+call-hooks = []
 # Opt-in recognizer that deoptimizes secret-dependent early-exit loops
 # instead of hard-erroring on the branch. Off by default: it adds a small
 # fixed-capacity per-execution cache to `Machine` that unaffected callers

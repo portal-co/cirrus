@@ -1081,17 +1081,40 @@ fn jump_and_link<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWo
     offset: Imm,
     dest: Reg,
 ) -> Result<Flow, ErtError<E>> {
-    push_return(machine, dest)?;
-    // JAL writes its link register like any other destination: the
-    // interpreter's concrete return stack is an optimization of the
-    // conventional return form, not a substitute for the architectural
-    // `rd = pc + len` update (compressed calls read `ra` back).
-    if dest != Reg::ZERO {
-        machine.write_constant(dest, machine.pc + machine.inst_len);
+    let target = machine.pc.wrapping_add_signed(i64::from(offset.as_i32()));
+    let action = machine
+        .t
+        .call_hook(
+            crate::CallEvent::Jal {
+                caller_pc: machine.pc,
+                target,
+                link: dest,
+            },
+            &mut machine.regs[..],
+            &mut machine.reg_consts[..],
+            &mut machine.offs[..],
+            &machine.zero,
+            &machine.one,
+        )
+        .map_err(ErtError::Emitted)?;
+    match action {
+        crate::CallAction::ReturnNow => {
+            // The hook replaced the call: no return push, no link write; the
+            // caller continues at the following instruction.
+            next(machine)
+        }
+        crate::CallAction::Proceed | crate::CallAction::Divert(_) => {
+            push_return(machine, dest)?;
+            if dest != Reg::ZERO {
+                machine.write_constant(dest, machine.pc + machine.inst_len);
+            }
+            let target = match action {
+                crate::CallAction::Divert(new_target) => new_target,
+                _ => target,
+            };
+            Ok(Flow::Next(target))
+        }
     }
-    Ok(Flow::Next(
-        machine.pc.wrapping_add_signed(i64::from(offset.as_i32())),
-    ))
 }
 
 fn jump_and_link_register<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord>(
@@ -1101,15 +1124,104 @@ fn jump_and_link_register<W: Clone, E: core::error::Error, const BITS: usize, R:
     dest: Reg,
 ) -> Result<Flow, ErtError<E>> {
     if dest == Reg::ZERO && base == Reg::RA && offset == Imm::ZERO {
-        return return_from_call(machine);
+        // The conventional return. The hook observes the return before the
+        // private stack is popped; an empty stack still fails closed without
+        // consulting the hook, since there is no meaningful target to show.
+        if machine.rsp == 0 {
+            return return_from_call(machine);
+        }
+        let target = machine.rstack[(machine.rsp - 1) as usize].into_u64();
+        let action = machine
+            .t
+            .call_hook(
+                crate::CallEvent::Return {
+                    from_pc: machine.pc,
+                    target,
+                },
+                &mut machine.regs[..],
+                &mut machine.reg_consts[..],
+                &mut machine.offs[..],
+                &machine.zero,
+                &machine.one,
+            )
+            .map_err(ErtError::Emitted)?;
+        match action {
+            crate::CallAction::Proceed => return return_from_call(machine),
+            crate::CallAction::Divert(new_target) => {
+                machine.rsp -= 1;
+                return Ok(Flow::Next(new_target));
+            }
+            crate::CallAction::ReturnNow => return Err(ErtError::Unexpected),
+        }
     }
-    let base = machine.reg_consts[base.0 as usize].ok_or(ErtError::Unexpected)?;
-    let target = base.wrapping_add_signed(i64::from(offset.as_i32())) & !1;
-    push_return(machine, dest)?;
-    if dest != Reg::ZERO {
-        machine.write_constant(dest, machine.pc + machine.inst_len);
+    let offset64 = i64::from(offset.as_i32());
+    match machine.reg_consts[base.0 as usize] {
+        Some(base_value) => {
+            let target = base_value.wrapping_add_signed(offset64) & !1;
+            let action = machine
+                .t
+                .call_hook(
+                    crate::CallEvent::Jalr {
+                        caller_pc: machine.pc,
+                        target,
+                        base,
+                        offset: offset64,
+                        link: dest,
+                    },
+                    &mut machine.regs[..],
+                    &mut machine.reg_consts[..],
+                    &mut machine.offs[..],
+                    &machine.zero,
+                    &machine.one,
+                )
+                .map_err(ErtError::Emitted)?;
+            match action {
+                crate::CallAction::ReturnNow => next(machine),
+                crate::CallAction::Proceed | crate::CallAction::Divert(_) => {
+                    push_return(machine, dest)?;
+                    if dest != Reg::ZERO {
+                        machine.write_constant(dest, machine.pc + machine.inst_len);
+                    }
+                    let target = match action {
+                        crate::CallAction::Divert(new_target) => new_target,
+                        _ => target,
+                    };
+                    Ok(Flow::Next(target))
+                }
+            }
+        }
+        None => {
+            // The historical behavior fails closed here. The hook is
+            // consulted first so a host can resolve a known-indirect target.
+            let action = machine
+                .t
+                .call_hook(
+                    crate::CallEvent::UnresolvedJalr {
+                        caller_pc: machine.pc,
+                        base,
+                        offset: offset64,
+                        link: dest,
+                    },
+                    &mut machine.regs[..],
+                    &mut machine.reg_consts[..],
+                    &mut machine.offs[..],
+                    &machine.zero,
+                    &machine.one,
+                )
+                .map_err(ErtError::Emitted)?;
+            match action {
+                crate::CallAction::Proceed => Err(ErtError::Unexpected),
+                crate::CallAction::ReturnNow => next(machine),
+                crate::CallAction::Divert(new_target) => {
+                    push_return(machine, dest)?;
+                    if dest != Reg::ZERO {
+                        machine.write_constant(dest, machine.pc + machine.inst_len);
+                    }
+                    Ok(Flow::Next(new_target))
+                }
+            }
+        }
     }
-    Ok(Flow::Next(target))
 }
 
 fn push_return<W, E, const BITS: usize, R: RstackWord>(

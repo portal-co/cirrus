@@ -10,7 +10,7 @@ use cirrus_ert_core::{EarlyExitLoopOptions, EcallOutcome, Handler};
 use rv_asm::{Imm, Inst, Reg, Xlen};
 use std::vec::Vec;
 
-use crate::{ErtError, RawMemory, ert_emit};
+use crate::{ErtError, RawMemory, RvHandler, ert_emit};
 
 fn value(word: &[bool; 32]) -> u32 {
     word.iter()
@@ -130,6 +130,8 @@ impl Handler<bool> for TestHandler {
         }
     }
 }
+
+impl RvHandler<bool> for TestHandler {}
 
 /// `T2 = 1; for i in 0..len { if a[i] != b[i] { T2 = 0; break; } }`, built
 /// into the canonical rotated-loop shape a real `-O2` toolchain emits: a

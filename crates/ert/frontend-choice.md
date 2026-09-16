@@ -16,7 +16,9 @@ text. Constraints: concrete control flow and stack-form addresses; documented
 opcode subset only, in normal or compressed encodings (compressed forms decode
 to the same subset). RV64 adds the `*W` word forms, `LWU`/`LD`/`SD`, and a
 six-stage barrel shifter; the hash `ECALL` moves its 32-byte payload through
-four 64-bit registers. RV32 `slt`/`slti` forms may
+four 64-bit registers. Call and return boundaries are observable
+and replaceable per handler (`RvHandler::call_hook`; canned replacements
+behind the `call-hooks` feature). RV32 `slt`/`slti` forms may
 materialize symbolic Boolean data. Thumb additionally supports symbolic
 NZCVQ APSR transfers, carry-consuming `ADC`/`SBC`, and a one-instruction IT
 value materializer; symbolic branches, general predication, calls, returns,
