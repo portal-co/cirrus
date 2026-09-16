@@ -85,8 +85,12 @@ use rv_asm::{DecodeError, Reg};
 
 #[cfg(feature = "early-exit-loops")]
 mod early_exit;
-mod handlers;
-mod machine;
+/// Instruction execution shared with the looped-circuit emulator.
+#[doc(hidden)]
+pub mod handlers;
+/// The machine state the looped-circuit emulator drives and snapshots.
+#[doc(hidden)]
+pub mod machine;
 
 #[cfg(test)]
 mod tests;
@@ -120,6 +124,7 @@ impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val>>
 }
 
 /// An error while decoding or symbolically executing a program.
+#[derive(Debug)]
 pub enum ErtError<E> {
     /// The caller-supplied Boolean context or hash callback returned this error.
     Emitted(E),

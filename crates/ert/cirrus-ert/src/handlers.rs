@@ -8,7 +8,8 @@ use rv_asm::{Imm, Inst, Reg};
 use crate::machine::{LoadAddress, Machine, RstackWord, add_bits, sext, word_mask};
 use crate::{EcallOutcome, ErtError};
 
-pub(crate) enum Flow {
+#[doc(hidden)]
+pub enum Flow {
     Next(u64),
     Exit,
 }
@@ -98,7 +99,8 @@ fn w_extend<W: Clone, const BITS: usize>(low: &[W; 32]) -> [W; BITS] {
     })
 }
 
-pub(crate) fn execute<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord>(
+#[doc(hidden)]
+pub fn execute<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord>(
     machine: &mut Machine<'_, W, E, BITS, R>,
     instruction: Inst,
 ) -> Result<Flow, ErtError<E>> {

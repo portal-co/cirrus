@@ -1,0 +1,24 @@
+[package]
+name = "cirrus-ert-loop"
+edition = "2024"
+version.workspace = true
+description = "Looped-circuit emulator for the cirrus ERT: shared RV32/RV64 instruction semantics with secret-dependent control flow"
+
+[features]
+# Keeps allocator-requiring program precomputation out of bare-metal users
+# unless they opt in (mirrors cirrus-ert's prepared-recording).
+precompute = []
+# Tunnel cirrus-ert's early-exit-loop recognizer through the looped runtime.
+early-exit-loops = ["cirrus-ert/early-exit-loops"]
+
+[dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
+cirrus-ert = { version = "0.1.0", path = "../cirrus-ert" }
+rv-asm.workspace = true
+
+[dev-dependencies]
+cirrus-ert-sha256-fixture = { path = "../cirrus-ert-sha256-fixture" }
+cirrus-recompile-core = { path = "../../recompile/cirrus-recompile-core" }
+cirrus-recompile-rt = { path = "../../recompile/cirrus-recompile-rt" }
+cirrus-volar-boolar = { path = "../../volar/cirrus-volar-boolar" }

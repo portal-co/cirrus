@@ -14,7 +14,10 @@ compatibility gate, on-device firmware the same subset.
 Cost is explicit: stack bits + 32×32 register wires (32×64 on RV64) + mapped
 text. Constraints: concrete control flow and stack-form addresses; documented
 opcode subset only, in normal or compressed encodings (compressed forms decode
-to the same subset). RV64 adds the `*W` word forms, `LWU`/`LD`/`SD`, and a
+to the same subset). For symbolic conditional branches, `cirrus-ert-loop`
+shares the same data paths but carries a virtual IP and folds a caller-sized
+live-target table at each step; callers must enforce a step budget. RV64 adds
+the `*W` word forms, `LWU`/`LD`/`SD`, and a
 six-stage barrel shifter; the hash `ECALL` moves its 32-byte payload through
 four 64-bit registers. Call and return boundaries are observable
 and replaceable per handler (`RvHandler::call_hook`; canned replacements

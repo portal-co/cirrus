@@ -11,6 +11,10 @@ raw-memory mapping, and host-call convention through the internal
 
 - [`cirrus-ert`](crates/ert/cirrus-ert/src/lib.rs) is the compatible RV32/RV64 RISC-V
   facade (both word widths, normal and compressed encodings).
+- [`cirrus-ert-loop`](crates/ert/cirrus-ert-loop/src/lib.rs) is the alloc-free
+  looped RISC-V executor: it carries a virtual IP across symbolic conditional
+  branches and folds a caller-sized set of live targets rather than rejecting
+  symbolic control flow.
 - [`cirrus-armv8m-ert`](crates/ert/cirrus-armv8m-ert/src/lib.rs) is the non-secure,
   Thumb-only Armv8-M Mainline/Cortex-M33 facade. Its ABI wrapper follows
   AAPCS32; it accepts an odd Thumb entry address and sixteen core registers.
@@ -81,8 +85,12 @@ emulator. Programs must use the documented supported instruction subset
 (compressed encodings of it included), concrete branch decisions, conventional
 calls and returns, and caller-provided stacks with sufficient capacity. The
 [crate documentation](crates/ert/cirrus-ert/src/lib.rs) describes the supported
-instructions, buffers, ECALLs, and public entry points. WASM and LLVM ingest (LLVM-direct and LLVM→VAFFLE) are sibling paths; this
-repo does not rank them: [frontend-choice.md](crates/ert/frontend-choice.md).
+instructions, buffers, ECALLs, and public entry points. For secret-dependent
+conditional branches, use [`cirrus-ert-loop`](crates/ert/cirrus-ert-loop/src/lib.rs):
+it uses the same instruction data paths, caller-owned virtual stack and return
+stack, but requires a caller-sized live-target table and a host step budget.
+WASM and LLVM ingest (LLVM-direct and LLVM→VAFFLE) are sibling paths; this repo
+does not rank them: [frontend-choice.md](crates/ert/frontend-choice.md).
 
 Instruction images are supplied through `RawMemory`. `RawMemory::from(&slice)`
 safely creates a bounded mapping for a host buffer; its lifetime keeps the

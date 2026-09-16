@@ -7,7 +7,8 @@ use crate::{EcallOutcome, ErtError, RawMemory, handlers};
 
 /// Object-safe bridge which keeps the machine monomorphic while its caller
 /// supplies arbitrary `ContextWithStorage` implementations.
-pub(crate) trait Runtime<W, const BITS: usize>:
+#[doc(hidden)]
+pub trait Runtime<W, const BITS: usize>:
     cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W>
 {
     fn ecall(
@@ -37,7 +38,8 @@ pub(crate) trait Runtime<W, const BITS: usize>:
     fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions;
 }
 
-pub(crate) const ABI_REGS: [Reg; 8] = [
+#[doc(hidden)]
+pub const ABI_REGS: [Reg; 8] = [
     Reg::A0,
     Reg::A1,
     Reg::A2,
@@ -61,7 +63,8 @@ pub(crate) fn sext<const BITS: usize>(value: u64) -> i64 {
 /// The concrete return-stack word type. RV32 callers keep their historical
 /// `&mut [u32]` stacks; RV64 uses `u64`. This keeps the machine free of
 /// width-conversion buffers (no allocation anywhere in the interpreter).
-pub(crate) trait RstackWord: Copy {
+#[doc(hidden)]
+pub trait RstackWord: Copy {
     fn from_u64(value: u64) -> Self;
     fn into_u64(self) -> u64;
 }
@@ -86,24 +89,39 @@ impl RstackWord for u64 {
     }
 }
 
-pub(crate) struct Machine<'a, W, E, const BITS: usize, R: RstackWord> {
-    pub(crate) t: &'a mut (dyn Runtime<W, BITS, Error = E> + 'a),
-    pub(crate) mem: RawMemory<'a>,
-    pub(crate) rstack: &'a mut [R],
-    pub(crate) storage_bits: usize,
-    pub(crate) pc: u64,
+#[doc(hidden)]
+pub struct Machine<'a, W, E, const BITS: usize, R: RstackWord> {
+    #[doc(hidden)]
+    pub t: &'a mut (dyn Runtime<W, BITS, Error = E> + 'a),
+    #[doc(hidden)]
+    pub mem: RawMemory<'a>,
+    #[doc(hidden)]
+    pub rstack: &'a mut [R],
+    #[doc(hidden)]
+    pub storage_bits: usize,
+    #[doc(hidden)]
+    pub pc: u64,
     /// Byte length of the instruction most recently decoded at `pc`
     /// (4 for normal encodings, 2 for compressed). Set by [`Machine::run`]
     /// before every handler invocation.
-    pub(crate) inst_len: u64,
-    pub(crate) regs: &'a mut [[W; BITS]; 32],
-    pub(crate) reg_consts: &'a mut [Option<u64>; 32],
-    pub(crate) zero: W,
-    pub(crate) one: W,
-    pub(crate) sp: u64,
-    pub(crate) stack_top: u64,
-    pub(crate) rsp: u64,
-    pub(crate) offs: [Option<i64>; 32],
+    #[doc(hidden)]
+    pub inst_len: u64,
+    #[doc(hidden)]
+    pub regs: &'a mut [[W; BITS]; 32],
+    #[doc(hidden)]
+    pub reg_consts: &'a mut [Option<u64>; 32],
+    #[doc(hidden)]
+    pub zero: W,
+    #[doc(hidden)]
+    pub one: W,
+    #[doc(hidden)]
+    pub sp: u64,
+    #[doc(hidden)]
+    pub stack_top: u64,
+    #[doc(hidden)]
+    pub rsp: u64,
+    #[doc(hidden)]
+    pub offs: [Option<i64>; 32],
     #[cfg(feature = "early-exit-loops")]
     pub(crate) loop_sites: [Option<crate::early_exit::RecognizedSite>; 8],
 }
@@ -115,7 +133,8 @@ pub(crate) enum LoadAddress {
 
 impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E, BITS, R> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         t: &'a mut (dyn Runtime<W, BITS, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [R],
@@ -164,7 +183,8 @@ impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E,
         }
     }
 
-    fn decode(&self) -> Result<(Inst, u64), ErtError<E>> {
+    #[doc(hidden)]
+    pub fn decode(&self) -> Result<(Inst, u64), ErtError<E>> {
         let xlen = if BITS == 64 { Xlen::Rv64 } else { Xlen::Rv32 };
         let half = u16::from_le_bytes(self.mem.read64(self.pc).ok_or(ErtError::Unexpected)?);
         if Inst::first_byte_is_compressed(half as u8) {
@@ -178,7 +198,8 @@ impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E,
             .map_err(ErtError::Decode)
     }
 
-    fn reset_fixed_registers(&mut self) {
+    #[doc(hidden)]
+    pub fn reset_fixed_registers(&mut self) {
         for register_bit in self.regs[Reg::ZERO.0 as usize].iter_mut() {
             *register_bit = self.zero.clone();
         }
@@ -196,7 +217,8 @@ impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E,
         }
     }
 
-    pub(crate) fn word_from_constant(&self, value: u64) -> [W; BITS] {
+    #[doc(hidden)]
+    pub fn word_from_constant(&self, value: u64) -> [W; BITS] {
         let value = value & word_mask::<BITS>();
         array::from_fn(|i| {
             if (value >> i) & 1 == 0 {
@@ -207,7 +229,8 @@ impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E,
         })
     }
 
-    pub(crate) fn write_constant(&mut self, dest: Reg, value: u64) {
+    #[doc(hidden)]
+    pub fn write_constant(&mut self, dest: Reg, value: u64) {
         self.offs[dest.0 as usize] = None;
         self.reg_consts[dest.0 as usize] = Some(value & word_mask::<BITS>());
         self.regs[dest.0 as usize] = self.word_from_constant(value);
@@ -269,7 +292,8 @@ impl<'a, W: Clone, E: Error, const BITS: usize, R: RstackWord> Machine<'a, W, E,
     }
 }
 
-pub(crate) fn write_abi_args<W, E: Error, const N: usize, const BITS: usize>(
+#[doc(hidden)]
+pub fn write_abi_args<W, E: Error, const N: usize, const BITS: usize>(
     t: &mut (dyn Runtime<W, BITS, Error = E> + '_),
     regs: &mut [[W; BITS]; 32],
     reg_consts: &mut [Option<u64>; 32],
@@ -295,7 +319,8 @@ pub(crate) fn write_abi_args<W, E: Error, const N: usize, const BITS: usize>(
     Ok(())
 }
 
-pub(crate) fn read_abi_results<W: Clone, E: Error, const M: usize, const BITS: usize>(
+#[doc(hidden)]
+pub fn read_abi_results<W: Clone, E: Error, const M: usize, const BITS: usize>(
     t: &mut (dyn Runtime<W, BITS, Error = E> + '_),
     regs: &[[W; BITS]; 32],
     reg_consts: &[Option<u64>; 32],

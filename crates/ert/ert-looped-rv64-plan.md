@@ -1,6 +1,6 @@
 # ERT: looped-circuit emulator, RV64 extension, call interception
 
-**Status: plan for review.** Research basis: `cirrus` (ERT crates),
+**Status: Phases A/B complete; Phase C live executor and precompute cache implemented.** Remaining Phase C work is prepared-artifact APIs and a bare-metal QEMU integration gate. Research basis: `cirrus` (ERT crates),
 `../volar-ir` (movfuscate / `lower_to_circuit_ir` / fuse), `../volar` (spec
 conventions), `../rv-utils` (`rv-asm` RV64 decoder support, local checkout
 ahead of the pinned rev), `../site` (step-circuit host glue), and
@@ -626,60 +626,51 @@ lives in the new crate over the *shared* core traits, not in
 
 ### Phase C — `cirrus-ert-loop` (`no_std`, `alloc`-free; feature `precompute`)
 
-- [] New crate skeleton: `#![no_std]`, **no `alloc` in the default
-      build**; depends on `cirrus-ert`, `cirrus-ert-core`, `cirrus-core`,
-      `rv-asm`; optional `prepared-recording`; feature
-      `precompute` gating `extern crate alloc` (manifest comment per the
-      `prepared-recording` precedent: keep allocator-requiring
-      precomputation out of bare-metal users unless they opt in).
-- [] Live explorer: `LoopedMachine` driving the ordinary handlers inline
-      from `RawMemory` until a symbolic control-flow point; virtual IP +
-      done flag + caller-sized `&mut [Option<RegionEntry>]`
-      fixed-capacity region table (pattern: `early-exit-loops`'
-      `loop_sites` cache); discovery-miss and table-exhaustion
-      fail-closed paths with actionable diagnostics.
-- [] Region bodies: reuse/promote per-instruction data-path handlers
-      (`#[doc(hidden)]` shared module or a small `pub` handler kit in
-      `cirrus-ert`); identical offs/consts bookkeeping.
-- [] Terminators: baked constants; `select_word` conditionals/backward
-      (the only dispatch cost); constant-mux bounded indirect (declared
-      target sets, validated at encounter); call/return via the concrete
-      rstack; Phase-B hook integration.
-- [] Dispatch: live `is_block` decode (port of
-      `volar-ir-passes/dispatch_accumulator.rs` formulas, cited), region
-      fold in table order, `[done] ++ regs' ++ ip' ++ return` output
-      layout matching `lower_to_circuit_ir`'s `[done] ++ state ++ return`
-      convention.
-- [] Executor host loop + `done`/budget semantics + first-done return
-      latch (mirror `run_step_loop`); usable with any
-      `ContextWithRvOps` context unchanged.
-- [] Feature `precompute` (`alloc`): `LoopedProgram::compile()` running
-      the same walker to fixpoint (bounded forward disassembly extended
-      from the `early_exit.rs` scanner), owned region table, execution
-      seeded from it through the identical step path.
+- [x] New `cirrus-ert-loop` crate: `#![no_std]`, **no `alloc` in the
+      default build**; depends on `cirrus-ert`, `cirrus-ert-core`,
+      `cirrus-core`, and `rv-asm`. The `precompute` feature alone enables
+      `alloc`, with the manifest comment documenting the bare-metal cost
+      boundary.
+- [x] Live explorer: `LoopedMachine` drives the ordinary handlers from
+      `RawMemory` until a symbolic control-flow point, then carries virtual
+      IP + done wires and a caller-sized fixed-capacity live-candidate table.
+      Candidate overflow, undeclared indirect targets, divergent concrete
+      stack state, and unsupported behaviour fail closed.
+- [x] Region bodies reuse the promoted `#[doc(hidden)]` ERT `Machine` and
+      handler seam, retaining identical register-constant and stack-offset
+      bookkeeping.
+- [x] Terminators emit `select_word` for symbolic conditionals/backedges and
+      a declared-target constant mux for symbolic `JALR`; ordinary
+      calls/returns retain the concrete rstack and the Phase-B hook tunnel.
+- [x] Dispatch folds each live candidate through its virtual-IP equality
+      predicate. Register and storage updates are predicated, and done is
+      accumulated as a wire; the exposed state is compatible with the
+      `[done] ++ state` step-loop contract.
+- [x] `step`, `run`, `done_wire`, result ABI helpers, and deterministic
+      budget truncation provide the host executor interface for any ERT
+      Boolean context.
+- [x] Feature `precompute` (`alloc`): `LoopedProgram::compile()` records a
+      bounded forward-disassembly boundary map; attaching it to a machine
+      consistency-checks the live walker, so it remains a cache rather than
+      an alternative semantics.
 - [] `*_prepared`: record via `PreparedRecorder` (both modes); with
       `precompute`, evaluate wiring stable region sequences →
       `PreparedLoop` (document the decision; additive only).
-- [] Equivalence gates:
-      1. host: looped execution ≡ single-pass `ert_func` on every
-         concrete-CF program in the existing test suites (RV32 and RV64;
-         reuse `cirrus-ert/src/tests.rs` fixtures) — same gates, same
-         order;
-      2. live ≡ precompute on the same fixtures (precompute is a cache,
-         never a semantic change);
-      3. a secret-trip-count loop (e.g. memcmp-with-early-exit compiled
-         *without* the deloopify idiom) runs to done under the looped
-         emulator where single-pass hard-errors;
-      4. unbounded loop with host budget: deterministic truncation error;
-      5. `PreparedRecorder` run ≡ plaintext run, wire-for-wire outputs.
-- [] Bare-metal: looped executor driving the RV64 SHA-256 selftest
-      image under QEMU **with default features (no `alloc`)** — the gate
-      that proves the alloc-free claim; device integration is a later
-      milestone (note Thumb out of scope).
-- [] Docs: crate docs, `frontend-choice.md` ERT section rewrite, README
-      "looped circuit" subsection, measurement table (looped step size
-      vs. single-pass size for the SHA-256 workload; region-table sizing
-      guidance).
+- [~] Equivalence gates: concrete call/loop control-flow equivalence,
+      RV32 entry coverage, secret-trip-count completion where the
+      single-pass path fails closed, bounded indirect dispatch, predicated
+      divergent stack writes, deterministic budget truncation, and recorder
+      replay are covered in `cirrus-ert-loop/src/tests.rs`; the RV64 SHA-256
+      ELF gate runs the real guest image on the host. Live ≡ precompute is
+      covered for the loop fixture. Expanding this to every existing ERT
+      fixture and adding `PreparedRecorder`-specific entry points remains.
+- [ ] Bare-metal: a default-feature cross build of `cirrus-ert-loop` proves
+      the crate itself remains no-alloc; wiring its executor into the RV64
+      selftest image and QEMU gate remains a later integration milestone.
+- [~] Docs: crate docs, `frontend-choice.md`, and the root README describe
+      the live looped executor and its caller-owned candidate/budget
+      requirements. A measurement table and region-table sizing benchmark
+      remain to be added.
 
 ## 4. Risks / open questions
 
