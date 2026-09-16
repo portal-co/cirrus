@@ -11,24 +11,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cirrus_ert::{DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert_func};
+use cirrus_ert::{DefaultHandler, ErtError, RawMemory, RvDefaultHandler, ert64_func};
 use cirrus_ert_sha256_fixture::sha256_compress;
 use cirrus_volar_boolar::MuxTreeContext;
 
-const TARGET: &str = "riscv32im-unknown-none-elf";
-const BASE: u32 = 0x8000_0000;
+const TARGET: &str = "riscv64gc-unknown-none-elf";
+const BASE: u64 = 0x8000_0000;
 const RUNNER_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const BOOLAR_HEAP_BYTES: usize = 120 * 1024 * 1024;
-const INPUT: [u32; 16] = [0x6162_6380, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24];
+const INPUT: [u64; 16] = [0x6162_6380, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24];
 
-// Both tests build the same RV32 image and use process-wide resource counters.
+// Both tests build the same RV64 image and use process-wide resource counters.
 // Serializing them keeps the CPU deltas attributable to the operation being
 // reported rather than to a concurrently-running sibling test.
 static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 static SELF_TEST_IMAGE: OnceLock<PathBuf> = OnceLock::new();
 
 #[test]
-fn rv32im_sha256_self_test_runs_under_qemu() {
+fn rv64im_sha256_self_test_runs_under_qemu() {
     let _measurement = MEASUREMENT_LOCK
         .lock()
         .expect("measurement lock is not poisoned");
@@ -36,11 +36,11 @@ fn rv32im_sha256_self_test_runs_under_qemu() {
     let image_bytes = allocated_image_bytes(&fs::read(image).expect("built ELF is readable"));
     assert!(
         image_bytes <= RUNNER_MEMORY_BYTES,
-        "RV32 image uses {image_bytes} bytes, beyond the {RUNNER_MEMORY_BYTES}-byte QEMU RAM"
+        "RV64 image uses {image_bytes} bytes, beyond the {RUNNER_MEMORY_BYTES}-byte QEMU RAM"
     );
 
     let run = run_qemu(image);
-    assert_success("running the RV32IM self-test under QEMU", &run.output);
+    assert_success("running the RV64IM self-test under QEMU", &run.output);
     let (heap_capacity, heap_used) = guest_heap_metrics(&run.output);
     assert_eq!(
         heap_capacity, BOOLAR_HEAP_BYTES,
@@ -51,7 +51,7 @@ fn rv32im_sha256_self_test_runs_under_qemu() {
         "guest bump allocation high-water mark {heap_used} must fit its {heap_capacity}-byte heap"
     );
     eprintln!(
-        "RV32 QEMU self-test: runner_ram={} bytes, image={} bytes, remaining={} bytes, guest_heap_capacity={} bytes, guest_heap_used={} bytes, wall={:?}, cpu_user={:?}, cpu_system={:?}, child_peak_rss={} bytes",
+        "RV64 QEMU self-test: runner_ram={} bytes, image={} bytes, remaining={} bytes, guest_heap_capacity={} bytes, guest_heap_used={} bytes, wall={:?}, cpu_user={:?}, cpu_system={:?}, child_peak_rss={} bytes",
         RUNNER_MEMORY_BYTES,
         image_bytes,
         RUNNER_MEMORY_BYTES - image_bytes,
@@ -65,7 +65,7 @@ fn rv32im_sha256_self_test_runs_under_qemu() {
 }
 
 #[test]
-fn rv32im_sha256_workload_runs_on_host_with_measurements() {
+fn rv64im_sha256_workload_runs_on_host_with_measurements() {
     let _measurement = MEASUREMENT_LOCK
         .lock()
         .expect("measurement lock is not poisoned");
@@ -82,13 +82,13 @@ fn self_test_image() -> &'static Path {
                 .and_then(|path| path.parent())
                 .expect("cirrus-ert lives below the workspace crates directory")
                 .to_owned();
-            let target_dir = root.join("target/cirrus-ert-selftest");
+            let target_dir = root.join("target/cirrus-ert64-selftest");
             let build = Command::new("cargo")
                 .current_dir(&root)
                 .args([
                     "build",
                     "-p",
-                    "cirrus-ert-selftest",
+                    "cirrus-ert64-selftest",
                     "--features",
                     "bare-metal",
                     "--target",
@@ -100,11 +100,11 @@ fn self_test_image() -> &'static Path {
                 .env("RUSTFLAGS", "-C panic=abort")
                 .output()
                 .expect("cargo must be available to build the bare-metal self-test");
-            assert_success("building the RV32IM self-test", &build);
+            assert_success("building the RV64IM self-test", &build);
             target_dir
                 .join(TARGET)
                 .join("release")
-                .join("cirrus-ert-selftest")
+                .join("cirrus-ert64-selftest")
         })
         .as_path()
 }
@@ -113,7 +113,7 @@ fn ensure_target_is_installed() {
     let installed = Command::new("rustup")
         .args(["target", "list", "--installed"])
         .output()
-        .expect("rustup is required to install the RV32IM target");
+        .expect("rustup is required to install the RV64IM target");
     assert_success("listing installed Rust targets", &installed);
     if installed
         .stdout
@@ -126,8 +126,8 @@ fn ensure_target_is_installed() {
     let install = Command::new("rustup")
         .args(["target", "add", TARGET])
         .output()
-        .expect("rustup is required to install the RV32IM target");
-    assert_success("installing the RV32IM Rust target", &install);
+        .expect("rustup is required to install the RV64IM target");
+    assert_success("installing the RV64IM Rust target", &install);
 }
 
 struct MeasuredQemuRun {
@@ -140,16 +140,16 @@ struct MeasuredQemuRun {
 
 fn run_qemu(image: &Path) -> MeasuredQemuRun {
     let started = Instant::now();
-    let mut child = Command::new("qemu-system-riscv32")
+    let mut child = Command::new("qemu-system-riscv64")
         .args([
-            "-machine", "virt", "-cpu", "rv32", "-m", "128M", "-bios", "none", "-kernel",
+            "-machine", "virt", "-cpu", "rv64", "-m", "128M", "-bios", "none", "-kernel",
         ])
         .arg(image)
         .args(["-nographic", "-no-reboot"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("qemu-system-riscv32 is required to run the bare-metal self-test");
+        .expect("qemu-system-riscv64 is required to run the bare-metal self-test");
     let pid = child.id().try_into().expect("QEMU PID fits a pid_t");
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut killed = false;
@@ -206,7 +206,7 @@ fn run_qemu(image: &Path) -> MeasuredQemuRun {
     };
     if killed {
         panic!(
-            "RV32IM self-test timed out after 120 seconds\nstdout:\n{}\nstderr:\n{}",
+            "RV64IM self-test timed out after 120 seconds\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -224,19 +224,19 @@ fn run_qemu(image: &Path) -> MeasuredQemuRun {
 }
 
 fn run_host_image(image: &Path) {
-    let elf = fs::read(image).expect("built RV32 ELF must be readable");
+    let elf = fs::read(image).expect("built RV64 ELF must be readable");
     let mapping = mapped_image(&elf, &[".text.ert_workload", ".rodata.ert_workload", ".rodata"]);
     let entry = symbol_address(&elf, "__ert_workload_entry");
     let memory = unsafe { RawMemory::new(mapping.as_ptr().wrapping_sub(BASE as usize), None) };
-    let mut registers = [[false; 32]; 32];
+    let mut registers = [[false; 64]; 32];
     let mut constants = [None; 32];
-    let mut rstack = [0; 256];
+    let mut rstack = [0u64; 256];
     let mut vstack = [false; 65_536];
     let storage_bits = vstack.len();
     let args = INPUT.map(|value| (word(value), None));
     let before = resource_usage(libc::RUSAGE_SELF);
     let started = Instant::now();
-    let result = ert_func::<_, _, 16, 2, _>(
+    let result = ert64_func::<_, _, 16, 2, _>(
         &mut RvDefaultHandler {
             inner: DefaultHandler {
                 context: MuxTreeContext::new(()),
@@ -258,18 +258,23 @@ fn run_host_image(image: &Path) {
     let after = resource_usage(libc::RUSAGE_SELF);
     let result = match result {
         Ok(result) => result,
-        Err(ErtError::Decode(error)) => panic!("host RV32 image decode failed: {error:?}"),
-        Err(ErtError::Unexpected) => panic!("host RV32 image violated the interpreter subset"),
+        Err(ErtError::Decode(error)) => panic!("host RV64 image decode failed: {error:?}"),
+        Err(ErtError::Unexpected) => panic!("host RV64 image violated the interpreter subset"),
         Err(ErtError::Emitted(error)) => match error {},
     };
     let expected = sha256_compress(
-        INPUT[0], INPUT[1], INPUT[2], INPUT[3], INPUT[4], INPUT[5], INPUT[6], INPUT[7], INPUT[8],
-        INPUT[9], INPUT[10], INPUT[11], INPUT[12], INPUT[13], INPUT[14], INPUT[15],
+        INPUT[0] as u32, INPUT[1] as u32, INPUT[2] as u32, INPUT[3] as u32, INPUT[4] as u32,
+        INPUT[5] as u32, INPUT[6] as u32, INPUT[7] as u32, INPUT[8] as u32, INPUT[9] as u32,
+        INPUT[10] as u32, INPUT[11] as u32, INPUT[12] as u32, INPUT[13] as u32, INPUT[14] as u32,
+        INPUT[15] as u32,
     );
-    assert_eq!(result[0].1, Some(u32::MAX));
-    assert_eq!(result[1], (word(expected), None));
+    assert_eq!(result[0].1, Some(u64::MAX));
+    // RV64's ABI leaves the high bits of a 32-bit return value undefined; the
+    // compiled body sign-extends through `addw`. Compare the low word only.
+    assert_eq!(result[1].0[..32], word(u64::from(expected))[..32]);
+    assert_eq!(result[1].1, None);
     eprintln!(
-        "RV32 host workload: wall={wall:?}, cpu_user={:?}, cpu_system={:?}, process_peak_rss={} bytes, value_stack_bytes={}, return_stack_bytes={}",
+        "RV64 host workload: wall={wall:?}, cpu_user={:?}, cpu_system={:?}, process_peak_rss={} bytes, value_stack_bytes={}, return_stack_bytes={}",
         after.user.saturating_sub(before.user),
         after.system.saturating_sub(before.system),
         after.peak_rss_bytes,
@@ -278,11 +283,11 @@ fn run_host_image(image: &Path) {
     );
 }
 
-fn word(value: u32) -> [bool; 32] {
+fn word(value: u64) -> [bool; 64] {
     array::from_fn(|bit| value & (1 << bit) != 0)
 }
 
-fn no_hash(_: &mut MuxTreeContext<()>, _: &[[bool; 32]]) -> Result<[u8; 32], Infallible> {
+fn no_hash(_: &mut MuxTreeContext<()>, _: &[[bool; 64]]) -> Result<[u8; 32], Infallible> {
     Ok([0; 32])
 }
 
@@ -320,13 +325,13 @@ fn elf_u32(image: &[u8], offset: usize) -> usize {
 
 fn elf_header(image: &[u8]) -> (usize, usize, usize, usize) {
     assert_eq!(&image[..4], b"\x7fELF", "image is an ELF file");
-    assert_eq!(image[4], 1, "self-test ELF is 32-bit");
+    assert_eq!(image[4], 2, "self-test ELF is 64-bit");
     assert_eq!(image[5], 1, "self-test ELF is little-endian");
     (
-        elf_u32(image, 32),
-        elf_u16(image, 46),
-        elf_u16(image, 48),
-        elf_u16(image, 50),
+        elf_u64(image, 40) as usize,
+        elf_u16(image, 58),
+        elf_u16(image, 60),
+        elf_u16(image, 62),
     )
 }
 
@@ -336,11 +341,19 @@ fn section_header(image: &[u8], index: usize) -> usize {
     offset + index * size
 }
 
+fn elf_u64(image: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        image[offset..offset + 8]
+            .try_into()
+            .expect("ELF header is complete"),
+    )
+}
+
 fn section_name<'a>(image: &'a [u8], header: usize) -> &'a str {
     let (_, _, _, strings) = elf_header(image);
     let strings = section_header(image, strings);
-    let strings_offset = elf_u32(image, strings + 16);
-    let strings_size = elf_u32(image, strings + 20);
+    let strings_offset = elf_u64(image, strings + 24) as usize;
+    let strings_size = elf_u64(image, strings + 32) as usize;
     let start = strings_offset + elf_u32(image, header);
     let bytes = &image[start..strings_offset + strings_size];
     let length = bytes
@@ -356,9 +369,9 @@ fn selected_section(image: &[u8], wanted: &str) -> Option<(usize, usize, usize)>
         let header = section_header(image, index);
         if section_name(image, header) == wanted {
             return Some((
-                elf_u32(image, header + 12),
-                elf_u32(image, header + 16),
-                elf_u32(image, header + 20),
+                elf_u64(image, header + 16) as usize,
+                elf_u64(image, header + 24) as usize,
+                elf_u64(image, header + 32) as usize,
             ));
         }
     }
@@ -391,15 +404,15 @@ fn allocated_image_bytes(image: &[u8]) -> usize {
     let base = BASE as usize;
     (0..count)
         .map(|index| section_header(image, index))
-        .filter(|header| elf_u32(image, *header + 8) & SHF_ALLOC != 0)
-        .map(|header| elf_u32(image, header + 12) + elf_u32(image, header + 20))
+        .filter(|header| elf_u64(image, *header + 8) & SHF_ALLOC as u64 != 0)
+        .map(|header| elf_u64(image, header + 16) as usize + elf_u64(image, header + 32) as usize)
         .max()
         .expect("ELF has an allocated section")
         .checked_sub(base)
-        .expect("allocated RV32 image begins at the configured RAM base")
+        .expect("allocated RV64 image begins at the configured RAM base")
 }
 
-fn symbol_address(image: &[u8], wanted: &str) -> u32 {
+fn symbol_address(image: &[u8], wanted: &str) -> u64 {
     const SYMBOL_TABLE: usize = 2;
     let (_, _, count, _) = elf_header(image);
     for index in 0..count {
@@ -407,13 +420,13 @@ fn symbol_address(image: &[u8], wanted: &str) -> u32 {
         if elf_u32(image, header + 4) != SYMBOL_TABLE {
             continue;
         }
-        let strings = section_header(image, elf_u32(image, header + 24));
-        let strings_offset = elf_u32(image, strings + 16);
-        let strings_size = elf_u32(image, strings + 20);
-        let symbols_offset = elf_u32(image, header + 16);
-        let symbols_size = elf_u32(image, header + 20);
-        let entry_size = elf_u32(image, header + 36);
-        assert_eq!(entry_size, 16, "self-test uses ELF32 symbol entries");
+        let strings = section_header(image, elf_u32(image, header + 40));
+        let strings_offset = elf_u64(image, strings + 24) as usize;
+        let strings_size = elf_u64(image, strings + 32) as usize;
+        let symbols_offset = elf_u64(image, header + 24) as usize;
+        let symbols_size = elf_u64(image, header + 32) as usize;
+        let entry_size = elf_u64(image, header + 56) as usize;
+        assert_eq!(entry_size, 24, "self-test uses ELF64 symbol entries");
         for entry in (symbols_offset..symbols_offset + symbols_size).step_by(entry_size) {
             let name_offset = strings_offset + elf_u32(image, entry);
             let name_bytes = &image[name_offset..strings_offset + strings_size];
@@ -423,7 +436,7 @@ fn symbol_address(image: &[u8], wanted: &str) -> u32 {
                 .expect("symbol name is terminated");
             if core::str::from_utf8(&name_bytes[..length]).expect("symbol name is UTF-8") == wanted
             {
-                return elf_u32(image, entry + 4) as u32;
+                return elf_u64(image, entry + 8);
             }
         }
     }

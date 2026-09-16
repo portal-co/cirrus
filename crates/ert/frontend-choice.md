@@ -3,17 +3,20 @@
 Cirrus does not pick a frontend. Each path below is a supported ingest;
 integrators choose per platform and guest shape.
 
-## ERT (RV32 / Thumb)
+## ERT (RV32 / RV64 / Thumb)
 
-Compile a well-behaved RV32 or Thumb function. `ert_func` maps the image,
+Compile a well-behaved RV32, RV64, or Thumb function. `ert_func` maps the image,
 runs once, and returns result registers. Extra ABI words live on the
 caller-owned **virtual stack** (byte-addressed by `sp`). Host and embedded
 share this interpreter: `RawMemory::from_slice` on desktop/server, QEMU as a
 compatibility gate, on-device firmware the same subset.
 
-Cost is explicit: stack bits + 32×32 register wires + mapped text.
-Constraints: concrete control flow and stack-form addresses; no compressed
-instructions; documented opcode subset only. RV32 `slt`/`slti` forms may
+Cost is explicit: stack bits + 32×32 register wires (32×64 on RV64) + mapped
+text. Constraints: concrete control flow and stack-form addresses; documented
+opcode subset only, in normal or compressed encodings (compressed forms decode
+to the same subset). RV64 adds the `*W` word forms, `LWU`/`LD`/`SD`, and a
+six-stage barrel shifter; the hash `ECALL` moves its 32-byte payload through
+four 64-bit registers. RV32 `slt`/`slti` forms may
 materialize symbolic Boolean data. Thumb additionally supports symbolic
 NZCVQ APSR transfers, carry-consuming `ADC`/`SBC`, and a one-instruction IT
 value materializer; symbolic branches, general predication, calls, returns,

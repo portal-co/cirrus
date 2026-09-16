@@ -42,23 +42,29 @@ pub(crate) const MAX_EXIT_WRITES: usize = 4;
 /// concrete-bounded loop, along with everything needed to replay it.
 #[derive(Clone, Copy)]
 pub(crate) struct RecognizedSite {
-    pub(crate) branch_pc: u32,
+    pub(crate) branch_pc: u64,
     pub(crate) predicate: ComparePredicate,
     /// `true` when the branch condition being *true* means "take the early
     /// exit"; `false` when it means "keep looping" (the exit is the
     /// not-taken/fallthrough successor instead).
     pub(crate) exit_when_taken: bool,
     /// Where control always goes instead of exiting.
-    pub(crate) continue_target: u32,
-    pub(crate) exit_writes: [Option<(Reg, u32)>; MAX_EXIT_WRITES],
+    pub(crate) continue_target: u64,
+    pub(crate) exit_writes: [Option<(Reg, u64)>; MAX_EXIT_WRITES],
     pub(crate) exit_write_count: usize,
 }
 
-fn decode_at(mem: &RawMemory<'_>, address: u32) -> Option<Inst> {
-    let bytes = mem.read::<4>(address)?;
-    Inst::decode(u32::from_le_bytes(bytes), Xlen::Rv32)
+fn decode_at(mem: &RawMemory<'_>, address: u64, xlen: Xlen) -> Option<(Inst, u64)> {
+    let half = u16::from_le_bytes(mem.read64::<2>(address)?);
+    if Inst::first_byte_is_compressed(half as u8) {
+        return Inst::decode_compressed(half, xlen)
+            .ok()
+            .map(|instruction| (instruction, 2));
+    }
+    let bytes = mem.read64::<4>(address)?;
+    Inst::decode(u32::from_le_bytes(bytes), xlen)
         .ok()
-        .map(|(instruction, _)| instruction)
+        .map(|(instruction, _)| (instruction, 4))
 }
 
 /// Walk forward from `start`, proving it reaches a backward branch (the
@@ -67,16 +73,17 @@ fn decode_at(mem: &RawMemory<'_>, address: u32) -> Option<Inst> {
 /// latch's not-taken (natural exit) successor address.
 fn resolve_continue(
     mem: &RawMemory<'_>,
-    start: u32,
-    branch_pc: u32,
+    start: u64,
+    branch_pc: u64,
     budget: &mut u16,
-) -> Option<u32> {
+    xlen: Xlen,
+) -> Option<u64> {
     let mut pc = start;
     loop {
         *budget = budget.checked_sub(1)?;
-        match decode_at(mem, pc)? {
+        match decode_at(mem, pc, xlen)?.0 {
             Inst::Jal { offset, dest } if dest == Reg::ZERO => {
-                pc = pc.wrapping_add_signed(offset.as_i32());
+                pc = pc.wrapping_add_signed(i64::from(offset.as_i32()));
             }
             Inst::Jalr { .. } => return None,
             Inst::Beq { offset, .. }
@@ -85,7 +92,7 @@ fn resolve_continue(
             | Inst::Blt { offset, .. }
             | Inst::Bgeu { offset, .. }
             | Inst::Bltu { offset, .. } => {
-                let target = pc.wrapping_add_signed(offset.as_i32());
+                let target = pc.wrapping_add_signed(i64::from(offset.as_i32()));
                 if target >= pc {
                     // Not a backward edge — a second real branch on this
                     // path, which the idiom's "exactly one candidate" rule
@@ -97,9 +104,9 @@ fn resolve_continue(
                     // the candidate — this isn't the loop we're looking for.
                     return None;
                 }
-                return Some(pc.wrapping_add(4));
+                return Some(pc.wrapping_add(decode_at(mem, pc, xlen)?.1));
             }
-            _ => pc = pc.wrapping_add(4),
+            _ => pc = pc.wrapping_add(decode_at(mem, pc, xlen)?.1),
         }
     }
 }
@@ -112,15 +119,16 @@ fn resolve_continue(
 /// code that happens to also start with an `addi rd, x0, imm`.
 fn resolve_natural_landing(
     mem: &RawMemory<'_>,
-    natural_exit: u32,
+    natural_exit: u64,
     budget: &mut u16,
-) -> Option<u32> {
+    xlen: Xlen,
+) -> Option<u64> {
     let mut pc = natural_exit;
     loop {
         *budget = budget.checked_sub(1)?;
-        match decode_at(mem, pc)? {
+        match decode_at(mem, pc, xlen)?.0 {
             Inst::Jal { offset, dest } if dest == Reg::ZERO => {
-                pc = pc.wrapping_add_signed(offset.as_i32());
+                pc = pc.wrapping_add_signed(i64::from(offset.as_i32()));
             }
             _ => return Some(pc),
         }
@@ -129,7 +137,7 @@ fn resolve_natural_landing(
 
 /// The result of walking the early-exit side forward to the merge point.
 struct ExitLanding {
-    writes: [Option<(Reg, u32)>; MAX_EXIT_WRITES],
+    writes: [Option<(Reg, u64)>; MAX_EXIT_WRITES],
     write_count: usize,
 }
 
@@ -141,9 +149,10 @@ struct ExitLanding {
 /// this early-exit path doesn't provably reconverge with the natural exit.
 fn resolve_exit_landing(
     mem: &RawMemory<'_>,
-    start: u32,
-    merge: u32,
+    start: u64,
+    merge: u64,
     budget: &mut u16,
+    xlen: Xlen,
 ) -> Option<ExitLanding> {
     let mut pc = start;
     let mut writes = [None; MAX_EXIT_WRITES];
@@ -156,17 +165,17 @@ fn resolve_exit_landing(
             });
         }
         *budget = budget.checked_sub(1)?;
-        match decode_at(mem, pc)? {
+        match decode_at(mem, pc, xlen)?.0 {
             Inst::Jal { offset, dest } if dest == Reg::ZERO => {
-                pc = pc.wrapping_add_signed(offset.as_i32());
+                pc = pc.wrapping_add_signed(i64::from(offset.as_i32()));
             }
             Inst::Addi { imm, dest, src1 } if src1 == Reg::ZERO => {
                 if write_count >= MAX_EXIT_WRITES {
                     return None;
                 }
-                writes[write_count] = Some((dest, imm.as_i32() as u32));
+                writes[write_count] = Some((dest, imm.as_i32() as i64 as u64));
                 write_count += 1;
-                pc = pc.wrapping_add(4);
+                pc = pc.wrapping_add(decode_at(mem, pc, xlen)?.1);
             }
             _ => return None,
         }
@@ -178,13 +187,14 @@ fn resolve_exit_landing(
 /// concrete-bounded loop.
 pub(crate) fn recognize(
     mem: &RawMemory<'_>,
-    branch_pc: u32,
+    branch_pc: u64,
     offset: Imm,
     predicate: ComparePredicate,
     max_lookahead: u16,
+    xlen: Xlen,
 ) -> Option<RecognizedSite> {
-    let taken_target = branch_pc.wrapping_add_signed(offset.as_i32());
-    let not_taken_target = branch_pc.wrapping_add(4);
+    let taken_target = branch_pc.wrapping_add_signed(i64::from(offset.as_i32()));
+    let not_taken_target = branch_pc.wrapping_add(decode_at(mem, branch_pc, xlen)?.1);
 
     for exit_when_taken in [false, true] {
         let (continue_start, exit_start) = if exit_when_taken {
@@ -195,18 +205,18 @@ pub(crate) fn recognize(
 
         let mut continue_budget = max_lookahead;
         let Some(natural_exit) =
-            resolve_continue(mem, continue_start, branch_pc, &mut continue_budget)
+            resolve_continue(mem, continue_start, branch_pc, &mut continue_budget, xlen)
         else {
             continue;
         };
 
         let mut natural_budget = max_lookahead;
-        let Some(merge) = resolve_natural_landing(mem, natural_exit, &mut natural_budget) else {
+        let Some(merge) = resolve_natural_landing(mem, natural_exit, &mut natural_budget, xlen) else {
             continue;
         };
 
         let mut exit_budget = max_lookahead;
-        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget)
+        let Some(exit_landing) = resolve_exit_landing(mem, exit_start, merge, &mut exit_budget, xlen)
         else {
             continue;
         };

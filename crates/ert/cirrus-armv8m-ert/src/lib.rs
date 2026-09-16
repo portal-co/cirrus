@@ -211,8 +211,8 @@ where
     fn ecall(
         &mut self,
         regs: &mut [[W; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
@@ -223,12 +223,12 @@ where
                     let register = index + 1;
                     let value = u32::from_le_bytes(array::from_fn(|byte| bytes[byte]));
                     offsets[register] = None;
-                    reg_consts[register] = Some(value);
-                    regs[register] = constant_word(zero, one, value);
+                    reg_consts[register] = Some(u64::from(value));
+                    regs[register] = constant_word(zero, one, u64::from(value));
                 }
                 Ok(EcallOutcome::Continue)
             }
-            Some(u32::MAX) => Ok(EcallOutcome::Exit),
+            Some(0xffff_ffff) => Ok(EcallOutcome::Exit),
             _ => Ok(EcallOutcome::Unexpected),
         }
     }
@@ -356,8 +356,8 @@ impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
     fn ecall(
         &mut self,
         regs: &mut [[H::Wrapped; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &H::Wrapped,
         one: &H::Wrapped,
     ) -> Result<EcallOutcome, H::Error> {
@@ -483,7 +483,31 @@ where
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
-        self.handler.ecall(regs, reg_consts, offsets, zero, one)
+        // The shared `Handler` trait carries `u64`/`i64` metadata for RV64;
+        // this facade's machine keeps its historical 32-bit metadata, so the
+        // boundary converts through a fixed register-file-sized scratch.
+        let mut consts64: [Option<u64>; REG_COUNT] = [None; REG_COUNT];
+        let mut offsets64: [Option<i64>; REG_COUNT] = [None; REG_COUNT];
+        for (slot, converted) in reg_consts.iter().zip(consts64.iter_mut()) {
+            *converted = slot.map(u64::from);
+        }
+        for (slot, converted) in offsets.iter().zip(offsets64.iter_mut()) {
+            *converted = slot.map(i64::from);
+        }
+        let outcome = self.handler.ecall(
+            regs,
+            &mut consts64[..reg_consts.len()],
+            &mut offsets64[..offsets.len()],
+            zero,
+            one,
+        )?;
+        for (slot, converted) in reg_consts.iter_mut().zip(consts64) {
+            *slot = converted.map(|value| value as u32);
+        }
+        for (slot, converted) in offsets.iter_mut().zip(offsets64) {
+            *slot = converted.map(|value| value as i32);
+        }
+        Ok(outcome)
     }
 
     fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
@@ -1323,7 +1347,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                     } else {
                         (
                             partial_bitwise_word(
-                                self.t, constant, symbolic, &self.zero, &self.one, kind,
+                                self.t, u64::from(constant), symbolic, &self.zero, &self.one, kind,
                             )
                             .map_err(ErtError::Emitted)?,
                             None,
@@ -1361,7 +1385,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         (
                             partial_bitwise_word(
                                 self.t,
-                                !right,
+                                u64::from(!right),
                                 &left_word,
                                 &self.zero,
                                 &self.one,
@@ -1376,7 +1400,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         (self.word_from_constant(0), Some(0))
                     } else {
                         (
-                            partial_and_not_word(self.t, left, &right_word, &self.zero, &self.one)
+                            partial_and_not_word(self.t, u64::from(left), &right_word, &self.zero, &self.one)
                                 .map_err(ErtError::Emitted)?,
                             None,
                         )
@@ -1573,7 +1597,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     fn word_from_constant(&self, value: u32) -> [W; 32] {
-        constant_word(&self.zero, &self.one, value)
+        constant_word(&self.zero, &self.one, u64::from(value))
     }
 
     fn write(&mut self, register: u8, word: [W; 32], value: Option<u32>) {
@@ -2706,7 +2730,7 @@ fn multiply_word<W: Clone, E>(
         return Ok(constant_word(
             zero,
             one,
-            concrete_product(product, left, right),
+            u64::from(concrete_product(product, left, right)),
         ));
     }
     if left_constant == Some(0) || right_constant == Some(0) {

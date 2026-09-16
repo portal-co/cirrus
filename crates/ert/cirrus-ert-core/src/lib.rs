@@ -70,7 +70,11 @@ where
 ///
 /// `regs`/`reg_consts`/`offsets` are slices over the full register file at
 /// the call — sliced rather than fixed-size-array-typed so this one trait
-/// shape serves both RV32's 32 registers and Armv8-M's 16 registers. An
+/// shape serves both RV32's 32 registers and Armv8-M's 16 registers.
+/// `BITS` is the facade's word width (32 for RV32 and Armv8-M, 64 for
+/// RV64); it defaults to 32 so existing 32-bit handlers keep their
+/// spelling. Concrete register metadata is always carried as `u64`/`i64`
+/// regardless of `BITS` — 32-bit facades store zero-extended values. An
 /// implementation is expected to index only known ABI-fixed positions (e.g.
 /// "register 0" and "the eight registers following it"); nothing about a
 /// well-behaved `ecall` implementation needs the total register count.
@@ -81,13 +85,13 @@ where
 ///
 /// The caller-balanced-stack requirement for a successful exit is enforced
 /// by each facade's own interpreter, not by the handler.
-pub trait Handler<Val>: ContextWithErtOps<Val> {
+pub trait Handler<Val, const BITS: usize = 32>: ContextWithErtOps<Val> {
     /// Handle an environment call.
     fn ecall(
         &mut self,
-        regs: &mut [[Self::Wrapped; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        regs: &mut [[Self::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &Self::Wrapped,
         one: &Self::Wrapped,
     ) -> Result<EcallOutcome, Self::Error>;
@@ -175,22 +179,23 @@ impl<'a> RawMemory<'a> {
         self
     }
 
-    /// Read a fixed number of bytes, rejecting an overflowing or out-of-range
-    /// address before any pointer is dereferenced.
+    /// Read a fixed number of bytes at a 64-bit guest address, rejecting an
+    /// overflowing or out-of-range address before any pointer is
+    /// dereferenced.
     #[doc(hidden)]
-    pub fn read<const N: usize>(&self, address: u32) -> Option<[u8; N]> {
+    pub fn read64<const N: usize>(&self, address: u64) -> Option<[u8; N]> {
         debug_assert!(N > 0);
-        address.checked_add(N.checked_sub(1)? as u32)?;
+        address.checked_add(N.checked_sub(1)? as u64)?;
         if N == 4 {
             if let Some((detect_address, value)) = self.detect {
-                if address == detect_address {
+                if address == u64::from(detect_address) {
                     let bytes = value.to_le_bytes();
                     return Some(array::from_fn(|i| bytes[i]));
                 }
             }
         }
         if let Some(len) = self.len {
-            let start = address as usize;
+            let start = usize::try_from(address).ok()?;
             if start.checked_add(N)? > len {
                 return None;
             }
@@ -200,6 +205,15 @@ impl<'a> RawMemory<'a> {
             // mapping, this is precisely the contract of `RawMemory::new`.
             unsafe { self.base.wrapping_add(address as usize + offset).read() }
         }))
+    }
+
+    /// Read a fixed number of bytes, rejecting an overflowing or out-of-range
+    /// address before any pointer is dereferenced.
+    #[doc(hidden)]
+    pub fn read<const N: usize>(&self, address: u32) -> Option<[u8; N]> {
+        debug_assert!(N > 0);
+        address.checked_add(N.checked_sub(1)? as u32)?;
+        self.read64(u64::from(address))
     }
 }
 
@@ -268,8 +282,8 @@ pub enum Product {
     HighUnsigned,
 }
 
-/// Form a symbolic constant word.
-pub fn constant_word<W: Clone>(zero: &W, one: &W, value: u32) -> [W; 32] {
+/// Form a symbolic constant word. Bits at or above `N` are ignored.
+pub fn constant_word<W: Clone, const N: usize>(zero: &W, one: &W, value: u64) -> [W; N] {
     array::from_fn(|bit| {
         if (value >> bit) & 1 == 0 {
             zero.clone()
@@ -345,13 +359,13 @@ pub fn add_bits_with_carry_out<W: Clone, E, const N: usize>(
     })
 }
 
-/// Add two 32-bit words.
-pub fn add_word<W: Clone, E>(
+/// Add two `N`-bit words.
+pub fn add_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    left: &[W; 32],
-    right: &[W; 32],
+    left: &[W; N],
+    right: &[W; N],
     zero: W,
-) -> Result<[W; 32], E> {
+) -> Result<[W; N], E> {
     add_bits(t, left, right, zero)
 }
 
@@ -376,13 +390,13 @@ pub fn select_word<W: Clone, E, const N: usize>(
     })
 }
 
-/// Apply a bitwise operation to every bit of two 32-bit words.
-pub fn bitwise_word<W: Clone, E>(
+/// Apply a bitwise operation to every bit of two `N`-bit words.
+pub fn bitwise_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    left: &[W; 32],
-    right: &[W; 32],
+    left: &[W; N],
+    right: &[W; N],
     operation: BitOp,
-) -> Result<[W; 32], E> {
+) -> Result<[W; N], E> {
     try_array(|bit| match operation {
         BitOp::And => t.bitand(left[bit].clone(), right[bit].clone()),
         BitOp::Or => t.bitor(left[bit].clone(), right[bit].clone()),
@@ -395,14 +409,15 @@ pub fn bitwise_word<W: Clone, E>(
 /// calls for AND/OR. XOR is accepted for call-site uniformity only — it
 /// still calls `t.bitxor` once per set bit, identical in cost to
 /// `bitwise_word`, since XOR has no constant-side shortcut to exploit.
-pub fn partial_bitwise_word<W: Clone, E>(
+/// Bits of `constant` at or above `N` are ignored.
+pub fn partial_bitwise_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    constant: u32,
-    symbolic: &[W; 32],
+    constant: u64,
+    symbolic: &[W; N],
     zero: &W,
     one: &W,
     operation: BitOp,
-) -> Result<[W; 32], E> {
+) -> Result<[W; N], E> {
     try_array(|bit| {
         let set = (constant >> bit) & 1 != 0;
         Ok(match operation {
@@ -419,13 +434,13 @@ pub fn partial_bitwise_word<W: Clone, E>(
 /// `constant & !symbolic`, for BitClear's concrete-left-operand case (not
 /// expressible via [`partial_bitwise_word`], since it needs a per-bit
 /// inverted copy rather than a direct copy).
-pub fn partial_and_not_word<W: Clone, E>(
+pub fn partial_and_not_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    constant: u32,
-    symbolic: &[W; 32],
+    constant: u64,
+    symbolic: &[W; N],
     zero: &W,
     one: &W,
-) -> Result<[W; 32], E> {
+) -> Result<[W; N], E> {
     try_array(|bit| {
         if (constant >> bit) & 1 == 0 {
             Ok(zero.clone())
@@ -436,19 +451,24 @@ pub fn partial_and_not_word<W: Clone, E>(
 }
 
 /// Invert every bit of a word using the supplied Boolean one wire.
-pub fn invert_word<W: Clone, E>(
+pub fn invert_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    word: &[W; 32],
+    word: &[W; N],
     one: W,
-) -> Result<[W; 32], E> {
+) -> Result<[W; N], E> {
     try_array(|bit| t.bitxor(word[bit].clone(), one.clone()))
 }
 
 /// Shift or rotate a snapshot by a host-known amount.
-pub fn fixed_shift<W: Clone>(source: &[W; 32], amount: u32, direction: Shift, zero: &W) -> [W; 32] {
-    let amount = amount.min(32);
+pub fn fixed_shift<W: Clone, const N: usize>(
+    source: &[W; N],
+    amount: u32,
+    direction: Shift,
+    zero: &W,
+) -> [W; N] {
+    let amount = amount.min(N as u32);
     let fill = match direction {
-        Shift::ArithmeticRight => source[31].clone(),
+        Shift::ArithmeticRight => source[N - 1].clone(),
         Shift::Left | Shift::LogicalRight | Shift::RotateRight => zero.clone(),
     };
     array::from_fn(|destination_bit| match direction {
@@ -456,16 +476,36 @@ pub fn fixed_shift<W: Clone>(source: &[W; 32], amount: u32, direction: Shift, ze
             source[destination_bit - amount as usize].clone()
         }
         Shift::LogicalRight | Shift::ArithmeticRight
-            if destination_bit + (amount as usize) < 32 =>
+            if destination_bit + (amount as usize) < N =>
         {
             source[destination_bit + amount as usize].clone()
         }
-        Shift::RotateRight => source[(destination_bit + (amount as usize & 31)) & 31].clone(),
+        Shift::RotateRight => {
+            source[(destination_bit + (amount as usize & (N - 1))) & (N - 1)].clone()
+        }
         _ => fill.clone(),
     })
 }
 
-/// Compute a five-stage RV32-style symbolic barrel shift.
+/// Compute a `log2(N)`-stage RISC-V-style symbolic barrel shift: five
+/// stages for 32-bit words, six for 64-bit words.
+pub fn runtime_shift<W: Clone, E, const N: usize>(
+    t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
+    source: &[W; N],
+    amount: &[W; N],
+    direction: Shift,
+    zero: &W,
+) -> Result<[W; N], E> {
+    let mut output = source.clone();
+    for stage in 0..N.trailing_zeros() as usize {
+        let candidate = fixed_shift(&output, 1 << stage, direction, zero);
+        output = select_word(t, amount[stage].clone(), &candidate, &output)?;
+    }
+    Ok(output)
+}
+
+/// The 32-bit form of [`runtime_shift`], kept under its original name for
+/// existing 32-bit call sites.
 pub fn rv32_runtime_shift<W: Clone, E>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
     source: &[W; 32],
@@ -473,12 +513,7 @@ pub fn rv32_runtime_shift<W: Clone, E>(
     direction: Shift,
     zero: &W,
 ) -> Result<[W; 32], E> {
-    let mut output = source.clone();
-    for stage in 0..5 {
-        let candidate = fixed_shift(&output, 1 << stage, direction, zero);
-        output = select_word(t, amount[stage].clone(), &candidate, &output)?;
-    }
-    Ok(output)
+    runtime_shift(t, source, amount, direction, zero)
 }
 
 /// Compute an Arm register-counted shift and its APSR C result.

@@ -31,3 +31,7 @@ libc = "0.2"
 [[test]]
 name = "bare_metal"
 required-features = ["volar-tests"]
+
+[[test]]
+name = "bare_metal64"
+required-features = ["volar-tests"]

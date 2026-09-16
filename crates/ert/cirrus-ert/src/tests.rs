@@ -95,8 +95,14 @@ fn bounded_raw_memory_rejects_a_truncated_instruction_fetch() {
     let mut rstack = [0; 8];
     let mut vstack = [false; 64];
 
+    // A null compressed halfword is a decode failure; a one-byte image is a
+    // truncated fetch.
     assert!(matches!(
         run(&[0; 3], &mut regs, &mut constants, &mut rstack, &mut vstack),
+        Err(ErtError::Decode(_))
+    ));
+    assert!(matches!(
+        run(&[0x13], &mut regs, &mut constants, &mut rstack, &mut vstack),
         Err(ErtError::Unexpected)
     ));
 }
@@ -941,6 +947,37 @@ fn constants_and_concrete_loads_update_register_metadata() {
 }
 
 #[test]
+fn symbolic_sub_subtracts_src2_from_src1() {
+    // Pins the historical operand mix-up: the symbolic subtract path once
+    // computed `src2 - src1`.
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    regs[Reg::T1.0 as usize] = word(100);
+    regs[Reg::T2.0 as usize] = word(58);
+    exit_register(&mut regs, &mut constants);
+    let mem = program([
+        Inst::Sub {
+            dest: Reg::T0,
+            src1: Reg::T1,
+            src2: Reg::T2,
+        },
+        Inst::Ecall,
+    ]);
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+
+    assert_success(run(
+        &mem,
+        &mut regs,
+        &mut constants,
+        &mut rstack,
+        &mut vstack,
+    ));
+
+    assert_eq!(value(&regs[Reg::T0.0 as usize]), 42);
+}
+
+#[test]
 fn symbolic_stack_memory_preserves_width_and_extension_rules() {
     let mut regs = [[false; 32]; 32];
     let mut constants = [None; 32];
@@ -1373,5 +1410,24 @@ fn dynamic_control_and_invalid_words_are_reported() {
             &mut vstack,
         ),
         Err(ErtError::Decode(_))
+    ));
+}
+
+#[test]
+fn compressed_instructions_execute_with_two_byte_steps() {
+    // Hand-assembled C.LI/C.MV/C.ADD/C.JR covering the CI and CR formats,
+    // including a compressed conventional return.
+    let mut regs = [[false; 32]; 32];
+    let mut constants = [None; 32];
+    exit_register(&mut regs, &mut constants);
+    let mut mem = std::vec::Vec::new();
+    mem.extend(0x4585u16.to_le_bytes()); // c.li a1, 1
+    mem.extend(0x85aau16.to_le_bytes()); // c.mv a1, a0  (a0 = exit selector)
+    mem.extend(0x8082u16.to_le_bytes()); // c.jr ra — underflow: must fail closed
+    let mut rstack = [0; 8];
+    let mut vstack = [false; 64];
+    assert!(matches!(
+        run(&mem, &mut regs, &mut constants, &mut rstack, &mut vstack),
+        Err(ErtError::Unexpected)
     ));
 }

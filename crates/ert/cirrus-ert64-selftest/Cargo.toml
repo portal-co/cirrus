@@ -1,0 +1,23 @@
+[package]
+name = "cirrus-ert64-selftest"
+edition = "2024"
+version.workspace = true
+description = "Bare-metal RV64IM cirrus-ert self-test"
+autobins = false
+
+[features]
+bare-metal = []
+
+[[bin]]
+name = "cirrus-ert64-selftest"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["bare-metal"]
+
+[dependencies]
+cirrus-ert = { path = "../cirrus-ert" }
+cirrus-ert-sha256-fixture = { path = "../cirrus-ert-sha256-fixture" }
+cirrus-volar-boolar = { path = "../../volar/cirrus-volar-boolar" }
+volar-ir = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
+volar-ir-common = { version = "0.1.0", git = "https://github.com/portal-co/volar-ir.git" }
