@@ -91,6 +91,9 @@ mod early_exit;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_hooks;
+
 #[cfg(all(test, feature = "early-exit-loops"))]
 mod early_exit_tests;
 
