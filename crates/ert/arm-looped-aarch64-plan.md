@@ -19,13 +19,16 @@
 ### Phase 2 — shared driver substrate — **IN PROGRESS**
 
 * `cirrus-ert-loop-core` owns the no-alloc, caller-buffered candidate
-  generation lifecycle (deduplication, capacity failure, tail compaction) and
-  the common predicated-value circuit `old ^ (active & (new ^ old))`.
+  generation lifecycle (deduplication, capacity failure, tail compaction), the
+  common predicated-value circuit `old ^ (active & (new ^ old))`, and a sealed
+  callback-style generation driver. The callback owns ISA state/folding while
+  the core commits successors only after every body has succeeded.
 * `cirrus-ert-loop` consumes both primitives without behavior changes; its
   all-feature unit suite and RV64 SHA workload are regression gates.
-* The scheduler still needs its ISA-neutral callback boundary before the Thumb
-  adapter can be implemented. No Thumb machine state is yet exposed to the
-  loop core, deliberately avoiding a premature public universal-machine API.
+* The RISC-V adapter still executes its generation loop directly while this
+  callback boundary stabilizes. The next change ports that adapter to it;
+  afterward the Thumb adapter can use the identical scheduler without exposing
+  a public universal-machine API.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
