@@ -100,8 +100,10 @@ mod early_exit_tests;
 #[cfg(feature = "early-exit-loops")]
 pub use cirrus_ert_core::EarlyExitLoopOptions;
 
-const REG_COUNT: usize = 16;
-const SP: u8 = 13;
+#[doc(hidden)]
+pub const REG_COUNT: usize = 16;
+#[doc(hidden)]
+pub const SP: u8 = 13;
 const LR: u8 = 14;
 const PC: u8 = 15;
 const ABI_REGS: [u8; 4] = [0, 1, 2, 3];
