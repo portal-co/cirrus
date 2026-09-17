@@ -1,5 +1,6 @@
 use cirrus_armv8m_ert::{ArmHandler, ErtError, RawMemory};
-use cirrus_ert_loop_core::{CandidateDriver, DriveError};
+use cirrus_ert_core::{ComparePredicate, compare_word};
+use cirrus_ert_loop_core::{CandidateDriver, DriveError, predicated_value};
 
 use crate::{ThumbBoundary, ThumbSnapshot, execute_snapshot, fold_registers, merge_agreement};
 
@@ -10,7 +11,7 @@ use crate::{ThumbBoundary, ThumbSnapshot, execute_snapshot, fold_registers, merg
 /// while concrete SP/rstack/ITSTATE/TrustZone state is checked for agreement.
 pub struct ThumbGenerationDriver<'a, H, W, E, const FRAMES: usize>
 where
-    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+    H: ArmHandler<bool, Wrapped = W, Error = E>,
     W: Clone,
     E: core::error::Error,
 {
@@ -25,11 +26,14 @@ where
     accumulator: ThumbSnapshot<W, FRAMES>,
     agreement: Option<crate::ThumbAgreement<FRAMES>>,
     any_exit: bool,
+    vip: [W; 32],
+    next_vip: [W; 32],
+    done: W,
 }
 
 impl<'a, H, W, E, const FRAMES: usize> ThumbGenerationDriver<'a, H, W, E, FRAMES>
 where
-    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+    H: ArmHandler<bool, Wrapped = W, Error = E>,
     W: Clone,
     E: core::error::Error,
 {
@@ -43,6 +47,7 @@ where
         base: ThumbSnapshot<W, FRAMES>,
         zero: W,
         one: W,
+        vip: [W; 32],
     ) -> Self {
         Self {
             handler,
@@ -50,12 +55,15 @@ where
             storage_bits,
             mem,
             rstack,
-            zero,
+            zero: zero.clone(),
             one,
             accumulator: base.clone(),
             base,
             agreement: None,
             any_exit: false,
+            vip: vip.clone(),
+            next_vip: vip,
+            done: zero.clone(),
         }
     }
 
@@ -72,7 +80,7 @@ where
 impl<'a, H, W, E, const FRAMES: usize> CandidateDriver<u32>
     for ThumbGenerationDriver<'a, H, W, E, FRAMES>
 where
-    H: ArmHandler<bool, Wrapped = W, Error = E> + ?Sized,
+    H: ArmHandler<bool, Wrapped = W, Error = E>,
     W: Clone,
     E: core::error::Error,
 {
@@ -85,6 +93,21 @@ where
     ) -> Result<(), DriveError<Self::Error>> {
         let mut body = self.base.clone();
         body.pc = candidate;
+        let candidate_word = core::array::from_fn(|bit| {
+            if (u64::from(candidate) >> bit) & 1 == 0 {
+                self.zero.clone()
+            } else {
+                self.one.clone()
+            }
+        });
+        let active = compare_word(
+            self.handler,
+            &self.vip,
+            &candidate_word,
+            ComparePredicate::Eq,
+            &self.one,
+        )
+        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
         let (boundary, updated) = execute_snapshot(
             self.handler,
             self.storage,
@@ -98,17 +121,60 @@ where
         .map_err(DriveError::Driver)?;
         merge_agreement(&mut self.agreement, updated.agreement())
             .map_err(|_| DriveError::Driver(ErtError::Unexpected))?;
-        let active = self.one.clone();
-        fold_registers(self.handler, active, &updated, &mut self.accumulator)
-            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
-        match boundary {
-            ThumbBoundary::Branch { .. } => {
-                for successor in boundary.successors().expect("branch has successors") {
-                    successors(u32::from(successor))?;
+        fold_registers(
+            self.handler,
+            active.clone(),
+            &updated,
+            &mut self.accumulator,
+        )
+        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+        let body_done = match boundary {
+            ThumbBoundary::Branch {
+                taken,
+                fallthrough,
+                condition,
+            } => {
+                let taken_word: [W; 32] = core::array::from_fn(|bit| {
+                    if (u64::from(taken) >> bit) & 1 == 0 {
+                        self.zero.clone()
+                    } else {
+                        self.one.clone()
+                    }
+                });
+                let fallthrough_word: [W; 32] = core::array::from_fn(|bit| {
+                    if (u64::from(fallthrough) >> bit) & 1 == 0 {
+                        self.zero.clone()
+                    } else {
+                        self.one.clone()
+                    }
+                });
+                for bit in 0..32 {
+                    let body_bit = predicated_value(
+                        self.handler,
+                        condition.clone(),
+                        taken_word[bit].clone(),
+                        fallthrough_word[bit].clone(),
+                    )
+                    .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+                    self.next_vip[bit] = predicated_value(
+                        self.handler,
+                        active.clone(),
+                        body_bit,
+                        self.next_vip[bit].clone(),
+                    )
+                    .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
                 }
+                successors(taken)?;
+                successors(fallthrough)?;
+                self.zero.clone()
             }
-            ThumbBoundary::Exit => self.any_exit = true,
-        }
+            ThumbBoundary::Exit => {
+                self.any_exit = true;
+                self.one.clone()
+            }
+        };
+        self.done = predicated_value(self.handler, active, body_done, self.done.clone())
+            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
         Ok(())
     }
 }
