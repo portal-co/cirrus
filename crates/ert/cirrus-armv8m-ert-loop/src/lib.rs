@@ -11,7 +11,7 @@
 //! virtual TrustZone state. A later wire-backed register/NZCV fold can only
 //! run after this agreement check has succeeded.
 
-use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
+use cirrus_armv8m_ert::{Flag, Machine, StorageRuntime, REG_COUNT, SecurityState};
 use cirrus_core::{ContextWithBitAnd, ContextWithBitXor, HasError};
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.

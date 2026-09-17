@@ -513,13 +513,32 @@ pub trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
     fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;
 }
 
-struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
     handler: &'a mut H,
     storage: &'a mut H::Storage,
     zero: H::Wrapped,
     one: H::Wrapped,
 }
 
+impl<'a, H: ContextWithStorage<bool> + ?Sized> StorageRuntime<'a, H> {
+    /// Construct the storage-backed runtime used by loop adapters.
+    #[doc(hidden)]
+    pub fn new(
+        handler: &'a mut H,
+        storage: &'a mut H::Storage,
+        zero: H::Wrapped,
+        one: H::Wrapped,
+    ) -> Self {
+        Self {
+            handler,
+            storage,
+            zero,
+            one,
+        }
+    }
+}
 impl<H: ContextWithStorage<bool> + ?Sized> HasError for StorageRuntime<'_, H> {
     type Error = H::Error;
 }
