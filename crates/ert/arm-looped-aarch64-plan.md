@@ -35,9 +35,14 @@
   PC/SP, rstack frames, ITSTATE, and virtual TrustZone state. The Arm facade
   exposes only doc-hidden decoded execution/state seam types needed to
   populate it.
-* The next change can use these pieces in the adapter's candidate body runner:
-  fold registers after agreement, then add NZCVQ materialization/folding at
-  the Arm seam. No public universal-machine API is introduced.
+* `cirrus-armv8m-ert-loop` now has a caller-owned `execute_snapshot` body
+  runner. It restores a complete `ThumbSnapshot`, executes through the Arm
+  interpreter's decoded seam, and captures the updated state plus a symbolic
+  `B<cond>`/`CBZ`/`CBNZ` boundary or exit. No allocator or hidden
+  storage/rstack state is introduced.
+* The remaining Phase 2 adapter work is the multi-candidate scheduler
+  integration: construct activity wires, call `merge_agreement`, fold
+  registers/metadata, and feed successors through `CandidateDriver`.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
