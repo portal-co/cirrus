@@ -71,13 +71,9 @@ where
         }
     }
 
-    /// Finish the generation and return its folded snapshot.
-    pub fn finish(self) -> Result<ThumbSnapshot<W, FRAMES>, ErtError<E>> {
-        if self.any_exit {
-            Ok(self.accumulator)
-        } else {
-            Ok(self.accumulator)
-        }
+    /// Finish the generation and return folded state plus virtual-IP/done wires.
+    pub fn finish(self) -> Result<(ThumbSnapshot<W, FRAMES>, [W; 32], W, bool), ErtError<E>> {
+        Ok((self.accumulator, self.next_vip, self.done, self.any_exit))
     }
 }
 
@@ -89,7 +85,7 @@ where
 pub fn run_generation<'a, H, W, E, const FRAMES: usize>(
     table: &mut CandidateTable<'_, u32>,
     driver: ThumbGenerationDriver<'a, H, W, E, FRAMES>,
-) -> Result<ThumbSnapshot<W, FRAMES>, ErtError<E>>
+) -> Result<(ThumbSnapshot<W, FRAMES>, [W; 32], W, bool), ErtError<E>>
 where
     H: ArmHandler<bool, Wrapped = W, Error = E>,
     W: Clone,
