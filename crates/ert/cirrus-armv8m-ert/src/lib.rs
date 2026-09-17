@@ -1,6 +1,5 @@
 #![no_std]
 #![warn(missing_docs)]
-
 //! Symbolically execute a deliberately small Armv8-M Thumb-2 subset,
 //! including virtual Secure/Non-secure TrustZone-M interworking.
 //!
@@ -60,6 +59,9 @@
 
 use core::{array, error::Error, mem::MaybeUninit, ops::Range};
 
+#[cfg(feature = "call-hooks")]
+extern crate alloc;
+
 #[cfg(feature = "prepared-recording")]
 use core::convert::Infallible;
 
@@ -79,6 +81,9 @@ use cirrus_recompile_core::{Idx, PreparedRecorder};
 use cirrus_volar_boolar::MuxTreeContext;
 
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
+
+#[cfg(feature = "call-hooks")]
+pub mod hooks;
 
 #[cfg(feature = "early-exit-loops")]
 mod early_exit;

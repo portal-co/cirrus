@@ -16,6 +16,9 @@ volar-tests = ["dep:cirrus-volar-boolar"]
 # fixed-capacity per-execution cache to `Machine` that unaffected callers
 # don't need to pay for.
 early-exit-loops = []
+# Canned call registries allocate; keep them out of bare-metal users unless
+# explicitly requested. Synchronous ArmHandler::call_hook is always available.
+call-hooks = []
 
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
