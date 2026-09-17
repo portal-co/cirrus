@@ -40,16 +40,15 @@
   interpreter's decoded seam, and captures the updated state plus a symbolic
   `B<cond>`/`CBZ`/`CBNZ` boundary or exit. No allocator or hidden
   storage/rstack state is introduced.
-* The Thumb adapter now has a `ThumbGenerationDriver` implementing the shared
-  `CandidateDriver<u32>` contract. It computes candidate activity from the
-  virtual IP, executes each body from a caller-owned snapshot, checks concrete
-  agreement, folds register wires, folds the symbolic next virtual IP, and
-  accumulates `done` through the shared predication formula. `run_generation`
-  delegates candidate lifecycle/overflow/deduplication to the shared core.
-* Boundary successor ordering is tested explicitly (taken then fall-through),
-  as is the exit/no-successor case. NZCVQ lazy-flag folding and a full public
-  Thumb loop entry remain the next increments; the current adapter deliberately
-  fails closed rather than fabricating a wire representation for lazy flags.
+* The Thumb generation driver now materializes all lazy NZCVQ recipes at the
+  body boundary before snapshot capture. This keeps flag folds explicit and
+  avoids silently treating `FlagWire::Zero`/overflow/shift recipes as direct
+  wires. Register constants and stack offsets now survive only when every body
+  agrees; divergent metadata is cleared to unknown.
+* Shared-driver integration remains allocation-free and caller-owned. The next
+  Phase 2 gate is an end-to-end Thumb loop entry that initializes a snapshot,
+  drives candidate generations, and validates symbolic conditional branches;
+  the current low-level driver is ready for that wrapper.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
