@@ -12,6 +12,7 @@
 //! run after this agreement check has succeeded.
 
 use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
+use cirrus_core::{ContextWithBitAnd, ContextWithBitXor, HasError};
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +109,52 @@ impl<W: Clone, const FRAMES: usize> ThumbSnapshot<W, FRAMES> {
     }
 }
 
-/// Concrete Arm state which may not be selected by a symbolic candidate
+/// Select wire-backed state under `active`, leaving concrete metadata to the
+/// explicit agreement check.
+///
+/// This is the same gate form as predicated storage writes:
+/// `old ^ (active & (new ^ old))`.
+pub fn select_wire<C, W>(context: &mut C, active: W, value: W, old: W) -> Result<W, C::Error>
+where
+    C: ContextWithBitAnd<bool, Wrapped = W> + ContextWithBitXor<bool, Wrapped = W> + HasError,
+    W: Clone,
+{
+    let difference = context.bitxor(value, old.clone())?;
+    let gated = context.bitand(active, difference)?;
+    context.bitxor(old, gated)
+}
+
+/// Fold the wire-backed register file from `candidate` into `accumulator`
+/// under `active`.
+///
+/// The caller must first call [`merge_agreement`] for both snapshots. Concrete
+/// constants and stack offsets are intentionally not selected here: a later
+/// full adapter preserves them only when every body agrees. Lazy NZCVQ is
+/// retained in the snapshot for now and will be folded through Arm's own
+/// materialization seam when the body runner is introduced.
+pub fn fold_registers<C, W, const FRAMES: usize>(
+    context: &mut C,
+    active: W,
+    candidate: &ThumbSnapshot<W, FRAMES>,
+    accumulator: &mut ThumbSnapshot<W, FRAMES>,
+) -> Result<(), C::Error>
+where
+    C: ContextWithBitAnd<bool, Wrapped = W> + ContextWithBitXor<bool, Wrapped = W> + HasError,
+    W: Clone,
+{
+    for register in 0..REG_COUNT {
+        for bit in 0..32 {
+            accumulator.regs[register][bit] = select_wire(
+                context,
+                active.clone(),
+                candidate.regs[register][bit].clone(),
+                accumulator.regs[register][bit].clone(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// predicate in the first Thumb loop-adapter cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThumbAgreement<const FRAMES: usize> {
@@ -155,7 +201,7 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
-    use super::{ThumbAgreement, ThumbMergeError, merge_agreement};
+    use super::{ThumbAgreement, ThumbMergeError, merge_agreement, select_wire};
     use cirrus_armv8m_ert::SecurityState;
 
     fn state() -> ThumbAgreement<2> {
@@ -166,6 +212,12 @@ mod tests {
             itstate: 0,
             security_state: SecurityState::Secure,
         }
+    }
+
+    #[test]
+    fn active_wire_selection_is_predicated() {
+        assert_eq!(select_wire(&mut (), false, true, false), Ok(false));
+        assert_eq!(select_wire(&mut (), true, true, false), Ok(true));
     }
 
     #[test]
