@@ -7,10 +7,24 @@
 //! prefix, accumulates the next generation in the disjoint tail, rejects
 //! overflow, deduplicates deterministically, and compacts only after every
 //! current candidate has been examined. The substrate has no ISA state,
-//! decoder, or circuit dependency: adapters own those semantics and use this
-//! type only for virtual-IP candidate lifecycle management.
+use cirrus_core::{ContextWithBitAnd, ContextWithBitXor, HasError};
 
-/// A caller-owned, fixed-capacity set of current and next virtual-IP
+/// Select a candidate's `value` only while `active`, retaining `old`
+/// otherwise.
+///
+/// The XOR/AND form is deliberately used instead of a generic mux so loop
+/// adapters can predicate virtual-stack writes with the same circuit shape:
+/// `old ^ (active & (value ^ old))`.
+pub fn predicated_value<C, W>(context: &mut C, active: W, value: W, old: W) -> Result<W, C::Error>
+where
+    C: ContextWithBitAnd<bool, Wrapped = W> + ContextWithBitXor<bool, Wrapped = W> + HasError,
+    W: Clone,
+{
+    let difference = context.bitxor(value, old.clone())?;
+    let gated = context.bitand(active, difference)?;
+    context.bitxor(old, gated)
+}
+
 /// candidates.
 ///
 /// The underlying slice must hold both the current generation and the next

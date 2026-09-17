@@ -5,3 +5,4 @@ version.workspace = true
 description = "Allocation-free candidate scheduling substrate for ERT looped executors"
 
 [dependencies]
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }

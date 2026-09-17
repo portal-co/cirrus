@@ -64,7 +64,7 @@ use cirrus_ert::{
     machine::{ABI_REGS, Machine, RstackWord, Runtime},
 };
 use cirrus_ert_core::{ComparePredicate, compare_word, select_word};
-use cirrus_ert_loop_core::CandidateTable;
+use cirrus_ert_loop_core::{CandidateTable, predicated_value};
 use rv_asm::{Imm, Inst, Reg};
 
 /// The declared, exhaustive target set of one bounded indirect `JALR`.
@@ -195,13 +195,10 @@ where
         match &self.predicate {
             None => self.handler.storage_write(self.storage, &address, value),
             Some(predicate) => {
-                // `write(old ^ (active & (new ^ old)))`: an inactive
-                // candidate's store is a no-op, keeping folded stack state
-                // sound when sibling bodies run on the shared storage.
+                // An inactive candidate's store is a no-op, keeping folded
+                // stack state sound when sibling bodies share storage.
                 let old = self.handler.storage_read(self.storage, &address)?;
-                let difference = self.handler.bitxor(value, old.clone())?;
-                let gated = self.handler.bitand(predicate.clone(), difference)?;
-                let selected = self.handler.bitxor(old, gated)?;
+                let selected = predicated_value(&mut self.handler, predicate.clone(), value, old)?;
                 self.handler.storage_write(self.storage, &address, selected)
             }
         }
