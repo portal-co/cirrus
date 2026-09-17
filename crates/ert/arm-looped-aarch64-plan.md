@@ -40,9 +40,16 @@
   interpreter's decoded seam, and captures the updated state plus a symbolic
   `B<cond>`/`CBZ`/`CBNZ` boundary or exit. No allocator or hidden
   storage/rstack state is introduced.
-* The remaining Phase 2 adapter work is the multi-candidate scheduler
-  integration: construct activity wires, call `merge_agreement`, fold
-  registers/metadata, and feed successors through `CandidateDriver`.
+* The Thumb adapter now has a `ThumbGenerationDriver` implementing the shared
+  `CandidateDriver<u32>` contract. It computes candidate activity from the
+  virtual IP, executes each body from a caller-owned snapshot, checks concrete
+  agreement, folds register wires, folds the symbolic next virtual IP, and
+  accumulates `done` through the shared predication formula. `run_generation`
+  delegates candidate lifecycle/overflow/deduplication to the shared core.
+* Boundary successor ordering is tested explicitly (taken then fall-through),
+  as is the exit/no-successor case. NZCVQ lazy-flag folding and a full public
+  Thumb loop entry remain the next increments; the current adapter deliberately
+  fails closed rather than fabricating a wire representation for lazy flags.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
