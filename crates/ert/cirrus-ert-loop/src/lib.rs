@@ -64,7 +64,7 @@ use cirrus_ert::{
     machine::{ABI_REGS, Machine, RstackWord, Runtime},
 };
 use cirrus_ert_core::{ComparePredicate, compare_word, select_word};
-use cirrus_ert_loop_core::append_unique;
+use cirrus_ert_loop_core::CandidateTable;
 use rv_asm::{Imm, Inst, Reg};
 
 /// The declared, exhaustive target set of one bounded indirect `JALR`.
@@ -613,8 +613,7 @@ where
     vip: [W; BITS],
     done: W,
     done_const: Option<bool>,
-    candidates: &'a mut [u64],
-    candidate_count: usize,
+    candidates: CandidateTable<'a, u64>,
     indirect: &'a [IndirectTargets<'a>],
     #[cfg(feature = "precompute")]
     program: Option<&'a LoopedProgram>,
@@ -674,7 +673,7 @@ where
             args,
         )
         .map_err(ErtError::Emitted)?;
-        candidates[0] = pc;
+        let candidates = CandidateTable::new(candidates, pc).map_err(|_| ErtError::Unexpected)?;
         Ok(Self {
             runtime,
             mem,
@@ -690,7 +689,6 @@ where
             done: zero,
             done_const: Some(false),
             candidates,
-            candidate_count: 1,
             indirect,
             #[cfg(feature = "precompute")]
             program: None,
@@ -716,7 +714,7 @@ where
 
     /// The candidate table's live count.
     pub fn candidate_count(&self) -> usize {
-        self.candidate_count
+        self.candidates.len()
     }
 
     /// The current register file (wires), for hosts reading state between
@@ -737,11 +735,11 @@ where
     /// control-flow point and the results fold. See the crate-level step
     /// contract.
     pub fn step(&mut self) -> Result<Step, ErtError<E>> {
-        if self.done_const == Some(true) || self.candidate_count == 0 {
+        if self.done_const == Some(true) || self.candidates.len() == 0 {
             return Ok(Step::Done);
         }
-        if self.candidate_count == 1 {
-            let pc = self.candidates[0];
+        if self.candidates.len() == 1 {
+            let pc = self.candidates.current()[0];
             let outcome = execute_body(
                 &mut self.runtime,
                 self.mem,
@@ -769,17 +767,15 @@ where
                     fallthrough,
                 } => {
                     self.vip = next_vip;
-                    self.candidate_count = if taken == fallthrough {
-                        self.candidates[0] = taken;
-                        1
+                    let successors = if taken == fallthrough {
+                        [taken, taken]
                     } else {
-                        if self.candidates.len() < 2 {
-                            return Err(ErtError::Unexpected);
-                        }
-                        self.candidates[0] = taken;
-                        self.candidates[1] = fallthrough;
-                        2
+                        [taken, fallthrough]
                     };
+                    let successor_count = if taken == fallthrough { 1 } else { 2 };
+                    self.candidates
+                        .replace(&successors[..successor_count])
+                        .map_err(|_| ErtError::Unexpected)?;
                     self.done_const = Some(false);
                 }
                 BodyKind::Indirect {
@@ -788,17 +784,15 @@ where
                 } => {
                     self.vip = next_vip;
                     let targets = self.indirect[declaration].targets;
-                    if targets.len() > self.candidates.len() {
-                        return Err(ErtError::Unexpected);
-                    }
-                    self.candidates[..targets.len()].copy_from_slice(targets);
-                    self.candidate_count = targets.len();
+                    self.candidates
+                        .replace(targets)
+                        .map_err(|_| ErtError::Unexpected)?;
                     self.done_const = Some(false);
                 }
                 BodyKind::Exited => {
                     self.done = self.runtime.one.clone();
                     self.done_const = Some(true);
-                    self.candidate_count = 0;
+                    self.candidates.clear();
                     return Ok(Step::Done);
                 }
             }
@@ -815,7 +809,7 @@ where
         let base_sp = self.sp;
         let base_rsp = self.rsp;
         let base_vip = self.vip.clone();
-        let count = self.candidate_count;
+        let count = self.candidates.len();
         let mut next_vip = base_vip.clone();
         let mut next_done = self.done.clone();
         let mut merged_sp: Option<u64> = None;
@@ -826,7 +820,7 @@ where
         let mut new_count = 0usize;
 
         for index in 0..count {
-            let candidate = self.candidates[index];
+            let candidate = self.candidates.current()[index];
             let candidate_word =
                 word_from_constant::<W, BITS>(candidate, &self.runtime.zero, &self.runtime.one);
             let one = self.runtime.one.clone();
@@ -951,8 +945,9 @@ where
         self.vip = next_vip;
         self.done = next_done;
         // Compact the tail-accumulated candidates into the table prefix.
-        self.candidates.copy_within(count..count + new_count, 0);
-        self.candidate_count = new_count;
+        self.candidates
+            .finish_next(new_count)
+            .map_err(|_| ErtError::Unexpected)?;
         self.done_const = if any_exited && !any_continued {
             Some(true)
         } else if !any_exited {
@@ -973,7 +968,11 @@ where
         count: usize,
         candidate: u64,
     ) -> Result<usize, ErtError<E>> {
-        append_unique(&mut self.candidates[base..], count, candidate)
+        if base != self.candidates.len() {
+            return Err(ErtError::Unexpected);
+        }
+        self.candidates
+            .append_next(count, candidate)
             .map_err(|_| ErtError::Unexpected)
     }
 
@@ -987,7 +986,7 @@ where
     ) -> Result<bool, ErtError<E>> {
         for _ in 0..max_steps {
             self.step()?;
-            if self.done_const == Some(true) || self.candidate_count == 0 || is_done(&self.done) {
+            if self.done_const == Some(true) || self.candidates.len() == 0 || is_done(&self.done) {
                 // The host's `is_done` is the done wire faithfully read (the
                 // concrete-context contract); it authorizes `results()`.
                 self.done_const = Some(true);

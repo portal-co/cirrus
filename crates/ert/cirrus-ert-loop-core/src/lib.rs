@@ -57,7 +57,22 @@ impl<'a, T: Copy + Eq> CandidateTable<'a, T> {
         self.len == 0
     }
 
-    /// Begin accumulating the next generation in the table tail.
+    /// Append one candidate to the next generation accumulating in the table
+    /// tail, returning its new size. The current generation remains intact.
+    pub fn append_next(&mut self, next_len: usize, candidate: T) -> Result<usize, TableError> {
+        append_unique(&mut self.entries[self.len..], next_len, candidate)
+    }
+
+    /// Commit `next_len` tail candidates as the next live generation.
+    pub fn finish_next(&mut self, next_len: usize) -> Result<usize, TableError> {
+        if self.len + next_len > self.entries.len() {
+            return Err(TableError::Capacity);
+        }
+        self.entries.copy_within(self.len..self.len + next_len, 0);
+        self.len = next_len;
+        Ok(next_len)
+    }
+
     ///
     /// The returned builder borrows the table until [`NextCandidates::finish`]
     /// commits its deduplicated candidates into the live prefix.
@@ -71,7 +86,11 @@ impl<'a, T: Copy + Eq> CandidateTable<'a, T> {
         })
     }
 
-    /// Replace current candidates directly. Intended for a single-body fast
+    /// Remove every live candidate.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
     /// path whose successor set is already fully known.
     pub fn replace(&mut self, candidates: &[T]) -> Result<(), TableError> {
         if candidates.len() > self.entries.len() {
