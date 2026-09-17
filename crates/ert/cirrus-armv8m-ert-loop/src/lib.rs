@@ -15,8 +15,10 @@ use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
 use cirrus_ert_core::ContextWithErtOps;
 
 mod body;
+mod body_api;
 
 pub use body::{ThumbBoundary, execute_body};
+pub use body_api::execute_snapshot;
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
