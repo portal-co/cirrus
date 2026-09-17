@@ -1,6 +1,31 @@
 # ERT Arm roadmap: Thumb hooks, shared loop driver, and AArch64
 
-**Status: plan for review — no implementation in this document.**
+**Status: Phase 1 complete; Phase 2 shared-driver substrate extracted.**
+
+## Delivery record
+
+### Phase 1 — Armv8-M call hooks — **COMPLETE**
+
+* `ArmCallEvent` / `ArmCallAction` and the defaulted
+  `ArmHandler::call_hook` now cover direct calls, register calls (including
+  unresolved targets), conventional returns, and `BXNS`/`BLXNS`.
+* `ArmDefaultHandler` preserves the new hook tunnel. `ReturnNow` runs before
+  the LR/private-rstack commit; return `ReturnNow` remains fail-closed; all
+  diverted targets are revalidated in their native transfer path.
+* The optional `call-hooks` feature adds the allocator-using
+  `ArmCallRegistry` and register-only `NoOp`/`ReturnConstants` replacements.
+  The synchronous hook remains available in the default no-alloc build.
+
+### Phase 2 — shared driver substrate — **IN PROGRESS**
+
+* `cirrus-ert-loop-core` owns the no-alloc, caller-buffered candidate
+  generation lifecycle (deduplication, capacity failure, tail compaction) and
+  the common predicated-value circuit `old ^ (active & (new ^ old))`.
+* `cirrus-ert-loop` consumes both primitives without behavior changes; its
+  all-feature unit suite and RV64 SHA workload are regression gates.
+* The scheduler still needs its ISA-neutral callback boundary before the Thumb
+  adapter can be implemented. No Thumb machine state is yet exposed to the
+  loop core, deliberately avoiding a premature public universal-machine API.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
@@ -370,11 +395,12 @@ do not make the Thumb adapter depend on `disarm64`.
 
 ## Delivery sequence and commits
 
-1. `[AI] Add Arm call interception to the ERT` — hooks, registry, tests,
-   Thumb documentation; no loop refactor.
-2. `[AI] Extract architecture-neutral ERT loop driver` — move existing
-   RISC-V loop scheduler into core with no behavior change and exhaustive
-   regression/equivalence coverage.
+1. `[AI] Add Arm call interception to the ERT` — **complete** (implemented
+   as focused commits for the hook contract, target validation, registry, and
+   tests); no loop refactor.
+2. `[AI] Extract architecture-neutral ERT loop driver` — **in progress**:
+   allocation-free candidate scheduling and predicated writes now live in
+   `cirrus-ert-loop-core`; complete callback-driven scheduling remains.
 3. `[AI] Add Thumb adapter to the ERT loop driver` — promoted internal seam,
    full Thumb state folding, hooks-at-boundaries, host gate.
 4. `[AI] Add AArch64 ERT facade with disarm64 decoding` — narrow single-pass
