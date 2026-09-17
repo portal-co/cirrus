@@ -20,7 +20,7 @@ mod generation;
 
 pub use body::{ThumbBoundary, execute_body};
 pub use body_api::execute_snapshot;
-pub use generation::ThumbGenerationDriver;
+pub use generation::{ThumbGenerationDriver, run_generation};
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,6 +1,8 @@
 use cirrus_armv8m_ert::{ArmHandler, ErtError, RawMemory};
 use cirrus_ert_core::{ComparePredicate, compare_word};
-use cirrus_ert_loop_core::{CandidateDriver, DriveError, predicated_value};
+use cirrus_ert_loop_core::{
+    CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
+};
 
 use crate::{ThumbBoundary, ThumbSnapshot, execute_snapshot, fold_registers, merge_agreement};
 
@@ -75,6 +77,28 @@ where
             Ok(self.accumulator)
         }
     }
+}
+
+/// Execute one shared candidate generation with the Thumb adapter.
+///
+/// Candidate iteration, successor deduplication, and fixed-capacity overflow
+/// handling are delegated to `cirrus-ert-loop-core`; the returned snapshot is
+/// the adapter's folded state after every body has completed.
+pub fn run_generation<'a, H, W, E, const FRAMES: usize>(
+    table: &mut CandidateTable<'_, u32>,
+    driver: ThumbGenerationDriver<'a, H, W, E, FRAMES>,
+) -> Result<ThumbSnapshot<W, FRAMES>, ErtError<E>>
+where
+    H: ArmHandler<bool, Wrapped = W, Error = E>,
+    W: Clone,
+    E: core::error::Error,
+{
+    let mut driver = driver;
+    drive_generation(table, &mut driver).map_err(|error| match error {
+        DriveError::Driver(error) => error,
+        DriveError::Table(_) => ErtError::Unexpected,
+    })?;
+    driver.finish()
 }
 
 impl<'a, H, W, E, const FRAMES: usize> CandidateDriver<u32>
