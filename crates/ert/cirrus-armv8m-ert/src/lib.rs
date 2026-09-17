@@ -1310,6 +1310,8 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
+    /// Return a concrete condition value when every required NZCV bit is
+    /// known; `None` means the condition is symbolic.
     pub fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
         let n = self.flags[FLAG_N].value;
         let z = self.flags[FLAG_Z].value;
