@@ -64,7 +64,9 @@ use cirrus_ert::{
     machine::{ABI_REGS, Machine, RstackWord, Runtime},
 };
 use cirrus_ert_core::{ComparePredicate, compare_word, select_word};
-use cirrus_ert_loop_core::{CandidateTable, predicated_value};
+use cirrus_ert_loop_core::{
+    CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
+};
 use rv_asm::{Imm, Inst, Reg};
 
 /// The declared, exhaustive target set of one bounded indirect `JALR`.
@@ -582,6 +584,269 @@ where
     }))
 }
 
+/// The RISC-V adapter half of one multi-candidate generation.
+///
+/// Candidate scheduling itself is delegated to `cirrus-ert-loop-core`; this
+/// object retains all ISA-specific snapshots, body execution, metadata
+/// agreement, and symbolic state folding.
+struct RiscvGenerationDriver<'a, 'state, H, W, E, const BITS: usize, R>
+where
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
+    W: Clone,
+    E: core::error::Error,
+    R: RstackWord,
+{
+    runtime: &'state mut LoopedRuntime<'a, H>,
+    mem: RawMemory<'a>,
+    rstack: &'state mut [R],
+    storage_bits: usize,
+    stack_top: u64,
+    indirect: &'a [IndirectTargets<'a>],
+    #[cfg(feature = "precompute")]
+    program: Option<&'a LoopedProgram>,
+    base_regs: [[W; BITS]; 32],
+    base_consts: [Option<u64>; 32],
+    base_offs: [Option<i64>; 32],
+    base_sp: u64,
+    base_rsp: u64,
+    base_vip: [W; BITS],
+    regs: &'state mut [[W; BITS]; 32],
+    reg_consts: &'state mut [Option<u64>; 32],
+    offs: &'state mut [Option<i64>; 32],
+    sp: &'state mut u64,
+    rsp: &'state mut u64,
+    vip: &'state mut [W; BITS],
+    done: &'state mut W,
+    done_const: &'state mut Option<bool>,
+    next_vip: [W; BITS],
+    next_done: W,
+    merged_sp: Option<u64>,
+    merged_rsp: Option<u64>,
+    merged_inflight: Option<([u64; MAX_INFLIGHT], usize)>,
+    any_exited: bool,
+    any_continued: bool,
+}
+
+impl<'a, 'state, H, W, E, const BITS: usize, R> RiscvGenerationDriver<'a, 'state, H, W, E, BITS, R>
+where
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
+    W: Clone,
+    E: core::error::Error,
+    R: RstackWord,
+{
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        runtime: &'state mut LoopedRuntime<'a, H>,
+        mem: RawMemory<'a>,
+        rstack: &'state mut [R],
+        storage_bits: usize,
+        stack_top: u64,
+        indirect: &'a [IndirectTargets<'a>],
+        #[cfg(feature = "precompute")] program: Option<&'a LoopedProgram>,
+        base_regs: [[W; BITS]; 32],
+        base_consts: [Option<u64>; 32],
+        base_offs: [Option<i64>; 32],
+        base_sp: u64,
+        base_rsp: u64,
+        base_vip: [W; BITS],
+        regs: &'state mut [[W; BITS]; 32],
+        reg_consts: &'state mut [Option<u64>; 32],
+        offs: &'state mut [Option<i64>; 32],
+        sp: &'state mut u64,
+        rsp: &'state mut u64,
+        vip: &'state mut [W; BITS],
+        done: &'state mut W,
+        done_const: &'state mut Option<bool>,
+    ) -> Self {
+        let next_vip = base_vip.clone();
+        let next_done = done.clone();
+        Self {
+            runtime,
+            mem,
+            rstack,
+            storage_bits,
+            stack_top,
+            indirect,
+            #[cfg(feature = "precompute")]
+            program,
+            base_regs,
+            base_consts,
+            base_offs,
+            base_sp,
+            base_rsp,
+            base_vip,
+            regs,
+            reg_consts,
+            offs,
+            sp,
+            rsp,
+            vip,
+            done,
+            done_const,
+            next_vip,
+            next_done,
+            merged_sp: None,
+            merged_rsp: None,
+            merged_inflight: None,
+            any_exited: false,
+            any_continued: false,
+        }
+    }
+
+    fn commit(self) -> Result<(), ErtError<E>> {
+        if self.any_continued {
+            *self.sp = self.merged_sp.ok_or(ErtError::Unexpected)?;
+            *self.rsp = self.merged_rsp.ok_or(ErtError::Unexpected)?;
+        }
+        *self.vip = self.next_vip;
+        *self.done = self.next_done;
+        *self.done_const = if self.any_exited && !self.any_continued {
+            Some(true)
+        } else if !self.any_exited {
+            Some(false)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
+impl<'a, 'state, H, W, E, const BITS: usize, R> CandidateDriver<u64>
+    for RiscvGenerationDriver<'a, 'state, H, W, E, BITS, R>
+where
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
+    W: Clone,
+    E: core::error::Error,
+    R: RstackWord,
+{
+    type Error = ErtError<E>;
+
+    fn execute(
+        &mut self,
+        candidate: u64,
+        successors: &mut dyn FnMut(u64) -> Result<(), DriveError<Self::Error>>,
+    ) -> Result<(), DriveError<Self::Error>> {
+        let candidate_word =
+            word_from_constant::<W, BITS>(candidate, &self.runtime.zero, &self.runtime.one);
+        let one = self.runtime.one.clone();
+        let active = compare_word(
+            &mut *self.runtime,
+            &self.base_vip,
+            &candidate_word,
+            ComparePredicate::Eq,
+            &one,
+        )
+        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+
+        let mut body_regs = self.base_regs.clone();
+        let mut body_consts = self.base_consts;
+        let mut body_offs = self.base_offs;
+        let outcome = execute_body(
+            self.runtime,
+            self.mem,
+            self.rstack,
+            self.storage_bits,
+            self.stack_top,
+            self.base_rsp,
+            self.indirect,
+            candidate,
+            &mut body_regs,
+            &mut body_consts,
+            &mut body_offs,
+            self.base_sp,
+            Some(active.clone()),
+            #[cfg(feature = "precompute")]
+            self.program,
+        )
+        .map_err(DriveError::Driver)?;
+
+        for register in 0..32 {
+            self.regs[register] = select_word(
+                &mut *self.runtime,
+                active.clone(),
+                &body_regs[register],
+                &self.regs[register],
+            )
+            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+            if body_consts[register] != self.reg_consts[register] {
+                self.reg_consts[register] = None;
+            }
+            if body_offs[register] != self.offs[register] {
+                self.offs[register] = None;
+            }
+        }
+
+        let body_done = match &outcome.kind {
+            BodyKind::Branch {
+                next_vip,
+                taken,
+                fallthrough,
+            } => {
+                self.next_vip =
+                    select_word(&mut *self.runtime, active.clone(), next_vip, &self.next_vip)
+                        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+                self.any_continued = true;
+                successors(*taken)?;
+                successors(*fallthrough)?;
+                self.runtime.zero.clone()
+            }
+            BodyKind::Indirect {
+                next_vip,
+                declaration,
+            } => {
+                self.next_vip =
+                    select_word(&mut *self.runtime, active.clone(), next_vip, &self.next_vip)
+                        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+                self.any_continued = true;
+                for target in self.indirect[*declaration].targets {
+                    successors(*target)?;
+                }
+                self.runtime.zero.clone()
+            }
+            BodyKind::Exited => {
+                self.any_exited = true;
+                self.runtime.one.clone()
+            }
+        };
+
+        let difference = self
+            .runtime
+            .bitxor(body_done, self.next_done.clone())
+            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+        let gated = self
+            .runtime
+            .bitand(active, difference)
+            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+        self.next_done = self
+            .runtime
+            .bitxor(self.next_done.clone(), gated)
+            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+
+        if !matches!(outcome.kind, BodyKind::Exited) {
+            match self.merged_sp {
+                Some(sp) if sp != outcome.sp => {
+                    return Err(DriveError::Driver(ErtError::Unexpected));
+                }
+                _ => self.merged_sp = Some(outcome.sp),
+            }
+            match self.merged_rsp {
+                Some(rsp) if rsp != outcome.rsp => {
+                    return Err(DriveError::Driver(ErtError::Unexpected));
+                }
+                _ => self.merged_rsp = Some(outcome.rsp),
+            }
+            if let Some(previous) = self.merged_inflight {
+                if previous != outcome.inflight {
+                    return Err(DriveError::Driver(ErtError::Unexpected));
+                }
+            } else {
+                self.merged_inflight = Some(outcome.inflight);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The looped-circuit emulator: an ERT machine plus a virtual IP, a `done`
 /// wire, and a caller-sized candidate table.
 ///
@@ -796,181 +1061,45 @@ where
             return Ok(Step::Continue);
         }
 
-        // Several live candidates: each body runs on a snapshot with its
-        // stack writes predicated, and the register files fold back through
-        // one select per register. The next candidate set accumulates in the
-        // table's tail (`count..`) and is compacted down at the end.
+        // Several live candidates are scheduled by the architecture-neutral
+        // core. This adapter owns the RISC-V body execution and symbolic
+        // state fold; the core owns stable successor collection and commit.
         let base_regs = self.regs.clone();
         let base_consts = self.reg_consts;
         let base_offs = self.offs;
         let base_sp = self.sp;
         let base_rsp = self.rsp;
         let base_vip = self.vip.clone();
-        let count = self.candidates.len();
-        let mut next_vip = base_vip.clone();
-        let mut next_done = self.done.clone();
-        let mut merged_sp: Option<u64> = None;
-        let mut merged_rsp: Option<u64> = None;
-        let mut merged_inflight: Option<([u64; MAX_INFLIGHT], usize)> = None;
-        let mut any_exited = false;
-        let mut any_continued = false;
-        let mut new_count = 0usize;
-
-        for index in 0..count {
-            let candidate = self.candidates.current()[index];
-            let candidate_word =
-                word_from_constant::<W, BITS>(candidate, &self.runtime.zero, &self.runtime.one);
-            let one = self.runtime.one.clone();
-            let active = compare_word(
-                &mut self.runtime,
-                &base_vip,
-                &candidate_word,
-                ComparePredicate::Eq,
-                &one,
-            )
-            .map_err(ErtError::Emitted)?;
-
-            let mut body_regs = base_regs.clone();
-            let mut body_consts = base_consts;
-            let mut body_offs = base_offs;
-            let outcome = execute_body(
-                &mut self.runtime,
-                self.mem,
-                &mut self.rstack[..],
-                self.storage_bits,
-                self.stack_top,
-                base_rsp,
-                self.indirect,
-                candidate,
-                &mut body_regs,
-                &mut body_consts,
-                &mut body_offs,
-                base_sp,
-                Some(active.clone()),
-                #[cfg(feature = "precompute")]
-                self.program,
-            )?;
-
-            // Fold the register file: one select per register.
-            for register in 0..32 {
-                self.regs[register] = select_word(
-                    &mut self.runtime,
-                    active.clone(),
-                    &body_regs[register],
-                    &self.regs[register],
-                )
-                .map_err(ErtError::Emitted)?;
-                if body_consts[register] != self.reg_consts[register] {
-                    self.reg_consts[register] = None;
-                }
-                if body_offs[register] != self.offs[register] {
-                    self.offs[register] = None;
-                }
-            }
-
-            let body_done;
-            match &outcome.kind {
-                BodyKind::Branch {
-                    next_vip: body_vip,
-                    taken,
-                    fallthrough,
-                } => {
-                    body_done = self.runtime.zero.clone();
-                    next_vip = select_word(&mut self.runtime, active.clone(), body_vip, &next_vip)
-                        .map_err(ErtError::Emitted)?;
-                    any_continued = true;
-                    new_count = self.append_candidate(count, new_count, *taken)?;
-                    new_count = self.append_candidate(count, new_count, *fallthrough)?;
-                }
-                BodyKind::Indirect {
-                    next_vip: body_vip,
-                    declaration,
-                } => {
-                    body_done = self.runtime.zero.clone();
-                    next_vip = select_word(&mut self.runtime, active.clone(), body_vip, &next_vip)
-                        .map_err(ErtError::Emitted)?;
-                    any_continued = true;
-                    for target in self.indirect[*declaration].targets {
-                        new_count = self.append_candidate(count, new_count, *target)?;
-                    }
-                }
-                BodyKind::Exited => {
-                    body_done = self.runtime.one.clone();
-                    any_exited = true;
-                }
-            }
-
-            // done' = select(active, body_done, done).
-            let difference = self
-                .runtime
-                .bitxor(body_done, next_done.clone())
-                .map_err(ErtError::Emitted)?;
-            let gated = self
-                .runtime
-                .bitand(active.clone(), difference)
-                .map_err(ErtError::Emitted)?;
-            next_done = self
-                .runtime
-                .bitxor(next_done, gated)
-                .map_err(ErtError::Emitted)?;
-
-            // Concrete stack state must agree across continued bodies;
-            // exited bodies end at the (uniform) stack top and do not fold.
-            if !matches!(outcome.kind, BodyKind::Exited) {
-                match merged_sp {
-                    Some(sp) if sp != outcome.sp => return Err(ErtError::Unexpected),
-                    _ => merged_sp = Some(outcome.sp),
-                }
-                match merged_rsp {
-                    Some(rsp) if rsp != outcome.rsp => return Err(ErtError::Unexpected),
-                    _ => merged_rsp = Some(outcome.rsp),
-                }
-                if let Some(previous) = merged_inflight {
-                    if previous != outcome.inflight {
-                        return Err(ErtError::Unexpected);
-                    }
-                } else {
-                    merged_inflight = Some(outcome.inflight);
-                }
-            }
-        }
-
-        if any_continued {
-            self.sp = merged_sp.ok_or(ErtError::Unexpected)?;
-            self.rsp = merged_rsp.ok_or(ErtError::Unexpected)?;
-        }
-        self.vip = next_vip;
-        self.done = next_done;
-        // Compact the tail-accumulated candidates into the table prefix.
-        self.candidates
-            .finish_next(new_count)
-            .map_err(|_| ErtError::Unexpected)?;
-        self.done_const = if any_exited && !any_continued {
-            Some(true)
-        } else if !any_exited {
-            Some(false)
-        } else {
-            None
-        };
+        let mut driver = RiscvGenerationDriver::new(
+            &mut self.runtime,
+            self.mem,
+            &mut self.rstack[..],
+            self.storage_bits,
+            self.stack_top,
+            self.indirect,
+            #[cfg(feature = "precompute")]
+            self.program,
+            base_regs,
+            base_consts,
+            base_offs,
+            base_sp,
+            base_rsp,
+            base_vip,
+            &mut self.regs,
+            &mut self.reg_consts,
+            &mut self.offs,
+            &mut self.sp,
+            &mut self.rsp,
+            &mut self.vip,
+            &mut self.done,
+            &mut self.done_const,
+        );
+        drive_generation(&mut self.candidates, &mut driver).map_err(|error| match error {
+            DriveError::Driver(error) => error,
+            DriveError::Table(_) => ErtError::Unexpected,
+        })?;
+        driver.commit()?;
         Ok(Step::Continue)
-    }
-
-    /// Append `candidate` to the next-candidate set accumulating in the
-    /// table's tail region (`base + count`), deduplicated. The tail must not
-    /// overlap the live prefix `0..base`, so the table must hold at least
-    /// twice the maximum live count.
-    fn append_candidate(
-        &mut self,
-        base: usize,
-        count: usize,
-        candidate: u64,
-    ) -> Result<usize, ErtError<E>> {
-        if base != self.candidates.len() {
-            return Err(ErtError::Unexpected);
-        }
-        self.candidates
-            .append_next(count, candidate)
-            .map_err(|_| ErtError::Unexpected)
     }
 
     /// Keep stepping until done (structurally or by the caller's wire
