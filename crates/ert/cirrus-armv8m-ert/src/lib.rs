@@ -261,9 +261,6 @@ pub enum SecurityAttribute {
     Secure,
 }
 
-/// An Arm-specific [`Handler`] extension gating `SVC #0` and Secure/Non-secure
-/// state transitions on the interpreter's tracked virtual security state
-/// (see [`SecurityState`]) and a caller-supplied address attribution.
 /// A call or return boundary observed by [`ArmHandler::call_hook`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArmCallEvent {
@@ -2703,7 +2700,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     fn call_register(&mut self, register: u8, len: u32) -> Result<Flow, ErtError<E>> {
         let return_pc = self.pc.wrapping_add(len);
         let known_target = self.constants[register as usize];
-        let target = match self
+        let action = self
             .t
             .call_hook(
                 ArmCallEvent::RegisterCall {
@@ -2718,19 +2715,23 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                 &self.zero,
                 &self.one,
             )
-            .map_err(ErtError::Emitted)?
-        {
-            ArmCallAction::Proceed => known_target.ok_or(ErtError::Unexpected)?,
+            .map_err(ErtError::Emitted)?;
+        let target = match action {
+            ArmCallAction::Proceed => {
+                let target = known_target.ok_or(ErtError::Unexpected)?;
+                if target & 1 == 0 {
+                    return Err(ErtError::Unexpected);
+                }
+                target & !1
+            }
             ArmCallAction::ReturnNow => return self.next(len),
-            ArmCallAction::Divert(target) => target,
+            ArmCallAction::Divert(target) if target & 1 == 0 => target,
+            ArmCallAction::Divert(_) => return Err(ErtError::Unexpected),
         };
-        if target & 1 == 0 {
-            return Err(ErtError::Unexpected);
-        }
         *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
         self.rsp += 1;
         self.write_constant(LR, return_pc | 1);
-        Ok(Flow::Next(target & !1))
+        Ok(Flow::Next(target))
     }
 
     fn branch_register(&mut self, register: u8) -> Result<Flow, ErtError<E>> {
