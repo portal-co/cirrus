@@ -809,18 +809,13 @@ where
             }
         };
 
-        let difference = self
-            .runtime
-            .bitxor(body_done, self.next_done.clone())
-            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
-        let gated = self
-            .runtime
-            .bitand(active, difference)
-            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
-        self.next_done = self
-            .runtime
-            .bitxor(self.next_done.clone(), gated)
-            .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+        self.next_done = predicated_value(
+            &mut *self.runtime,
+            active,
+            body_done,
+            self.next_done.clone(),
+        )
+        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
 
         if !matches!(outcome.kind, BodyKind::Exited) {
             match self.merged_sp {
