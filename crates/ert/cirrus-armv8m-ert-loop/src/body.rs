@@ -32,8 +32,27 @@ impl<W> ThumbBoundary<W> {
     }
 }
 
-///
-/// Concrete branches, calls, returns, and IT-predicated instructions continue
+#[cfg(test)]
+mod tests {
+    use super::ThumbBoundary;
+
+    #[test]
+    fn branch_successors_are_taken_then_fallthrough() {
+        let boundary = ThumbBoundary::Branch {
+            condition: false,
+            taken: 8,
+            fallthrough: 4,
+        };
+        assert_eq!(boundary.successors(), Some([8, 4]));
+    }
+
+    #[test]
+    fn exit_has_no_successors() {
+        let boundary: ThumbBoundary<bool> = ThumbBoundary::Exit;
+        assert_eq!(boundary.successors(), None);
+    }
+}
+
 /// inline exactly through [`Machine::execute_decoded`]. A conditional `B` or
 /// `CBZ`/`CBNZ` whose condition cannot be decided from the machine's concrete
 /// metadata closes the body and returns a symbolic boundary. The machine's
