@@ -25,6 +25,67 @@ where
     context.bitxor(old, gated)
 }
 
+/// An adapter callback invoked once for every candidate in a generation.
+///
+/// The adapter owns ISA state, body execution, and state folding. It calls the
+/// supplied successor sink for every candidate that can be live in the next
+/// generation. The core owns only deterministic successor scheduling and
+/// caller-buffer capacity enforcement.
+pub trait CandidateDriver<T: Copy + Eq> {
+    /// Error reported by the ISA adapter.
+    type Error;
+
+    /// Execute the body rooted at `candidate` and report each successor.
+    ///
+    /// An adapter may report no successor for an exited body. Repeated
+    /// successors are harmless: the core preserves only their first-seen
+    /// occurrence.
+    fn execute(
+        &mut self,
+        candidate: T,
+        successors: &mut dyn FnMut(T) -> Result<(), DriveError<Self::Error>>,
+    ) -> Result<(), DriveError<Self::Error>>;
+}
+
+/// An error from [`drive_generation`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriveError<E> {
+    /// The adapter failed while executing or folding a candidate body.
+    Driver(E),
+    /// The caller-owned candidate table could not represent the next set.
+    Table(TableError),
+}
+
+/// Run one candidate generation through an ISA-owned [`CandidateDriver`].
+///
+/// Current candidates are presented in stable order. Their successors are
+/// accumulated in the table's disjoint tail and committed only after every
+/// callback succeeds; therefore a capacity error never overwrites the current
+/// generation. The driver retains its own ISA snapshot/fold discipline.
+pub fn drive_generation<T, D>(
+    table: &mut CandidateTable<'_, T>,
+    driver: &mut D,
+) -> Result<usize, DriveError<D::Error>>
+where
+    T: Copy + Eq,
+    D: CandidateDriver<T>,
+{
+    let current_len = table.len();
+    let mut next_len = 0;
+    for index in 0..current_len {
+        let candidate = table.current()[index];
+        let mut append = |successor| {
+            next_len = table
+                .append_next(next_len, successor)
+                .map_err(DriveError::Table)?;
+            Ok(())
+        };
+        driver.execute(candidate, &mut append)?;
+    }
+    table.finish_next(next_len).map_err(DriveError::Table)
+}
+
+/// A caller-owned, fixed-capacity set of current and next virtual-IP
 /// candidates.
 ///
 /// The underlying slice must hold both the current generation and the next
@@ -191,7 +252,9 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateTable, TableError, predicated_value};
+    use super::{
+        CandidateDriver, CandidateTable, DriveError, TableError, drive_generation, predicated_value,
+    };
 
     #[test]
     fn next_generation_deduplicates_and_compacts_in_first_seen_order() {
@@ -201,6 +264,31 @@ mod tests {
         next.extend(&[4, 2, 4, 3, 2]).unwrap();
         assert_eq!(next.finish(), 3);
         assert_eq!(table.current(), &[4, 2, 3]);
+    }
+
+    struct Branches;
+
+    impl CandidateDriver<u8> for Branches {
+        type Error = ();
+
+        fn execute(
+            &mut self,
+            candidate: u8,
+            successors: &mut dyn FnMut(u8) -> Result<(), DriveError<Self::Error>>,
+        ) -> Result<(), DriveError<Self::Error>> {
+            successors(candidate + 1)?;
+            successors(candidate + 2)?;
+            successors(candidate + 1)
+        }
+    }
+
+    #[test]
+    fn driver_commits_a_deduplicated_generation_in_candidate_order() {
+        let mut backing = [0; 8];
+        let mut table = CandidateTable::new(&mut backing, 1).unwrap();
+        table.replace(&[1, 2]).unwrap();
+        assert_eq!(drive_generation(&mut table, &mut Branches), Ok(3));
+        assert_eq!(table.current(), &[2, 3, 4]);
     }
 
     #[test]
