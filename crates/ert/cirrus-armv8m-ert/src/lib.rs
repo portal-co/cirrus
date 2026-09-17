@@ -1949,7 +1949,10 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn materialize_flag(&mut self, index: usize) -> Result<W, ErtError<E>> {
+    /// Materialize one lazy NZCVQ flag as a direct wire and retain it in the
+    /// machine state. This is the loop-adapter flag-folding seam.
+    #[doc(hidden)]
+    pub fn materialize_flag(&mut self, index: usize) -> Result<W, ErtError<E>> {
         let wire = self.materialize_wire(self.flags[index].wire.clone())?;
         self.flags[index].wire = FlagWire::Direct(wire.clone());
         Ok(wire)
