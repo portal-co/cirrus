@@ -136,10 +136,9 @@ where
 /// under `active`.
 ///
 /// The caller must first call [`merge_agreement`] for both snapshots. Concrete
-/// constants and stack offsets are intentionally not selected here: a later
-/// full adapter preserves them only when every body agrees. Lazy NZCVQ is
-/// retained in the snapshot for now and will be folded through Arm's own
-/// materialization seam when the body runner is introduced.
+/// Constants and stack offsets survive only where every folded body agrees;
+/// divergent metadata becomes unknown. Lazy NZCVQ is retained in the snapshot
+/// for now and is folded through the Arm materialization seam separately.
 pub fn fold_registers<C, W, const FRAMES: usize>(
     context: &mut C,
     active: W,
@@ -158,6 +157,12 @@ where
                 candidate.regs[register][bit].clone(),
                 accumulator.regs[register][bit].clone(),
             )?;
+        }
+        if candidate.constants[register] != accumulator.constants[register] {
+            accumulator.constants[register] = None;
+        }
+        if candidate.offsets[register] != accumulator.offsets[register] {
+            accumulator.offsets[register] = None;
         }
     }
     Ok(())
