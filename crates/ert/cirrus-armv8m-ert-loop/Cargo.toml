@@ -7,4 +7,5 @@ description = "Thumb-2 state adapter for the shared ERT loop driver"
 [dependencies]
 cirrus-armv8m-ert = { version = "0.1.0", path = "../cirrus-armv8m-ert" }
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
+cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
 cirrus-ert-loop-core = { version = "0.1.0", path = "../cirrus-ert-loop-core" }

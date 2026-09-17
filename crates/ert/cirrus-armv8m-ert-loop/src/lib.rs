@@ -11,8 +11,12 @@
 //! virtual TrustZone state. A later wire-backed register/NZCV fold can only
 //! run after this agreement check has succeeded.
 
-use cirrus_armv8m_ert::{Flag, Machine, StorageRuntime, REG_COUNT, SecurityState};
-use cirrus_core::{ContextWithBitAnd, ContextWithBitXor, HasError};
+use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
+use cirrus_ert_core::ContextWithErtOps;
+
+mod body;
+
+pub use body::{ThumbBoundary, execute_body};
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,7 +120,7 @@ impl<W: Clone, const FRAMES: usize> ThumbSnapshot<W, FRAMES> {
 /// `old ^ (active & (new ^ old))`.
 pub fn select_wire<C, W>(context: &mut C, active: W, value: W, old: W) -> Result<W, C::Error>
 where
-    C: ContextWithBitAnd<bool, Wrapped = W> + ContextWithBitXor<bool, Wrapped = W> + HasError,
+    C: ContextWithErtOps<bool, Wrapped = W>,
     W: Clone,
 {
     let difference = context.bitxor(value, old.clone())?;
@@ -139,7 +143,7 @@ pub fn fold_registers<C, W, const FRAMES: usize>(
     accumulator: &mut ThumbSnapshot<W, FRAMES>,
 ) -> Result<(), C::Error>
 where
-    C: ContextWithBitAnd<bool, Wrapped = W> + ContextWithBitXor<bool, Wrapped = W> + HasError,
+    C: ContextWithErtOps<bool, Wrapped = W>,
     W: Clone,
 {
     for register in 0..REG_COUNT {
