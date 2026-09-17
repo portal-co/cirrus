@@ -1254,29 +1254,38 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         machine
     }
 
+    /// Execute exactly one decoded instruction using the interpreter's normal
+    /// IT-state and predication rules. The returned flow does not mutate `pc`.
+    ///
+    /// This is the loop-adapter seam: an adapter can snapshot state, call this
+    /// method, and then decide whether a control-flow result is a boundary.
+    #[doc(hidden)]
+    pub fn execute_decoded(&mut self, decoded: Decoded) -> Result<Flow, ErtError<E>> {
+        let is_it = matches!(decoded.operation, Op::It { .. });
+        if is_it && self.itstate != 0 {
+            return Err(ErtError::Unexpected);
+        }
+        let flow = if is_it || self.itstate == 0 {
+            self.execute(decoded.operation, decoded.len)?
+        } else if let Some(execute) = self.condition_value((self.itstate >> 4) & 15)? {
+            if execute {
+                self.execute(decoded.operation, decoded.len)?
+            } else {
+                Flow::Next(self.pc.wrapping_add(decoded.len))
+            }
+        } else {
+            self.execute_symbolic_it(decoded.operation, decoded.len)?
+        };
+        if !is_it && self.itstate != 0 {
+            self.advance_it();
+        }
+        Ok(flow)
+    }
+
     fn run(mut self) -> Result<(), ErtError<E>> {
         loop {
             let decoded = self.decode()?;
-            let is_it = matches!(decoded.operation, Op::It { .. });
-            if is_it && self.itstate != 0 {
-                return Err(ErtError::Unexpected);
-            }
-            let flow = if is_it {
-                self.execute(decoded.operation, decoded.len)?
-            } else if self.itstate == 0 {
-                self.execute(decoded.operation, decoded.len)?
-            } else if let Some(execute) = self.condition_value((self.itstate >> 4) & 15)? {
-                if execute {
-                    self.execute(decoded.operation, decoded.len)?
-                } else {
-                    Flow::Next(self.pc.wrapping_add(decoded.len))
-                }
-            } else {
-                self.execute_symbolic_it(decoded.operation, decoded.len)?
-            };
-            if !is_it && self.itstate != 0 {
-                self.advance_it();
-            }
+            let flow = self.execute_decoded(decoded)?;
             match flow {
                 Flow::Next(next) => self.pc = next,
                 Flow::Exit => return Ok(()),
