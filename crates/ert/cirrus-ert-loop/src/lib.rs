@@ -64,6 +64,7 @@ use cirrus_ert::{
     machine::{ABI_REGS, Machine, RstackWord, Runtime},
 };
 use cirrus_ert_core::{ComparePredicate, compare_word, select_word};
+use cirrus_ert_loop_core::append_unique;
 use rv_asm::{Imm, Inst, Reg};
 
 /// The declared, exhaustive target set of one bounded indirect `JALR`.
@@ -972,14 +973,8 @@ where
         count: usize,
         candidate: u64,
     ) -> Result<usize, ErtError<E>> {
-        if self.candidates[base..base + count].contains(&candidate) {
-            return Ok(count);
-        }
-        if base + count >= self.candidates.len() {
-            return Err(ErtError::Unexpected);
-        }
-        self.candidates[base + count] = candidate;
-        Ok(count + 1)
+        append_unique(&mut self.candidates[base..], count, candidate)
+            .map_err(|_| ErtError::Unexpected)
     }
 
     /// Keep stepping until done (structurally or by the caller's wire

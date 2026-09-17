@@ -1,0 +1,7 @@
+[package]
+name = "cirrus-ert-loop-core"
+edition = "2024"
+version.workspace = true
+description = "Allocation-free candidate scheduling substrate for ERT looped executors"
+
+[dependencies]
