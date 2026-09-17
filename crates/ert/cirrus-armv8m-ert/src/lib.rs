@@ -478,7 +478,9 @@ pub type PreparedArmHandler<F, G, A> =
 
 /// Object-safe facade used by the Arm machine while its public caller keeps
 /// the storage type in `ContextWithStorage<bool>`.
-trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
     fn ecall(
         &mut self,
         regs: &mut [[W; 32]],
@@ -919,13 +921,17 @@ fn read_abi_results<W: Clone, E: Error, const M: usize>(
 }
 
 #[derive(Clone, Copy)]
-enum Flow {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Flow {
     Next(u32),
     Exit,
 }
 
 #[derive(Clone, Copy)]
-enum LoadKind {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum LoadKind {
     ByteSigned,
     HalfSigned,
     ByteUnsigned,
@@ -934,7 +940,9 @@ enum LoadKind {
 }
 
 #[derive(Clone, Copy)]
-enum Arithmetic {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Arithmetic {
     Add,
     AddCarry,
     Sub,
@@ -943,7 +951,9 @@ enum Arithmetic {
 }
 
 #[derive(Clone, Copy)]
-enum Operand {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Operand {
     Register(u8),
     Immediate(u32),
     Shifted {
@@ -954,13 +964,17 @@ enum Operand {
 }
 
 #[derive(Clone, Copy)]
-enum ShiftAmount {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum ShiftAmount {
     Immediate(u32),
     Register(u8),
 }
 
 #[derive(Clone, Copy)]
-enum Op {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Op {
     Nop,
     It {
         condition: u8,
@@ -1114,9 +1128,11 @@ enum Op {
 }
 
 #[derive(Clone)]
-struct Flag<W> {
-    wire: FlagWire<W>,
-    value: Option<bool>,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Flag<W> {
+    pub wire: FlagWire<W>,
+    pub value: Option<bool>,
 }
 
 /// A symbolic status bit which is lowered only when an instruction observes it.
@@ -1125,7 +1141,9 @@ struct Flag<W> {
 /// reduction or a small Boolean circuit.  Keeping their inputs here means
 /// ordinary flag-setting data instructions retain their previous gate shape.
 #[derive(Clone)]
-enum FlagWire<W> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum FlagWire<W> {
     Direct(W),
     Zero([W; 32]),
     AddOverflow {
@@ -1155,41 +1173,50 @@ impl<W: Clone> Flag<W> {
     }
 }
 
-const FLAG_N: usize = 0;
-const FLAG_Z: usize = 1;
-const FLAG_C: usize = 2;
-const FLAG_V: usize = 3;
-const FLAG_Q: usize = 4;
+#[doc(hidden)]
+pub const FLAG_N: usize = 0;
+#[doc(hidden)]
+pub const FLAG_Z: usize = 1;
+#[doc(hidden)]
+pub const FLAG_C: usize = 2;
+#[doc(hidden)]
+pub const FLAG_V: usize = 3;
+#[doc(hidden)]
+pub const FLAG_Q: usize = 4;
 
-struct Decoded {
-    operation: Op,
-    len: u32,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Decoded {
+    pub operation: Op,
+    pub len: u32,
 }
 
-struct Machine<'a, W, E> {
-    t: &'a mut (dyn Runtime<W, Error = E> + 'a),
-    mem: RawMemory<'a>,
-    rstack: &'a mut [u32],
-    storage_bits: usize,
-    pc: u32,
-    regs: &'a mut [[W; 32]; REG_COUNT],
-    constants: &'a mut [Option<u32>; REG_COUNT],
-    zero: W,
-    one: W,
-    sp: u32,
-    stack_top: u32,
-    rsp: usize,
-    offsets: [Option<i32>; REG_COUNT],
-    flags: [Flag<W>; 5],
-    itstate: u8,
-    security_state: SecurityState,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Machine<'a, W, E> {
+    pub t: &'a mut (dyn Runtime<W, Error = E> + 'a),
+    pub mem: RawMemory<'a>,
+    pub rstack: &'a mut [u32],
+    pub storage_bits: usize,
+    pub pc: u32,
+    pub regs: &'a mut [[W; 32]; REG_COUNT],
+    pub constants: &'a mut [Option<u32>; REG_COUNT],
+    pub zero: W,
+    pub one: W,
+    pub sp: u32,
+    pub stack_top: u32,
+    pub rsp: usize,
+    pub offsets: [Option<i32>; REG_COUNT],
+    pub flags: [Flag<W>; 5],
+    pub itstate: u8,
+    pub security_state: SecurityState,
     #[cfg(feature = "early-exit-loops")]
-    loop_sites: [Option<early_exit::RecognizedSite>; 8],
+    pub loop_sites: [Option<early_exit::RecognizedSite>; 8],
 }
 
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         t: &'a mut (dyn Runtime<W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
@@ -1257,7 +1284,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn decode(&self) -> Result<Decoded, ErtError<E>> {
+    pub fn decode(&self) -> Result<Decoded, ErtError<E>> {
         let first = u16::from_le_bytes(self.mem.read::<2>(self.pc).ok_or(ErtError::Unexpected)?);
         let wide = first & 0xe000 == 0xe000 && first & 0x1800 != 0;
         if wide {
@@ -1272,7 +1299,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
+    pub fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
         let n = self.flags[FLAG_N].value;
         let z = self.flags[FLAG_Z].value;
         let c = self.flags[FLAG_C].value;
@@ -1280,7 +1307,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         arm_condition_value(n, z, c, v, condition).ok_or(ErtError::Unexpected)
     }
 
-    fn condition_wire(&mut self, condition: u8) -> Result<W, ErtError<E>> {
+    pub fn condition_wire(&mut self, condition: u8) -> Result<W, ErtError<E>> {
         let n = self.materialize_flag(FLAG_N)?;
         let z = self.materialize_flag(FLAG_Z)?;
         let c = self.materialize_flag(FLAG_C)?;
@@ -1290,7 +1317,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             .ok_or(ErtError::Unexpected)
     }
 
-    fn advance_it(&mut self) {
+    pub fn advance_it(&mut self) {
         if self.itstate & 7 == 0 {
             self.itstate = 0;
         } else {
@@ -1298,7 +1325,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn execute_symbolic_it(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+    pub fn execute_symbolic_it(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
         // A symbolic condition may only materialize a value. Multi-instruction
         // IT blocks and every non-register effect would otherwise require
         // symbolic control flow.
@@ -1358,7 +1385,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         self.next(len)
     }
 
-    fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+    pub fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
         if self.security_state == SecurityState::NonSecure
             && !matches!(operation, Op::SecureGateway)
             && self.t.security_attribute(self.pc) != SecurityAttribute::NonSecure
