@@ -29,9 +29,14 @@
   RISC-V path. The adapter owns RISC-V snapshots/body execution/metadata and
   state folding; the core owns only stable successor collection and atomic
   candidate-table commit. All existing loop and RV64 SHA regression gates pass.
-* The next change promotes the minimum private Thumb execution seam; afterward
-  the Thumb adapter can use the identical scheduler without exposing a public
-  universal-machine API.
+* `cirrus-armv8m-ert-loop` now defines the fixed-capacity Thumb boundary
+  snapshot and fail-closed concrete agreement contract. It retains all 16
+  register words/metadata, lazy NZCVQ flags, PC/SP, rstack frames, ITSTATE,
+  and virtual TrustZone state. The Arm facade exposes only doc-hidden decoded
+  execution/state seam types needed to populate it.
+* The next change can implement the adapter's candidate body runner and fold
+  wire-backed registers/NZCVQ after this agreement check; no public
+  universal-machine API is introduced.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
