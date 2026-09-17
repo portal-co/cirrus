@@ -25,10 +25,13 @@
   the core commits successors only after every body has succeeded.
 * `cirrus-ert-loop` consumes both primitives without behavior changes; its
   all-feature unit suite and RV64 SHA workload are regression gates.
-* The RISC-V adapter still executes its generation loop directly while this
-  callback boundary stabilizes. The next change ports that adapter to it;
-  afterward the Thumb adapter can use the identical scheduler without exposing
-  a public universal-machine API.
+* `cirrus-ert-loop` now uses that callback boundary for its multi-candidate
+  RISC-V path. The adapter owns RISC-V snapshots/body execution/metadata and
+  state folding; the core owns only stable successor collection and atomic
+  candidate-table commit. All existing loop and RV64 SHA regression gates pass.
+* The next change promotes the minimum private Thumb execution seam; afterward
+  the Thumb adapter can use the identical scheduler without exposing a public
+  universal-machine API.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
