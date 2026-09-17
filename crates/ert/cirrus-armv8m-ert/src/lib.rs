@@ -1129,6 +1129,30 @@ pub enum Op {
     Svc(u8),
 }
 
+impl Op {
+    /// Return a conditional/unconditional branch's target and condition.
+    #[doc(hidden)]
+    pub fn branch_info(self) -> Option<(u32, Option<u8>)> {
+        match self {
+            Self::Branch { target, condition } => Some((target, condition)),
+            _ => None,
+        }
+    }
+
+    /// Return a compare-and-branch's register, polarity, and target.
+    #[doc(hidden)]
+    pub fn compare_branch_info(self) -> Option<(u8, bool, u32)> {
+        match self {
+            Self::CompareBranch {
+                register,
+                nonzero,
+                target,
+            } => Some((register, nonzero, target)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 #[allow(missing_docs)]
