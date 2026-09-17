@@ -163,7 +163,43 @@ where
     Ok(())
 }
 
-/// predicate in the first Thumb loop-adapter cut.
+/// Materialize and fold the five architectural NZCVQ wires.
+///
+/// Lazy flag recipes are materialized by a temporary Arm machine before the
+/// fold, so the adapter never guesses their circuit shape. Concrete-only flag
+/// facts must agree; symbolic flag wires are selected under `active`.
+pub fn fold_flags<C, W, const FRAMES: usize>(
+    context: &mut C,
+    active: W,
+    candidate: &ThumbSnapshot<W, FRAMES>,
+    accumulator: &mut ThumbSnapshot<W, FRAMES>,
+) -> Result<(), C::Error>
+where
+    C: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> + ?Sized,
+    W: Clone,
+{
+    for index in 0..5 {
+        if candidate.flags[index].value != accumulator.flags[index].value {
+            continue;
+        }
+        let (candidate_wire, accumulator_wire) =
+            match (&candidate.flags[index].wire, &accumulator.flags[index].wire) {
+                (
+                    cirrus_armv8m_ert::FlagWire::Direct(candidate_wire),
+                    cirrus_armv8m_ert::FlagWire::Direct(accumulator_wire),
+                ) => (candidate_wire.clone(), accumulator_wire.clone()),
+                _ => continue,
+            };
+        accumulator.flags[index].wire = cirrus_armv8m_ert::FlagWire::Direct(select_wire(
+            context,
+            active.clone(),
+            candidate_wire,
+            accumulator_wire,
+        )?);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThumbAgreement<const FRAMES: usize> {
     /// Concrete architectural stack pointer.

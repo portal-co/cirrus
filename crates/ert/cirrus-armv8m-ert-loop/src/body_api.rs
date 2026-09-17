@@ -52,6 +52,9 @@ where
     machine.rstack[..snapshot.rsp].copy_from_slice(&snapshot.rstack[..snapshot.rsp]);
 
     let boundary = execute_body(&mut machine)?;
+    for index in 0..5 {
+        machine.materialize_flag(index)?;
+    }
     let updated =
         ThumbSnapshot::capture(&machine).map_err(|ThumbSnapshotError::ReturnStackCapacity| {
             cirrus_armv8m_ert::ErtError::Unexpected

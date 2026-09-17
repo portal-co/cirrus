@@ -4,7 +4,9 @@ use cirrus_ert_loop_core::{
     CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
 };
 
-use crate::{ThumbBoundary, ThumbSnapshot, execute_snapshot, fold_registers, merge_agreement};
+use crate::{
+    ThumbBoundary, ThumbSnapshot, execute_snapshot, fold_flags, fold_registers, merge_agreement,
+};
 
 /// Fixed-capacity Thumb candidate body driver.
 ///
@@ -146,6 +148,13 @@ where
         merge_agreement(&mut self.agreement, updated.agreement())
             .map_err(|_| DriveError::Driver(ErtError::Unexpected))?;
         fold_registers(
+            self.handler,
+            active.clone(),
+            &updated,
+            &mut self.accumulator,
+        )
+        .map_err(|error| DriveError::Driver(ErtError::Emitted(error)))?;
+        fold_flags(
             self.handler,
             active.clone(),
             &updated,
