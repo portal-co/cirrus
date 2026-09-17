@@ -11,7 +11,102 @@
 //! virtual TrustZone state. A later wire-backed register/NZCV fold can only
 //! run after this agreement check has succeeded.
 
-use cirrus_armv8m_ert::SecurityState;
+use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
+
+/// A snapshot could not fit in the caller-provided fixed return-frame array.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThumbSnapshotError {
+    /// The machine's return-stack depth exceeds the fixed snapshot capacity.
+    ReturnStackCapacity,
+}
+
+/// The complete Thumb state that crosses a loop-body boundary.
+///
+/// Register wires and lazy NZCVQ flags remain symbolic values, while the
+/// concrete metadata and virtual-machine fields are retained exactly. The
+/// first loop-adapter implementation will select the wire-backed portions
+/// under candidate activity and require agreement for the fields represented
+/// by [`ThumbAgreement`].
+#[derive(Clone)]
+pub struct ThumbSnapshot<W, const FRAMES: usize> {
+    /// General-purpose register wires, including `r13`'s mirrored SP word.
+    pub regs: [[W; 32]; REG_COUNT],
+    /// Per-register known concrete values.
+    pub constants: [Option<u32>; REG_COUNT],
+    /// Per-register stack-relative offset metadata.
+    pub offsets: [Option<i32>; REG_COUNT],
+    /// Lazy symbolic NZCVQ flags.
+    pub flags: [Flag<W>; 5],
+    /// Normalized even Thumb fetch PC.
+    pub pc: u32,
+    /// Concrete architectural stack pointer.
+    pub sp: u32,
+    /// Entry stack pointer required at an exit boundary.
+    pub stack_top: u32,
+    /// Private return-stack depth.
+    pub rsp: usize,
+    /// Private return addresses through `rsp`.
+    pub rstack: [u32; FRAMES],
+    /// Thumb predication state.
+    pub itstate: u8,
+    /// Virtual TrustZone-M state.
+    pub security_state: SecurityState,
+}
+
+impl<W: Clone, const FRAMES: usize> ThumbSnapshot<W, FRAMES> {
+    /// Capture a machine state using caller-owned fixed return-frame capacity.
+    pub fn capture<E>(machine: &Machine<'_, W, E>) -> Result<Self, ThumbSnapshotError> {
+        if machine.rsp > FRAMES || machine.rsp > machine.rstack.len() {
+            return Err(ThumbSnapshotError::ReturnStackCapacity);
+        }
+        let mut rstack = [const { 0 }; FRAMES];
+        rstack[..machine.rsp].copy_from_slice(&machine.rstack[..machine.rsp]);
+        Ok(Self {
+            regs: machine.regs.clone(),
+            constants: *machine.constants,
+            offsets: machine.offsets,
+            flags: machine.flags.clone(),
+            pc: machine.pc,
+            sp: machine.sp,
+            stack_top: machine.stack_top,
+            rsp: machine.rsp,
+            rstack,
+            itstate: machine.itstate,
+            security_state: machine.security_state,
+        })
+    }
+
+    /// Restore this state into a machine using the same fixed return-frame
+    /// capacity check as [`Self::capture`].
+    pub fn restore<E>(&self, machine: &mut Machine<'_, W, E>) -> Result<(), ThumbSnapshotError> {
+        if self.rsp > FRAMES || self.rsp > machine.rstack.len() {
+            return Err(ThumbSnapshotError::ReturnStackCapacity);
+        }
+        *machine.regs = self.regs.clone();
+        *machine.constants = self.constants;
+        machine.offsets = self.offsets;
+        machine.flags = self.flags.clone();
+        machine.pc = self.pc;
+        machine.sp = self.sp;
+        machine.stack_top = self.stack_top;
+        machine.rsp = self.rsp;
+        machine.rstack[..self.rsp].copy_from_slice(&self.rstack[..self.rsp]);
+        machine.itstate = self.itstate;
+        machine.security_state = self.security_state;
+        Ok(())
+    }
+
+    /// The concrete-only state that must agree before symbolic data folding.
+    pub fn agreement(&self) -> ThumbAgreement<FRAMES> {
+        ThumbAgreement {
+            sp: self.sp,
+            rstack_depth: self.rsp,
+            rstack: self.rstack,
+            itstate: self.itstate,
+            security_state: self.security_state,
+        }
+    }
+}
 
 /// Concrete Arm state which may not be selected by a symbolic candidate
 /// predicate in the first Thumb loop-adapter cut.
