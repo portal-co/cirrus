@@ -191,7 +191,7 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidateTable, TableError};
+    use super::{CandidateTable, TableError, predicated_value};
 
     #[test]
     fn next_generation_deduplicates_and_compacts_in_first_seen_order() {
@@ -201,6 +201,12 @@ mod tests {
         next.extend(&[4, 2, 4, 3, 2]).unwrap();
         assert_eq!(next.finish(), 3);
         assert_eq!(table.current(), &[4, 2, 3]);
+    }
+
+    #[test]
+    fn predication_keeps_an_inactive_value_and_selects_an_active_value() {
+        assert_eq!(predicated_value(&mut (), false, true, false), Ok(false));
+        assert_eq!(predicated_value(&mut (), true, true, false), Ok(true));
     }
 
     #[test]
