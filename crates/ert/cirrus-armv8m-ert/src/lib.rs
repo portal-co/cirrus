@@ -68,10 +68,10 @@ use cirrus_core::{
     HasError, StorageAddressBit,
 };
 use cirrus_ert_core::{
-    add_bits, add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
-    arm_runtime_shift_with_carry, bitwise_word, concrete_product, constant_word, fixed_shift,
-    invert_word, partial_and_not_word, partial_bitwise_word, select_word, subtract_overflow,
-    zero_word, BitOp, Product, Shift,
+    BitOp, Product, Shift, add_bits, add_bits_with_carry_out, add_overflow, arm_condition,
+    arm_condition_value, arm_runtime_shift_with_carry, bitwise_word, concrete_product,
+    constant_word, fixed_shift, invert_word, partial_and_not_word, partial_bitwise_word,
+    select_word, subtract_overflow, zero_word,
 };
 #[cfg(feature = "prepared-recording")]
 use cirrus_recompile_core::{Idx, PreparedRecorder};
@@ -264,6 +264,67 @@ pub enum SecurityAttribute {
 /// An Arm-specific [`Handler`] extension gating `SVC #0` and Secure/Non-secure
 /// state transitions on the interpreter's tracked virtual security state
 /// (see [`SecurityState`]) and a caller-supplied address attribution.
+/// A call or return boundary observed by [`ArmHandler::call_hook`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArmCallEvent {
+    /// A direct Thumb `BL` call.
+    DirectCall {
+        /// Address of the call instruction.
+        caller_pc: u32,
+        /// Normalized (even) fetch address of the callee.
+        target: u32,
+        /// Normalized return fetch address.
+        return_pc: u32,
+    },
+    /// A register call. A symbolic target is represented by `None`.
+    RegisterCall {
+        /// Address of the call instruction.
+        caller_pc: u32,
+        /// Source register containing the target.
+        register: u8,
+        /// Normalized target when concretely known.
+        target: Option<u32>,
+        /// Normalized return fetch address.
+        return_pc: u32,
+    },
+    /// A conventional return through the private return stack.
+    Return {
+        /// Address of the return instruction.
+        from_pc: u32,
+        /// Normalized return target at the top of the private return stack.
+        target: u32,
+    },
+    /// `BXNS` or `BLXNS`, before its virtual-security transition.
+    NonSecureBranch {
+        /// Address of the branch instruction.
+        caller_pc: u32,
+        /// Register containing the raw (low-bit-bearing) target.
+        register: u8,
+        /// Raw target when concretely known.
+        target: Option<u32>,
+        /// Whether this is the linking `BLXNS` form.
+        link: bool,
+        /// Virtual state before the transfer.
+        state_before: SecurityState,
+    },
+}
+
+/// The Arm call hook's decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArmCallAction {
+    /// Execute the transfer normally.
+    Proceed,
+    /// Replace a linking call without entering the callee. The hook has
+    /// already written its result registers; no private return frame is made.
+    ReturnNow,
+    /// Use another concrete target. For ordinary calls/returns it is a
+    /// normalized even Thumb fetch address; for `BXNS`/`BLXNS` it is the raw
+    /// target whose low bit drives the existing security-state transition.
+    Divert(u32),
+}
+
+/// An Arm-specific [`Handler`] extension that gates `SVC #0`, controls
+/// virtual Secure/Non-secure attribution, and may intercept call boundaries.
 pub trait ArmHandler<Val>: Handler<Val> + ContextWithStorage<Val> {
     /// Whether an `SVC #0` reached while the CPU is in `state` may proceed
     /// to [`Handler::ecall`]. Called by the interpreter before dispatch;
@@ -277,6 +338,22 @@ pub trait ArmHandler<Val>: Handler<Val> + ContextWithStorage<Val> {
     /// policy, or supply an entirely synthetic map when there is no real
     /// hardware backing (e.g. a desktop/user-mode test).
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
+
+    /// Observe or replace a call/return transfer. The default preserves the
+    /// historical interpreter exactly: unresolved register transfers remain
+    /// rejected and every ordinary transfer proceeds unchanged.
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<ArmCallAction, Self::Error> {
+        let _ = (event, regs, constants, offsets, zero, one);
+        Ok(ArmCallAction::Proceed)
+    }
 }
 
 /// Tunnels any [`Handler`] through as an [`ArmHandler`], adding both policy
@@ -412,6 +489,16 @@ trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
 
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
 
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[W; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<ArmCallAction, Self::Error>;
+
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, Self::Error>;
 
     fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;
@@ -520,6 +607,19 @@ where
 
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute {
         self.handler.security_attribute(address)
+    }
+
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[W; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<ArmCallAction, E> {
+        self.handler
+            .call_hook(event, regs, constants, offsets, zero, one)
     }
 
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {
@@ -1347,7 +1447,12 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                     } else {
                         (
                             partial_bitwise_word(
-                                self.t, u64::from(constant), symbolic, &self.zero, &self.one, kind,
+                                self.t,
+                                u64::from(constant),
+                                symbolic,
+                                &self.zero,
+                                &self.one,
+                                kind,
                             )
                             .map_err(ErtError::Emitted)?,
                             None,
@@ -1400,8 +1505,14 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         (self.word_from_constant(0), Some(0))
                     } else {
                         (
-                            partial_and_not_word(self.t, u64::from(left), &right_word, &self.zero, &self.one)
-                                .map_err(ErtError::Emitted)?,
+                            partial_and_not_word(
+                                self.t,
+                                u64::from(left),
+                                &right_word,
+                                &self.zero,
+                                &self.one,
+                            )
+                            .map_err(ErtError::Emitted)?,
                             None,
                         )
                     }
@@ -1557,13 +1668,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             Op::ReadApsr { dest } => self.read_apsr(dest, len),
             Op::WriteApsr { source } => self.write_apsr(source, len),
             Op::Call { target } => self.call(target, len),
-            Op::CallRegister { register } => {
-                let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
-                if target & 1 == 0 {
-                    return Err(ErtError::Unexpected);
-                }
-                self.call(target & !1, len)
-            }
+            Op::CallRegister { register } => self.call_register(register, len),
             Op::BranchRegister { register } => self.branch_register(register),
             Op::SecureGateway => self.secure_gateway(len),
             Op::BranchExchangeNonSecure { register, link } => {
@@ -2566,10 +2671,66 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     fn call(&mut self, target: u32, len: u32) -> Result<Flow, ErtError<E>> {
         let return_pc = self.pc.wrapping_add(len);
+        let target = match self
+            .t
+            .call_hook(
+                ArmCallEvent::DirectCall {
+                    caller_pc: self.pc,
+                    target,
+                    return_pc,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => target,
+            ArmCallAction::ReturnNow => return self.next(len),
+            ArmCallAction::Divert(target) => target,
+        };
+        if target & 1 != 0 {
+            return Err(ErtError::Unexpected);
+        }
         *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
         self.rsp += 1;
         self.write_constant(LR, return_pc | 1);
         Ok(Flow::Next(target))
+    }
+
+    fn call_register(&mut self, register: u8, len: u32) -> Result<Flow, ErtError<E>> {
+        let return_pc = self.pc.wrapping_add(len);
+        let known_target = self.constants[register as usize];
+        let target = match self
+            .t
+            .call_hook(
+                ArmCallEvent::RegisterCall {
+                    caller_pc: self.pc,
+                    register,
+                    target: known_target.map(|target| target & !1),
+                    return_pc,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => known_target.ok_or(ErtError::Unexpected)?,
+            ArmCallAction::ReturnNow => return self.next(len),
+            ArmCallAction::Divert(target) => target,
+        };
+        if target & 1 == 0 {
+            return Err(ErtError::Unexpected);
+        }
+        *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
+        self.rsp += 1;
+        self.write_constant(LR, return_pc | 1);
+        Ok(Flow::Next(target & !1))
     }
 
     fn branch_register(&mut self, register: u8) -> Result<Flow, ErtError<E>> {
@@ -2584,8 +2745,33 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     fn return_from_call(&mut self) -> Result<Flow, ErtError<E>> {
-        self.rsp = self.rsp.checked_sub(1).ok_or(ErtError::Unexpected)?;
-        Ok(Flow::Next(self.rstack[self.rsp]))
+        let rsp = self.rsp.checked_sub(1).ok_or(ErtError::Unexpected)?;
+        let target = self.rstack[rsp];
+        match self
+            .t
+            .call_hook(
+                ArmCallEvent::Return {
+                    from_pc: self.pc,
+                    target,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => {
+                self.rsp = rsp;
+                Ok(Flow::Next(target))
+            }
+            ArmCallAction::Divert(target) if target & 1 == 0 => {
+                self.rsp = rsp;
+                Ok(Flow::Next(target))
+            }
+            ArmCallAction::Divert(_) | ArmCallAction::ReturnNow => Err(ErtError::Unexpected),
+        }
     }
 
     fn secure_gateway(&mut self, len: u32) -> Result<Flow, ErtError<E>> {
@@ -2609,7 +2795,30 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         if self.security_state == SecurityState::NonSecure {
             return Err(ErtError::Unexpected);
         }
-        let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
+        let known_target = self.constants[register as usize];
+        let target = match self
+            .t
+            .call_hook(
+                ArmCallEvent::NonSecureBranch {
+                    caller_pc: self.pc,
+                    register,
+                    target: known_target,
+                    link,
+                    state_before: self.security_state,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => known_target.ok_or(ErtError::Unexpected)?,
+            ArmCallAction::Divert(target) => target,
+            ArmCallAction::ReturnNow if link => return self.next(len),
+            ArmCallAction::ReturnNow => return Err(ErtError::Unexpected),
+        };
         if target & 1 == 0 {
             self.security_state = SecurityState::NonSecure;
         }
@@ -3642,11 +3851,7 @@ fn thumb_expand_imm(first: u16, second: u16) -> u32 {
 }
 
 fn nonzero_shift(value: u16) -> u32 {
-    if value == 0 {
-        32
-    } else {
-        value as u32
-    }
+    if value == 0 { 32 } else { value as u32 }
 }
 
 fn sign_extend(value: u32, bits: u32) -> u32 {
