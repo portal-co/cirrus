@@ -1,0 +1,9 @@
+[package]
+name = "cirrus-armv8m-ert-loop"
+edition = "2024"
+version.workspace = true
+description = "Thumb-2 state adapter for the shared ERT loop driver"
+
+[dependencies]
+cirrus-armv8m-ert = { version = "0.1.0", path = "../cirrus-armv8m-ert" }
+cirrus-ert-loop-core = { version = "0.1.0", path = "../cirrus-ert-loop-core" }
