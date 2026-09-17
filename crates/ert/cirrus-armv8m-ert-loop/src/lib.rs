@@ -16,9 +16,11 @@ use cirrus_ert_core::ContextWithErtOps;
 
 mod body;
 mod body_api;
+mod generation;
 
 pub use body::{ThumbBoundary, execute_body};
 pub use body_api::execute_snapshot;
+pub use generation::ThumbGenerationDriver;
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +124,7 @@ impl<W: Clone, const FRAMES: usize> ThumbSnapshot<W, FRAMES> {
 /// `old ^ (active & (new ^ old))`.
 pub fn select_wire<C, W>(context: &mut C, active: W, value: W, old: W) -> Result<W, C::Error>
 where
-    C: ContextWithErtOps<bool, Wrapped = W>,
+    C: ContextWithErtOps<bool, Wrapped = W> + ?Sized,
     W: Clone,
 {
     let difference = context.bitxor(value, old.clone())?;
@@ -145,7 +147,7 @@ pub fn fold_registers<C, W, const FRAMES: usize>(
     accumulator: &mut ThumbSnapshot<W, FRAMES>,
 ) -> Result<(), C::Error>
 where
-    C: ContextWithErtOps<bool, Wrapped = W>,
+    C: ContextWithErtOps<bool, Wrapped = W> + ?Sized,
     W: Clone,
 {
     for register in 0..REG_COUNT {

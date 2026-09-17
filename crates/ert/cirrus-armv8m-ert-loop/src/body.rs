@@ -1,5 +1,6 @@
 use cirrus_armv8m_ert::Machine;
 
+/// The symbolic control-flow boundary reached by one Thumb body.
 #[derive(Clone)]
 pub enum ThumbBoundary<W> {
     /// A conditional branch whose condition is represented by `condition`.
@@ -15,7 +16,22 @@ pub enum ThumbBoundary<W> {
     Exit,
 }
 
-/// Execute one straight-line Thumb body from `machine.pc`.
+impl<W> ThumbBoundary<W> {
+    /// Return the concrete successor fetch addresses in architectural order.
+    ///
+    /// The condition wire is intentionally not inspected here; the caller
+    /// feeds it into its state/virtual-IP mux while retaining this stable
+    /// taken-then-fallthrough ordering.
+    pub fn successors(&self) -> Option<[u32; 2]> {
+        match self {
+            Self::Branch {
+                taken, fallthrough, ..
+            } => Some([*taken, *fallthrough]),
+            Self::Exit => None,
+        }
+    }
+}
+
 ///
 /// Concrete branches, calls, returns, and IT-predicated instructions continue
 /// inline exactly through [`Machine::execute_decoded`]. A conditional `B` or
