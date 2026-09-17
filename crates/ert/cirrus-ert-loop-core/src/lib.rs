@@ -291,6 +291,32 @@ mod tests {
         assert_eq!(table.current(), &[2, 3, 4]);
     }
 
+    struct FailsAfterAppending;
+
+    impl CandidateDriver<u8> for FailsAfterAppending {
+        type Error = &'static str;
+
+        fn execute(
+            &mut self,
+            candidate: u8,
+            successors: &mut dyn FnMut(u8) -> Result<(), DriveError<Self::Error>>,
+        ) -> Result<(), DriveError<Self::Error>> {
+            successors(candidate + 1)?;
+            Err(DriveError::Driver("body failure"))
+        }
+    }
+
+    #[test]
+    fn driver_error_does_not_commit_a_partial_generation() {
+        let mut backing = [0; 4];
+        let mut table = CandidateTable::new(&mut backing, 7).unwrap();
+        assert_eq!(
+            drive_generation(&mut table, &mut FailsAfterAppending),
+            Err(DriveError::Driver("body failure"))
+        );
+        assert_eq!(table.current(), &[7]);
+    }
+
     #[test]
     fn predication_keeps_an_inactive_value_and_selects_an_active_value() {
         assert_eq!(predicated_value(&mut (), false, true, false), Ok(false));
