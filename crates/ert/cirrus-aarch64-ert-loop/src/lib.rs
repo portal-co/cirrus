@@ -128,10 +128,11 @@ pub fn run_generation<C, W>(
     context: &mut C,
     table: &mut CandidateTable<'_, u64>,
     snapshot: &Aarch64Snapshot<W>,
+    virtual_ip: &[W; 64],
     memory: RawMemory<'_>,
     zero: &W,
     one: &W,
-) -> Result<Aarch64Snapshot<W>, DriveError<Aarch64DriveError<C::Error>>>
+) -> Result<(Aarch64Snapshot<W>, [W; 64], W, bool), DriveError<Aarch64DriveError<C::Error>>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
         + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
@@ -146,11 +147,20 @@ where
         memory,
         zero,
         one,
+        virtual_ip: virtual_ip.clone(),
+        next_virtual_ip: virtual_ip.clone(),
+        done: zero.clone(),
+        exited: false,
     };
     drive_generation(table, &mut driver)?;
-    driver
-        .accumulated
-        .ok_or(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+    Ok((
+        driver
+            .accumulated
+            .ok_or(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))?,
+        driver.next_virtual_ip,
+        driver.done,
+        driver.exited,
+    ))
 }
 
 struct Aarch64GenerationDriver<'a, C, W> {
@@ -160,6 +170,10 @@ struct Aarch64GenerationDriver<'a, C, W> {
     memory: RawMemory<'a>,
     zero: &'a W,
     one: &'a W,
+    virtual_ip: [W; 64],
+    next_virtual_ip: [W; 64],
+    done: W,
+    exited: bool,
 }
 
 impl<C, W> CandidateDriver<u64> for Aarch64GenerationDriver<'_, C, W>
@@ -204,16 +218,50 @@ where
                     .ok_or(Aarch64DriveError::SymbolicNextPc)
                     .map_err(DriveError::Driver)?;
                 snapshot.pc = next;
+                let active = cirrus_ert_core::compare_word(
+                    self.context,
+                    &self.virtual_ip,
+                    &word64(candidate, self.zero, self.one),
+                    cirrus_ert_core::ComparePredicate::Eq,
+                    self.one,
+                )
+                .map_err(Aarch64DriveError::Context)
+                .map_err(DriveError::Driver)?;
                 if let Some(accumulated) = &mut self.accumulated {
-                    fold_snapshot(self.context, self.one, &snapshot, accumulated, self.zero)
+                    fold_snapshot(self.context, &active, &snapshot, accumulated, self.zero)
                         .map_err(Aarch64DriveError::Fold)
                         .map_err(DriveError::Driver)?;
                 } else {
                     self.accumulated = Some(snapshot);
                 }
+                for bit in 0..64 {
+                    self.next_virtual_ip[bit] = predicated_value(
+                        self.context,
+                        active.clone(),
+                        next_word[bit].clone(),
+                        self.next_virtual_ip[bit].clone(),
+                    )
+                    .map_err(Aarch64DriveError::Context)
+                    .map_err(DriveError::Driver)?;
+                }
                 successors(next)?;
             }
-            Flow::Exit => {}
+            Flow::Exit => {
+                self.exited = true;
+                let active = cirrus_ert_core::compare_word(
+                    self.context,
+                    &self.virtual_ip,
+                    &word64(candidate, self.zero, self.one),
+                    cirrus_ert_core::ComparePredicate::Eq,
+                    self.one,
+                )
+                .map_err(Aarch64DriveError::Context)
+                .map_err(DriveError::Driver)?;
+                self.done =
+                    predicated_value(self.context, active, self.one.clone(), self.done.clone())
+                        .map_err(Aarch64DriveError::Context)
+                        .map_err(DriveError::Driver)?;
+            }
         }
         Ok(())
     }
@@ -223,6 +271,16 @@ where
 pub trait WireValue {
     /// Return the host-known Boolean value, if this wire is concrete.
     fn concrete(self) -> Option<bool>;
+}
+
+fn word64<W: Clone>(value: u64, zero: &W, one: &W) -> [W; 64] {
+    core::array::from_fn(|bit| {
+        if (value >> bit) & 1 == 0 {
+            zero.clone()
+        } else {
+            one.clone()
+        }
+    })
 }
 
 impl WireValue for bool {
@@ -251,6 +309,8 @@ pub enum Aarch64DriveError<E> {
     /// The facade produced a symbolic next-PC outside a higher-level dispatch
     /// mechanism; the first adapter cut is concrete-control only.
     SymbolicNextPc,
+    /// A Boolean folding/dispatch gate failed.
+    Context(E),
     /// Folding candidate state failed.
     Fold(Aarch64FoldError<E>),
     /// Every candidate in the generation exited; there is no live state to fold.
@@ -299,9 +359,47 @@ mod tests {
         let snapshot = capture(&cirrus_aarch64_ert::initial_state(false), 0);
         let mut entries = [0; 4];
         let mut table = CandidateTable::new(&mut entries, 0).unwrap();
-        let folded = run_generation(&mut (), &mut table, &snapshot, memory, &false, &true).unwrap();
+        let (folded, next_vip, done, exited) = run_generation(
+            &mut (),
+            &mut table,
+            &snapshot,
+            &word64(0, &false, &true),
+            memory,
+            &false,
+            &true,
+        )
+        .unwrap();
         assert_eq!(folded.pc, 4);
+        assert_eq!(next_vip, word64(4, &false, &true));
+        assert!(!done);
+        assert!(!exited);
         assert_eq!(table.current(), &[4]);
+    }
+
+    #[test]
+    fn symbolic_compare_branch_selects_virtual_ip_and_successors() {
+        let bytes = 0xb500_0041u32.to_le_bytes(); // cbnz x1, +8
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.regs[1][0] = true;
+        let snapshot = capture(&state, 0);
+        let mut entries = [0; 8];
+        let mut table = CandidateTable::new(&mut entries, 0).unwrap();
+        let (folded, next_vip, done, exited) = run_generation(
+            &mut (),
+            &mut table,
+            &snapshot,
+            &word64(0, &false, &true),
+            memory,
+            &false,
+            &true,
+        )
+        .unwrap();
+        assert_eq!(folded.pc, 8);
+        assert_eq!(next_vip, word64(8, &false, &true));
+        assert!(!done);
+        assert!(!exited);
+        assert_eq!(table.current(), &[8]);
     }
 
     #[test]
@@ -315,7 +413,15 @@ mod tests {
         let mut entries = [0; 4];
         let mut table = CandidateTable::new(&mut entries, 0).unwrap();
         assert!(matches!(
-            run_generation(&mut (), &mut table, &snapshot, memory, &false, &true),
+            run_generation(
+                &mut (),
+                &mut table,
+                &snapshot,
+                &word64(0, &false, &true),
+                memory,
+                &false,
+                &true,
+            ),
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
         assert!(table.is_empty());
