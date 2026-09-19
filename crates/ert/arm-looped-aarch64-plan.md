@@ -450,9 +450,9 @@ do not make the Thumb adapter depend on `disarm64`.
    `MADD`/`MSUB`/`MUL`. Concrete memory reads now cover PC-relative literal
    loads and unsigned-immediate or signed-unscaled byte/half/word/double
    loads with correct zero/sign extension, plus bounded concrete stores through
-   the new mutable `RawMemory` seam, plus concrete STP pre/post/signed-offset
-   frame forms with SP writeback; load pairs and stack-relative symbolic
-   storage are still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
+   the new mutable `RawMemory` seam, plus concrete LDP/STP pre/post/signed-
+   offset frame forms with SP writeback; stack-relative symbolic storage is
+   still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
    selector pending the hash runtime/handler seam. Remaining work is wider
    multiply forms, pairs and caller-owned storage, the AAPCS64/SVC runtime ABI
    and host fixtures.
