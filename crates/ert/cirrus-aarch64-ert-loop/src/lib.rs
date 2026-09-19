@@ -212,21 +212,21 @@ where
             state,
             pc: candidate,
         };
+        let active = cirrus_ert_core::compare_word(
+            self.context,
+            &self.virtual_ip,
+            &word64(candidate, self.zero, self.one),
+            cirrus_ert_core::ComparePredicate::Eq,
+            self.one,
+        )
+        .map_err(Aarch64DriveError::Context)
+        .map_err(DriveError::Driver)?;
         match flow {
             Flow::Next(next_word) => {
                 let next = Aarch64Snapshot::<W>::concrete_next(&next_word)
                     .ok_or(Aarch64DriveError::SymbolicNextPc)
                     .map_err(DriveError::Driver)?;
                 snapshot.pc = next;
-                let active = cirrus_ert_core::compare_word(
-                    self.context,
-                    &self.virtual_ip,
-                    &word64(candidate, self.zero, self.one),
-                    cirrus_ert_core::ComparePredicate::Eq,
-                    self.one,
-                )
-                .map_err(Aarch64DriveError::Context)
-                .map_err(DriveError::Driver)?;
                 if let Some(accumulated) = &mut self.accumulated {
                     fold_snapshot(self.context, &active, &snapshot, accumulated, self.zero)
                         .map_err(Aarch64DriveError::Fold)
@@ -248,15 +248,6 @@ where
             }
             Flow::Exit => {
                 self.exited = true;
-                let active = cirrus_ert_core::compare_word(
-                    self.context,
-                    &self.virtual_ip,
-                    &word64(candidate, self.zero, self.one),
-                    cirrus_ert_core::ComparePredicate::Eq,
-                    self.one,
-                )
-                .map_err(Aarch64DriveError::Context)
-                .map_err(DriveError::Driver)?;
                 self.done =
                     predicated_value(self.context, active, self.one.clone(), self.done.clone())
                         .map_err(Aarch64DriveError::Context)
@@ -425,6 +416,31 @@ mod tests {
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn exit_done_is_predicated_by_candidate_activity() {
+        let bytes = 0xd400_0001u32.to_le_bytes(); // svc #0
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.constants[0] = Some(u64::MAX);
+        state.regs[0] = core::array::from_fn(|_| true);
+        let snapshot = capture(&state, 0);
+        let mut entries = [0; 4];
+        let mut table = CandidateTable::new(&mut entries, 0).unwrap();
+        let result = run_generation(
+            &mut (),
+            &mut table,
+            &snapshot,
+            &word64(8, &false, &true),
+            memory,
+            &false,
+            &true,
+        );
+        assert!(matches!(
+            result,
+            Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+        ));
     }
 
     #[test]
