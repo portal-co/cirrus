@@ -71,6 +71,19 @@ macro_rules! exit_with {
         }
     };
 }
+#[cfg(target_arch = "aarch64")]
+#[macro_export]
+/// Exit the program through the AArch64 bare-metal ERT `SVC #0` convention.
+macro_rules! exit_with {
+    ($($a:tt)*) => {
+        loop {
+            unsafe {
+                $crate::asm!("svc #0", in("x0") u64::MAX, $($a)*)
+            }
+        }
+    };
+}
+
 #[cfg(target_arch = "arm")]
 #[macro_export]
 /// Exit the program through the Armv8-M ERT `SVC #0` convention.
@@ -83,7 +96,12 @@ macro_rules! exit_with {
         }
     };
 }
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
+#[cfg(not(any(
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "arm",
+    target_arch = "aarch64"
+)))]
 #[macro_export]
 /// Exit the program, with extra register arguments
 macro_rules! exit_with {
