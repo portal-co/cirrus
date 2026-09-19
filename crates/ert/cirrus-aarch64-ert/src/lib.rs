@@ -18,9 +18,9 @@
 
 use cirrus_core::ContextWithValue;
 use cirrus_ert_core::{
-    BitOp, ContextWithErtOps, Shift, add_bits_with_carry_out, add_overflow, arm_condition,
-    arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word, select_word,
-    subtract_overflow, zero_word,
+    BitOp, ContextWithErtOps, Shift, add_bits, add_bits_with_carry_out, add_overflow,
+    arm_condition, arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word,
+    select_word, subtract_overflow, zero_word,
 };
 use disarm64::decoder;
 
@@ -235,6 +235,53 @@ where
                     one,
                 )?;
             }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::MultiplyAdd {
+            dest,
+            left,
+            right,
+            addend,
+            subtract,
+            width64,
+        } => {
+            let product = multiply_low(
+                context,
+                &register_word(state, left, zero),
+                &register_word(state, right, zero),
+                width64,
+                zero,
+            )?;
+            let addend_word = register_word(state, addend, zero);
+            let (result, _) = arithmetic(
+                context,
+                &addend_word,
+                &product,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let result_constant = register_constant(state, left)
+                .zip(register_constant(state, right))
+                .zip(register_constant(state, addend))
+                .map(|((left, right), addend)| {
+                    let product = left.wrapping_mul(right) & mask;
+                    (if subtract {
+                        addend.wrapping_sub(product)
+                    } else {
+                        addend.wrapping_add(product)
+                    }) & mask
+                });
             if dest != 31 {
                 state.regs[dest as usize] = result;
                 state.constants[dest as usize] = result_constant;
@@ -622,6 +669,55 @@ where
     Ok(())
 }
 
+fn multiply_low<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    width64: bool,
+    zero: &W,
+) -> Result<[W; 64], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        multiply_low_word(context, left, right, zero)
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let low = multiply_low_word(context, &left32, &right32, zero)?;
+        Ok(core::array::from_fn(|bit| {
+            if bit < 32 {
+                low[bit].clone()
+            } else {
+                zero.clone()
+            }
+        }))
+    }
+}
+
+fn multiply_low_word<C, W, const N: usize>(
+    context: &mut C,
+    left: &[W; N],
+    right: &[W; N],
+    zero: &W,
+) -> Result<[W; N], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut accumulator: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut addend = left.clone();
+    for bit in 0..N {
+        let candidate = add_bits(context, &accumulator, &addend, zero.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        accumulator = select_word(context, right[bit].clone(), &candidate, &accumulator)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        addend = fixed_shift(&addend, 1, Shift::Left, zero);
+    }
+    Ok(accumulator)
+}
+
 fn register_word<W: Clone>(state: &State<W>, register: u8, zero: &W) -> [W; 64] {
     if register == 31 {
         core::array::from_fn(|_| zero.clone())
@@ -748,6 +844,21 @@ pub enum Instruction {
         subtract: bool,
         /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
         set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `MADD` or `MSUB`, with `MUL` represented by an XZR/WZR addend.
+    MultiplyAdd {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// First multiplier, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Second multiplier, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Addend/minuend, with 31 denoting XZR/WZR.
+        addend: u8,
+        /// Whether this is MSUB rather than MADD.
+        subtract: bool,
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
@@ -894,6 +1005,16 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             immediate,
             subtract: raw & (1 << 30) != 0,
             set_flags,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_8000 == 0x1b00_0000 || raw & 0x7fe0_8000 == 0x1b00_8000 {
+        return Ok(Instruction::MultiplyAdd {
+            dest: (raw & 31) as u8,
+            left: ((raw >> 5) & 31) as u8,
+            addend: ((raw >> 10) & 31) as u8,
+            right: ((raw >> 16) & 31) as u8,
+            subtract: raw & (1 << 15) != 0,
             width64: raw & (1 << 31) != 0,
         });
     }
@@ -1136,6 +1257,54 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn madd_msub_and_mul_aliases_use_low_width_products() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(3);
+        state.regs[2] = word(4);
+        state.regs[3] = word(5);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(4);
+        state.constants[3] = Some(5);
+        assert_eq!(
+            decode(0x1000, 0x9b02_0c20),
+            Ok(Instruction::MultiplyAdd {
+                dest: 0,
+                left: 1,
+                right: 2,
+                addend: 3,
+                subtract: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9b02_0c20, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(17));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9b02_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(12));
+        state.regs[1] = word(0x1_0000_0002);
+        state.constants[1] = Some(0x1_0000_0002);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0x1b02_7c20, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(8));
+        assert_eq!(state.constants[0], Some(8));
+        state.regs[1] = word(3);
+        state.constants[1] = Some(3);
+        assert_eq!(
+            step(&mut (), &mut state, 0x100c, 0x9b02_8c20, &false, &true),
+            Ok(Flow::Next(word(0x1010)))
+        );
+        assert_eq!(state.regs[0], word(u64::MAX - 6));
+        assert_eq!(state.constants[0], Some(u64::MAX - 6));
     }
 
     #[test]
