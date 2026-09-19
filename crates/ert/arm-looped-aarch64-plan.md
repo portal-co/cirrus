@@ -459,9 +459,11 @@ do not make the Thumb adapter depend on `disarm64`.
    target-gated AArch64 `SVC #0` hash/exit ABI, and an
    `aarch64-unknown-none` selftest image now links for the QEMU `virt`
    layout. The host ELF fixture now maps the built image, decodes its
-   supported boot path, and reaches the declared exit. Remaining work is wider
-   multiply forms, stack-relative symbolic storage loads/stores, and the
-   timeout-bounded QEMU runner.
+   supported boot path, and reaches the declared exit. A timeout-bounded QEMU
+   fixture is present but ignored because `virt` remains resident after the
+   bare-metal SVC; it needs a UART/semihosting exit protocol before becoming a
+   gate. Remaining work is wider multiply forms and stack-relative symbolic
+   storage loads/stores.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
