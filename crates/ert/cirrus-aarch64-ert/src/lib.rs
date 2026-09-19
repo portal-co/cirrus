@@ -18,8 +18,8 @@
 
 use cirrus_core::ContextWithValue;
 use cirrus_ert_core::{
-    ContextWithErtOps, add_bits_with_carry_out, add_overflow, arm_condition, constant_word,
-    invert_word, select_word, subtract_overflow, zero_word,
+    ContextWithErtOps, Shift, add_bits_with_carry_out, add_overflow, arm_condition, constant_word,
+    fixed_shift, invert_word, select_word, subtract_overflow, zero_word,
 };
 use disarm64::decoder;
 
@@ -235,6 +235,76 @@ where
             }
             Ok(Flow::Next(constant(next)))
         }
+        Instruction::AddRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            subtract,
+            set_flags,
+            width64,
+        } => {
+            let left_word = state.regs[left as usize].clone();
+            let right_word = if width64 {
+                fixed_shift(&state.regs[right as usize], amount, shift, zero)
+            } else {
+                let right32: [W; 32] =
+                    core::array::from_fn(|bit| state.regs[right as usize][bit].clone());
+                let shifted = fixed_shift(&right32, amount, shift, zero);
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        shifted[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            let (result, carry_out) = arithmetic(
+                context,
+                &left_word,
+                &right_word,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
+            let left_constant = state.constants[left as usize];
+            let right_constant = state.constants[right as usize]
+                .map(|value| shift_constant(value, amount, shift, width64));
+            let result_constant = left_constant.zip(right_constant).map(|(left, right)| {
+                let result = if subtract {
+                    left.wrapping_sub(right)
+                } else {
+                    left.wrapping_add(right)
+                };
+                if width64 {
+                    result
+                } else {
+                    result & u64::from(u32::MAX)
+                }
+            });
+            if set_flags {
+                update_nzcv(
+                    context,
+                    state,
+                    &left_word,
+                    &right_word,
+                    &result,
+                    carry_out,
+                    subtract,
+                    width64,
+                    left_constant,
+                    result_constant,
+                    one,
+                )?;
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
         Instruction::TestBranch {
             register,
             bit,
@@ -420,6 +490,28 @@ where
     Ok(())
 }
 
+fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
+    let mask = if width64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let value = value & mask;
+    match shift {
+        Shift::Left => value.wrapping_shl(amount) & mask,
+        Shift::LogicalRight => value >> amount,
+        Shift::ArithmeticRight => {
+            let signed = if width64 {
+                value as i64
+            } else {
+                i64::from(value as u32 as i32)
+            };
+            (signed >> amount) as u64 & mask
+        }
+        Shift::RotateRight => unreachable!("A64 add/sub shifted register excludes ROR"),
+    }
+}
+
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
@@ -473,6 +565,25 @@ pub enum Instruction {
         source: u8,
         /// Zero-extended immediate after its optional 12-bit shift.
         immediate: u64,
+        /// Whether this is subtraction rather than addition.
+        subtract: bool,
+        /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
+        set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `ADD`/`SUB` shifted register, including flag-setting aliases.
+    AddRegister {
+        /// Destination `Wd`/`Xd`; 31 is accepted for flag-setting aliases.
+        dest: u8,
+        /// Left operand, restricted to 0 through 30.
+        left: u8,
+        /// Right operand before the fixed shift, restricted to 0 through 30.
+        right: u8,
+        /// Fixed right-operand shift.
+        shift: Shift,
+        /// Fixed shift amount.
+        amount: u32,
         /// Whether this is subtraction rather than addition.
         subtract: bool,
         /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
@@ -563,6 +674,33 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             width64: raw & (1 << 31) != 0,
         });
     }
+    if raw & 0x1f20_0000 == 0x0b00_0000 {
+        let dest = (raw & 31) as u8;
+        let left = ((raw >> 5) & 31) as u8;
+        let right = ((raw >> 16) & 31) as u8;
+        let set_flags = raw & (1 << 29) != 0;
+        let width64 = raw & (1 << 31) != 0;
+        let amount = (raw >> 10) & 63;
+        let shift = match (raw >> 22) & 3 {
+            0 => Shift::Left,
+            1 => Shift::LogicalRight,
+            2 => Shift::ArithmeticRight,
+            _ => return Err(DecodeError::Malformed(raw)),
+        };
+        if left == 31 || right == 31 || (dest == 31 && !set_flags) || (!width64 && amount >= 32) {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::AddRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            subtract: raw & (1 << 30) != 0,
+            set_flags,
+            width64,
+        });
+    }
     if raw & 0x7c00_0000 == 0x1400_0000 {
         let target = pc.wrapping_add_signed(sign_extend(raw & 0x03ff_ffff, 26) << 2);
         return Ok(if raw & 0x8000_0000 == 0 {
@@ -638,7 +776,7 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, Flow, Instruction, decode, initial_state, step};
+    use super::{DecodeError, Flow, Instruction, Shift, decode, initial_state, step};
 
     fn word(value: u64) -> [bool; 64] {
         core::array::from_fn(|bit| (value >> bit) & 1 != 0)
@@ -728,6 +866,54 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn shifted_register_arithmetic_handles_shift_and_cmp_aliases() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(3);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            decode(0x1000, 0x8b02_0820),
+            Ok(Instruction::AddRegister {
+                dest: 0,
+                left: 1,
+                right: 2,
+                shift: Shift::Left,
+                amount: 2,
+                subtract: false,
+                set_flags: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x8b02_0820, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(11));
+        assert_eq!(state.constants[0], Some(11));
+        state.regs[1] = word(0);
+        state.regs[2] = word(0x8000_0000);
+        state.constants[1] = Some(0);
+        state.constants[2] = Some(0x8000_0000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x0b82_0420, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(0xc000_0000));
+        assert_eq!(state.constants[0], Some(0xc000_0000));
+        state.regs[1] = word(3);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0xeb02_003f, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.nzcv_constants[1], Some(false));
+        assert_eq!(state.nzcv_constants[2], Some(true));
     }
 
     #[test]
