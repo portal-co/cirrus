@@ -7,7 +7,7 @@
 //! this crate provides boundary snapshots, concrete agreement, and predicated
 //! folding for the shared candidate scheduler.
 
-use cirrus_aarch64_ert::{Flow, RawMemory, State, step};
+use cirrus_aarch64_ert::{DecodeError, Flow, RawMemory, State, step as execute_instruction};
 use cirrus_ert_loop_core::{
     CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
 };
@@ -117,6 +117,76 @@ where
     Ok(())
 }
 
+/// The result of one shared-scheduler AArch64 generation.
+#[derive(Clone)]
+pub struct Aarch64Step<W> {
+    /// Folded architectural state for the next generation.
+    pub snapshot: Aarch64Snapshot<W>,
+    /// Symbolic virtual instruction pointer for the next generation.
+    pub virtual_ip: [W; 64],
+    /// Accumulated symbolic completion wire.
+    pub done: W,
+    /// Whether any represented body exited in this generation.
+    pub exited: bool,
+}
+
+/// Build the initial A64 loop snapshot and virtual-IP word.
+pub fn initial_step<W: Clone>(
+    state: State<W>,
+    entry: u64,
+    zero: &W,
+    one: &W,
+) -> Result<Aarch64Step<W>, DecodeError> {
+    if entry & 3 != 0 {
+        return Err(DecodeError::Malformed(0));
+    }
+    Ok(Aarch64Step {
+        snapshot: capture(&state, entry),
+        virtual_ip: word64(entry, zero, one),
+        done: zero.clone(),
+        exited: false,
+    })
+}
+
+/// Execute one no-alloc AArch64 loop generation through the shared scheduler.
+///
+/// The caller owns the candidate table. A prior `done` wire is carried into
+/// the generation and predicated with exits from active candidate bodies.
+pub fn step<C, W>(
+    context: &mut C,
+    table: &mut CandidateTable<'_, u64>,
+    previous: Aarch64Step<W>,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<Aarch64Step<W>, DriveError<Aarch64DriveError<C::Error>>>
+where
+    C: cirrus_core::ContextWithValue<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitOr<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitXor<bool, Wrapped = W>,
+    W: WireValue + Clone,
+{
+    let (snapshot, virtual_ip, generation_done, exited) = run_generation(
+        context,
+        table,
+        &previous.snapshot,
+        &previous.virtual_ip,
+        memory,
+        zero,
+        one,
+    )?;
+    let done = predicated_value(context, previous.done.clone(), one.clone(), generation_done)
+        .map_err(Aarch64DriveError::Context)
+        .map_err(DriveError::Driver)?;
+    Ok(Aarch64Step {
+        snapshot,
+        virtual_ip,
+        done,
+        exited: exited || previous.exited,
+    })
+}
+
 /// Execute one candidate generation through the shared fixed-capacity
 /// scheduler.
 ///
@@ -198,7 +268,7 @@ where
                 .ok_or(Aarch64DriveError::Memory(candidate))
                 .map_err(DriveError::Driver)?,
         );
-        let flow = step(
+        let flow = execute_instruction(
             self.context,
             &mut state,
             candidate,
@@ -441,6 +511,24 @@ mod tests {
             result,
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
+    }
+
+    #[test]
+    fn public_step_carries_done_and_virtual_ip_across_generations() {
+        let bytes = 0xd400_0001u32.to_le_bytes(); // svc #0
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.constants[0] = Some(u64::MAX);
+        state.regs[0] = core::array::from_fn(|_| true);
+        let initial = initial_step(state, 0, &false, &true).unwrap();
+        let mut entries = [0; 4];
+        let mut table = CandidateTable::new(&mut entries, 0).unwrap();
+        let stepped = step(&mut (), &mut table, initial, memory, &false, &true);
+        assert!(matches!(
+            stepped,
+            Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+        ));
+        assert!(table.is_empty());
     }
 
     #[test]
