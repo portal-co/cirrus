@@ -36,8 +36,10 @@ pub struct State<W> {
     pub regs: [[W; 64]; 31],
     /// Known concrete values for `x0` through `x30`.
     pub constants: [Option<u64>; 31],
-    /// Architectural stack pointer, distinct from x31/XZR.
-    pub sp: u64,
+    /// Architectural stack pointer wires, distinct from x31/XZR.
+    pub sp_word: [W; 64],
+    /// Known architectural stack pointer value.
+    pub sp: Option<u64>,
     /// NZCV flag wires in N, Z, C, V order.
     pub nzcv: [W; 4],
     /// Concrete NZCV facts in N, Z, C, V order, when known.
@@ -62,14 +64,16 @@ pub enum Flow<W> {
 /// at `stack_pointer`. The stack pointer is required to be 16-byte aligned.
 pub fn initial_state_with_arguments<W: Clone>(
     zero: W,
+    one: &W,
     stack_pointer: u64,
     arguments: &[Option<u64>],
 ) -> Result<State<W>, DecodeError> {
     if stack_pointer & 15 != 0 {
         return Err(DecodeError::Malformed(0));
     }
-    let mut state = initial_state(zero);
-    state.sp = stack_pointer;
+    let mut state = initial_state(zero.clone());
+    state.sp_word = constant_word(&zero, one, stack_pointer);
+    state.sp = Some(stack_pointer);
     for (index, value) in arguments.iter().take(8).enumerate() {
         if let Some(value) = value {
             state.constants[index] = Some(*value);
@@ -83,7 +87,8 @@ pub fn initial_state<W: Clone>(zero: W) -> State<W> {
     State {
         regs: core::array::from_fn(|_| core::array::from_fn(|_| zero.clone())),
         constants: [None; 31],
-        sp: 0,
+        sp_word: core::array::from_fn(|_| zero.clone()),
+        sp: None,
         nzcv: core::array::from_fn(|_| zero.clone()),
         nzcv_constants: [Some(false); 4],
         done: zero,
@@ -603,7 +608,7 @@ where
             mode,
         } => {
             let old_base = if base == 31 {
-                Some(state.sp)
+                state.sp
             } else {
                 register_constant(state, base)
             }
@@ -615,7 +620,8 @@ where
             };
             if matches!(mode, PairMode::PreIndex) {
                 if base == 31 {
-                    state.sp = new_base;
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
                 } else {
                     state.regs[base as usize] = constant_word(zero, one, new_base);
                     state.constants[base as usize] = Some(new_base);
@@ -626,7 +632,8 @@ where
             store_value(state, second, second_address, width, memory, raw)?;
             if matches!(mode, PairMode::PostIndex) {
                 if base == 31 {
-                    state.sp = new_base;
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
                 } else {
                     state.regs[base as usize] = constant_word(zero, one, new_base);
                     state.constants[base as usize] = Some(new_base);
@@ -642,7 +649,7 @@ where
             mode,
         } => {
             let old_base = if base == 31 {
-                Some(state.sp)
+                state.sp
             } else {
                 register_constant(state, base)
             }
@@ -654,7 +661,8 @@ where
             };
             if matches!(mode, PairMode::PreIndex) {
                 if base == 31 {
-                    state.sp = new_base;
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
                 } else {
                     state.regs[base as usize] = constant_word(zero, one, new_base);
                     state.constants[base as usize] = Some(new_base);
@@ -673,7 +681,8 @@ where
             )?;
             if matches!(mode, PairMode::PostIndex) {
                 if base == 31 {
-                    state.sp = new_base;
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
                 } else {
                     state.regs[base as usize] = constant_word(zero, one, new_base);
                     state.constants[base as usize] = Some(new_base);
@@ -2067,7 +2076,7 @@ mod tests {
     fn store_pair_updates_frames_and_sp_under_the_indexing_rules() {
         let mut bytes = [0u8; 160];
         let memory = RawMemory::from_mut_slice(&mut bytes);
-        let mut state = initial_state_with_arguments(false, 144, &[Some(1)]).unwrap();
+        let mut state = initial_state_with_arguments(false, &true, 144, &[Some(1)]).unwrap();
         state.constants[1] = Some(1);
         state.constants[5] = Some(0xdead_beef);
         state.constants[30] = Some(0x2000);
@@ -2094,7 +2103,7 @@ mod tests {
             ),
             Ok(Flow::Next(word(0x1004)))
         );
-        assert_eq!(state.sp, 136);
+        assert_eq!(state.sp, Some(136));
         assert_eq!(memory.read64::<8>(136), Some(0xdead_beefu64.to_le_bytes()));
         assert_eq!(memory.read64::<8>(144), Some(1u64.to_le_bytes()));
         state.constants[29] = Some(0x1122_3344_5566_7788);
@@ -2111,7 +2120,7 @@ mod tests {
             ),
             Ok(Flow::Next(word(0x1008)))
         );
-        assert_eq!(state.sp, 120);
+        assert_eq!(state.sp, Some(120));
         assert_eq!(
             memory.read64::<8>(120),
             Some(0x1122_3344_5566_7788u64.to_le_bytes())
@@ -2128,7 +2137,7 @@ mod tests {
         bytes[112..120].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
         bytes[120..128].copy_from_slice(&0x99aa_bbcc_ddee_ff00u64.to_le_bytes());
         let memory = RawMemory::from_mut_slice(&mut bytes);
-        let mut state = initial_state_with_arguments(false, 112, &[]).unwrap();
+        let mut state = initial_state_with_arguments(false, &true, 112, &[]).unwrap();
         assert_eq!(
             decode(0x1000, 0xa8c2_7bfd),
             Ok(Instruction::LoadPair {
@@ -2152,7 +2161,7 @@ mod tests {
             ),
             Ok(Flow::Next(word(0x1004)))
         );
-        assert_eq!(state.sp, 144);
+        assert_eq!(state.sp, Some(144));
         assert_eq!(state.constants[29], Some(0x1122_3344_5566_7788));
         assert_eq!(state.constants[30], Some(0x99aa_bbcc_ddee_ff00));
         assert_eq!(
