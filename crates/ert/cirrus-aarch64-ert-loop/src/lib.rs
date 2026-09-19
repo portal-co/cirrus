@@ -187,6 +187,181 @@ where
     })
 }
 
+/// The boundary reached by an A64 candidate body.
+#[derive(Clone)]
+pub enum Aarch64Boundary<W> {
+    /// The body stopped at a symbolic next-PC word.
+    SymbolicBranch {
+        /// Symbolic selected next-PC word.
+        next: [W; 64],
+        /// Concrete taken target.
+        taken: u64,
+        /// Concrete fallthrough target.
+        fallthrough: u64,
+    },
+    /// The body reached the declared SVC exit.
+    Exit,
+}
+
+/// Detect and resolve a symbolic A64 conditional-branch boundary.
+///
+/// The facade's decoded branch form remains private, so the adapter audits
+/// the same raw CBZ/CBNZ and TBZ/TBNZ masks before executing the instruction.
+fn symbolic_branch_boundary<C, W>(
+    context: &mut C,
+    state: &State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+) -> Result<Option<Aarch64Boundary<W>>, C::Error>
+where
+    C: cirrus_core::ContextWithValue<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitOr<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitXor<bool, Wrapped = W>,
+    W: WireValue + Clone,
+{
+    let fallthrough = pc.wrapping_add(4);
+    if raw & 0x7e00_0000 == 0x3400_0000 {
+        let register = (raw & 31) as usize;
+        let nonzero = raw & (1 << 24) != 0;
+        if register == 31 || state.constants[register].is_some() {
+            return Ok(None);
+        }
+        let mut wire = state.regs[register].clone();
+        let zero_word = word64(0, zero, one);
+        if raw & (1 << 31) == 0 {
+            for bit in 32..64 {
+                wire[bit] = zero.clone();
+            }
+        }
+        let condition = cirrus_ert_core::compare_word(
+            context,
+            &wire,
+            &zero_word,
+            if nonzero {
+                cirrus_ert_core::ComparePredicate::Ne
+            } else {
+                cirrus_ert_core::ComparePredicate::Eq
+            },
+            one,
+        )?;
+        let taken = pc.wrapping_add_signed(cirrus_aarch64_ert::compare_branch_offset(raw));
+        let next = cirrus_ert_core::select_word(
+            context,
+            condition,
+            &word64(taken, zero, one),
+            &word64(fallthrough, zero, one),
+        )?;
+        return Ok(Some(Aarch64Boundary::SymbolicBranch {
+            next,
+            taken,
+            fallthrough,
+        }));
+    }
+    if raw & 0x7e00_0000 == 0x3600_0000 {
+        let register = (raw & 31) as usize;
+        let bit = (((raw >> 31) & 1) << 5 | ((raw >> 19) & 31)) as usize;
+        let tested = if register == 31 {
+            zero.clone()
+        } else {
+            state.regs[register][bit].clone()
+        };
+        if register == 31 || tested.clone().concrete().is_some() {
+            return Ok(None);
+        }
+        let condition = if raw & (1 << 24) != 0 {
+            tested
+        } else {
+            context.bitxor(tested, one.clone())?
+        };
+        let taken = pc.wrapping_add_signed(cirrus_aarch64_ert::test_branch_offset(raw));
+        let next = cirrus_ert_core::select_word(
+            context,
+            condition,
+            &word64(taken, zero, one),
+            &word64(fallthrough, zero, one),
+        )?;
+        return Ok(Some(Aarch64Boundary::SymbolicBranch {
+            next,
+            taken,
+            fallthrough,
+        }));
+    }
+    Ok(None)
+}
+
+/// Execute a straight-line A64 candidate body until a symbolic branch or exit.
+///
+/// The adapter owns the body-runner distinction that the facade intentionally
+/// does not expose: ordinary flow advances to a concrete next PC, while a
+/// symbolic `Flow::Next` word stops the body. The symbolic branch currently
+/// has the A64 conditional shape, so the boundary reports concrete taken and
+/// fallthrough targets in stable order.
+pub fn execute_body<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    entry: u64,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<Aarch64Boundary<W>, Aarch64DriveError<C::Error>>
+where
+    C: cirrus_core::ContextWithValue<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitOr<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitXor<bool, Wrapped = W>,
+    W: WireValue + Clone,
+{
+    let mut pc = entry;
+    loop {
+        let raw = u32::from_le_bytes(
+            memory
+                .read64::<4>(pc)
+                .ok_or(Aarch64DriveError::Memory(pc))?,
+        );
+        if let Some(boundary) = symbolic_branch_boundary(context, state, pc, raw, zero, one)
+            .map_err(Aarch64DriveError::Context)?
+        {
+            return Ok(boundary);
+        }
+        let flow = execute_instruction(context, state, pc, raw, zero, one)
+            .map_err(Aarch64DriveError::Decode)?;
+        match flow {
+            Flow::Next(next_word) => {
+                let Some(next) = Aarch64Snapshot::<W>::concrete_next(&next_word) else {
+                    return Err(Aarch64DriveError::SymbolicNextPc);
+                };
+                pc = next;
+                if raw & 0x7e00_0000 == 0x3600_0000 {
+                    return Ok(Aarch64Boundary::SymbolicBranch {
+                        next: next_word,
+                        taken: pc.wrapping_add_signed(cirrus_aarch64_ert::test_branch_offset(raw)),
+                        fallthrough: pc.wrapping_add(4),
+                    });
+                }
+                if raw & 0x7e00_0000 == 0x3400_0000 {
+                    return Ok(Aarch64Boundary::SymbolicBranch {
+                        next: next_word,
+                        taken: pc
+                            .wrapping_add_signed(cirrus_aarch64_ert::compare_branch_offset(raw)),
+                        fallthrough: pc.wrapping_add(4),
+                    });
+                }
+                if raw & 0x7c00_0000 == 0x1400_0000 {
+                    return Ok(Aarch64Boundary::SymbolicBranch {
+                        next: next_word,
+                        taken: next,
+                        fallthrough: next,
+                    });
+                }
+            }
+            Flow::Exit => return Ok(Aarch64Boundary::Exit),
+        }
+    }
+}
+
 /// Execute one candidate generation through the shared fixed-capacity
 /// scheduler.
 ///
@@ -262,26 +437,15 @@ where
         successors: &mut dyn FnMut(u64) -> Result<(), DriveError<Self::Error>>,
     ) -> Result<(), DriveError<Self::Error>> {
         let mut state = self.initial.state.clone();
-        let raw = u32::from_le_bytes(
-            self.memory
-                .read64::<4>(candidate)
-                .ok_or(Aarch64DriveError::Memory(candidate))
-                .map_err(DriveError::Driver)?,
-        );
-        let flow = execute_instruction(
+        let boundary = execute_body(
             self.context,
             &mut state,
             candidate,
-            raw,
+            self.memory,
             self.zero,
             self.one,
         )
-        .map_err(Aarch64DriveError::Decode)
         .map_err(DriveError::Driver)?;
-        let mut snapshot = Aarch64Snapshot {
-            state,
-            pc: candidate,
-        };
         let active = cirrus_ert_core::compare_word(
             self.context,
             &self.virtual_ip,
@@ -291,12 +455,28 @@ where
         )
         .map_err(Aarch64DriveError::Context)
         .map_err(DriveError::Driver)?;
-        match flow {
-            Flow::Next(next_word) => {
-                let next = Aarch64Snapshot::<W>::concrete_next(&next_word)
-                    .ok_or(Aarch64DriveError::SymbolicNextPc)
-                    .map_err(DriveError::Driver)?;
-                snapshot.pc = next;
+        let snapshot_pc = match &boundary {
+            Aarch64Boundary::SymbolicBranch {
+                taken, fallthrough, ..
+            } => {
+                if taken == fallthrough {
+                    *taken
+                } else {
+                    candidate
+                }
+            }
+            Aarch64Boundary::Exit => candidate,
+        };
+        let snapshot = Aarch64Snapshot {
+            state,
+            pc: snapshot_pc,
+        };
+        match boundary {
+            Aarch64Boundary::SymbolicBranch {
+                next: next_word,
+                taken,
+                fallthrough,
+            } => {
                 if let Some(accumulated) = &mut self.accumulated {
                     fold_snapshot(self.context, &active, &snapshot, accumulated, self.zero)
                         .map_err(Aarch64DriveError::Fold)
@@ -314,9 +494,12 @@ where
                     .map_err(Aarch64DriveError::Context)
                     .map_err(DriveError::Driver)?;
                 }
-                successors(next)?;
+                successors(taken)?;
+                if fallthrough != taken {
+                    successors(fallthrough)?;
+                }
             }
-            Flow::Exit => {
+            Aarch64Boundary::Exit => {
                 self.exited = true;
                 self.done =
                     predicated_value(self.context, active, self.one.clone(), self.done.clone())
@@ -415,7 +598,10 @@ mod tests {
 
     #[test]
     fn generation_runs_concrete_bodies_and_collects_successors() {
-        let bytes = [0x01, 0x00, 0x00, 0x14]; // b +4
+        // b +8; nop; nop (the branch body terminates at the symbolic boundary)
+        let bytes = [
+            0x02, 0x00, 0x00, 0x14, 0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5,
+        ];
         let memory = RawMemory::from_slice(&bytes);
         let snapshot = capture(&cirrus_aarch64_ert::initial_state(false), 0);
         let mut entries = [0; 4];
@@ -430,11 +616,11 @@ mod tests {
             &true,
         )
         .unwrap();
-        assert_eq!(folded.pc, 4);
-        assert_eq!(next_vip, word64(4, &false, &true));
+        assert_eq!(folded.pc, 8);
+        assert_eq!(next_vip, word64(8, &false, &true));
         assert!(!done);
         assert!(!exited);
-        assert_eq!(table.current(), &[4]);
+        assert_eq!(table.current(), &[8]);
     }
 
     #[test]
@@ -456,11 +642,11 @@ mod tests {
             &true,
         )
         .unwrap();
-        assert_eq!(folded.pc, 8);
+        assert_eq!(folded.pc, 0);
         assert_eq!(next_vip, word64(8, &false, &true));
         assert!(!done);
         assert!(!exited);
-        assert_eq!(table.current(), &[8]);
+        assert_eq!(table.current(), &[8, 4]);
     }
 
     #[test]
@@ -486,6 +672,62 @@ mod tests {
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn symbolic_test_branch_advances_through_public_step_generations() {
+        // tbnz x1, #0, +8; movz x0, #0; svc #0; nop; svc #0
+        let code = [
+            0x3728_0041u32,
+            0x5280_0000,
+            0xd400_0001,
+            0xd503_201f,
+            0xd400_0001,
+        ];
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.regs[1][0] = true;
+        let mut initial = initial_step(state, 0, &false, &true).unwrap();
+        initial.snapshot.state.constants[0] = Some(u64::MAX);
+        initial.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        // The plaintext host treats symbolic bit 0 of x1 as true, so the
+        // generation queues candidates 12 and 8; the 12 body exits through the
+        // second SVC, then candidate 8 exits through the first SVC.
+        let mut bytes = [0u8; 20];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut backing = [0u64; 8];
+        let mut candidates = CandidateTable::new(&mut backing, 0).unwrap();
+        let first = step(
+            &mut (),
+            &mut candidates,
+            initial,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+        )
+        .unwrap();
+        assert_eq!(candidates.current(), &[12, 8]);
+        assert_eq!(first.virtual_ip, word64(4, &false, &true));
+        assert!(!first.done);
+        assert!(!first.exited);
+
+        let mut first = first;
+        first.snapshot.state.constants[0] = Some(u64::MAX);
+        first.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        let second = step(
+            &mut (),
+            &mut candidates,
+            first,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+        );
+        assert!(matches!(
+            second,
+            Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+        ));
+        assert!(candidates.is_empty());
     }
 
     #[test]

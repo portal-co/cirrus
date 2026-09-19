@@ -2140,6 +2140,18 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     Err(DecodeError::Unsupported(raw))
 }
 
+/// Return the signed TBZ/TBNZ target offset for the loop adapter.
+#[doc(hidden)]
+pub fn test_branch_offset(raw: u32) -> i64 {
+    sign_extend((raw >> 5) & 0x3fff, 14) << 2
+}
+
+/// Return the signed CBZ/CBNZ target offset for the loop adapter.
+#[doc(hidden)]
+pub fn compare_branch_offset(raw: u32) -> i64 {
+    sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2
+}
+
 fn register_branch(
     raw: u32,
     make: impl FnOnce(u8) -> Instruction,
