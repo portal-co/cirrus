@@ -106,6 +106,52 @@ where
     Ok(())
 }
 
+/// Read AAPCS64 results from a state and caller-owned symbolic storage.
+///
+/// Up to eight eight-byte results come from `x0` through `x7`; any extra
+/// results are read from the same eight-byte stack window used for extra
+/// arguments.
+pub fn read_aapcs64_results<C, W, const M: usize>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &State<W>,
+    zero: &W,
+    one: &W,
+) -> Result<[([W; 64], Option<u64>); M], DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut results: [([W; 64], Option<u64>); M] =
+        core::array::from_fn(|_| (core::array::from_fn(|_| zero.clone()), None));
+    for (index, result) in results.iter_mut().enumerate() {
+        if index < 8 {
+            *result = (state.regs[index].clone(), state.constants[index]);
+            continue;
+        }
+        let stack_pointer = state.sp.ok_or(DecodeError::Unsupported(0))?;
+        let byte_address = stack_pointer.wrapping_add(
+            u64::try_from(index - 8)
+                .ok()
+                .and_then(|n| n.checked_mul(8))
+                .ok_or(DecodeError::Malformed(0))?,
+        );
+        for (bit, slot) in result.0.iter_mut().enumerate() {
+            let bit_index = byte_address
+                .checked_mul(8)
+                .and_then(|index| index.checked_add(bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let address = storage_address(bit_index, zero, one);
+            *slot = context
+                .storage_read(storage, &address)
+                .map_err(|_| DecodeError::Unsupported(0))?;
+        }
+    }
+    Ok(results)
+}
+
 fn storage_address<W: Clone>(address: u64, zero: &W, one: &W) -> [StorageAddressBit<W>; 64] {
     core::array::from_fn(|bit| {
         let known = (address >> bit) & 1 != 0;
@@ -1746,7 +1792,8 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 mod tests {
     use super::{
         BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
-        initial_state_with_arguments, step, step_with_memory, write_aapcs64_arguments,
+        initial_state_with_arguments, read_aapcs64_results, step, step_with_memory,
+        write_aapcs64_arguments,
     };
 
     use cirrus_core::{ContextWithStorage, ContextWithValue, HasError, StorageAddressBit};
@@ -2334,6 +2381,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.constants[7], Some(7));
+        let results: [([bool; 64], Option<u64>); 10] =
+            read_aapcs64_results(&mut context, &mut storage, &state, &false, &true).unwrap();
+        assert_eq!(results[7].0, word(7));
+        assert_eq!(results[7].1, Some(7));
+        assert_eq!(results[8].0, word(8));
+        assert_eq!(results[8].1, None);
+        assert_eq!(results[9].0, word(9));
         for (index, value) in [8u64, 9].iter().enumerate() {
             let slot = u64::from_le_bytes(core::array::from_fn(|byte| {
                 (0..8).fold(0u8, |value_bits, bit| {
