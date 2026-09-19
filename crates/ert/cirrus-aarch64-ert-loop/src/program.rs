@@ -163,16 +163,27 @@ mod tests {
 
     #[test]
     fn compile_walks_branches_and_declared_returns() {
-        // nop; svc #0 (entry at nop)
-        let code = [0xd503_201fu32, 0xd400_0001];
-        let mut bytes = [0u8; 8];
+        // b.ne +12; nop; svc #0; ret; svc #0
+        let code = [
+            0x5400_0061u32,
+            0xd503_201f,
+            0xd400_0001,
+            0xd65f_03c0,
+            0xd400_0001,
+        ];
+        let mut bytes = [0u8; 20];
         for (index, word) in code.into_iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let memory = RawMemory::from_slice(&bytes);
-        let program = Aarch64LoopedProgram::compile(&memory, 0, &[], &[], 8).unwrap();
-        assert!(program.boundaries().is_empty());
-        assert!(program.return_sites().is_empty());
+        let return_targets = [8u64];
+        let returns = [Aarch64ReturnTargets {
+            pc: 12,
+            targets: &return_targets,
+        }];
+        let program = Aarch64LoopedProgram::compile(&memory, 0, &[], &returns, 8).unwrap();
+        assert_eq!(program.boundaries().get(&0), Some(&(12, 4)));
+        assert_eq!(program.return_sites(), &[12]);
         assert!(program.indirect_sites().is_empty());
     }
 
@@ -184,5 +195,20 @@ mod tests {
                 .unwrap_err(),
             DecodeError::Unsupported(0xd61f_0020)
         );
+    }
+
+    #[test]
+    fn compile_walks_cbz_and_tbz_boundaries() {
+        // cbnz x1, +8; nop; svc #0; svc #0
+        let code = [0xb500_0041u32, 0xd503_201f, 0xd400_0001, 0xd400_0001];
+        let mut bytes = [0u8; 16];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let memory = RawMemory::from_slice(&bytes);
+        let program = Aarch64LoopedProgram::compile(&memory, 0, &[], &[], 8).unwrap();
+        assert_eq!(program.boundaries().get(&0), Some(&(8, 4)));
+        assert!(program.return_sites().is_empty());
+        assert!(program.indirect_sites().is_empty());
     }
 }
