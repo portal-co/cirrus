@@ -160,6 +160,7 @@ pub fn step<C, W>(
     zero: &W,
     one: &W,
     indirect: &[Aarch64IndirectTargets<'_>],
+    returns: &[Aarch64ReturnTargets<'_>],
 ) -> Result<Aarch64Step<W>, DriveError<Aarch64DriveError<C::Error>>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -177,6 +178,7 @@ where
         zero,
         one,
         indirect,
+        returns,
     )?;
     let done = predicated_value(context, previous.done.clone(), one.clone(), generation_done)
         .map_err(Aarch64DriveError::Context)
@@ -212,6 +214,19 @@ pub enum Aarch64Boundary<W> {
     },
     /// The body reached the declared SVC exit.
     Exit,
+}
+
+/// The declared exhaustive target set of one bounded symbolic `RET`.
+///
+/// A return target is normally concrete in x30; this declaration permits the
+/// loop adapter to support a symbolic x30 without adding a return stack. It
+/// must enumerate every reachable return target.
+#[derive(Clone, Copy, Debug)]
+pub struct Aarch64ReturnTargets<'a> {
+    /// The `RET` instruction address.
+    pub pc: u64,
+    /// Every concrete target the return may resolve to.
+    pub targets: &'a [u64],
 }
 
 /// The declared exhaustive target set of one bounded indirect A64 branch.
@@ -363,6 +378,7 @@ pub fn execute_body<C, W>(
     zero: &W,
     one: &W,
     indirect: &[Aarch64IndirectTargets<'_>],
+    returns: &[Aarch64ReturnTargets<'_>],
 ) -> Result<Aarch64Boundary<W>, Aarch64DriveError<C::Error>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -382,6 +398,38 @@ where
             .map_err(Aarch64DriveError::Context)?
         {
             return Ok(boundary);
+        }
+        if raw == 0xd65f_03c0 && state.constants[30].is_none() {
+            let Some(declaration) = returns.iter().position(|site| site.pc == pc) else {
+                return Err(Aarch64DriveError::Decode(
+                    cirrus_aarch64_ert::DecodeError::Unsupported(raw),
+                ));
+            };
+            let targets = returns[declaration].targets;
+            if targets.is_empty() || targets.len() > 8 {
+                return Err(Aarch64DriveError::SymbolicNextPc);
+            }
+            let mut next = word64(targets[targets.len() - 1], zero, one);
+            for target in targets[..targets.len() - 1].iter().rev() {
+                let target_word = word64(*target, zero, one);
+                let active = cirrus_ert_core::compare_word(
+                    context,
+                    &state.regs[30],
+                    &target_word,
+                    cirrus_ert_core::ComparePredicate::Eq,
+                    one,
+                )
+                .map_err(Aarch64DriveError::Context)?;
+                next = cirrus_ert_core::select_word(context, active, &target_word, &next)
+                    .map_err(Aarch64DriveError::Context)?;
+            }
+            let mut fixed = [0; 8];
+            fixed[..targets.len()].copy_from_slice(targets);
+            return Ok(Aarch64Boundary::IndirectBranch {
+                next,
+                targets: fixed,
+                len: targets.len(),
+            });
         }
         if raw & 0xffff_fc1f == 0xd61f_0000 || raw & 0xffff_fc1f == 0xd63f_0000 {
             let register = ((raw >> 5) & 31) as usize;
@@ -474,6 +522,7 @@ pub fn run_generation<C, W>(
     zero: &W,
     one: &W,
     indirect: &[Aarch64IndirectTargets<'_>],
+    returns: &[Aarch64ReturnTargets<'_>],
 ) -> Result<(Aarch64Snapshot<W>, [W; 64], W, bool), DriveError<Aarch64DriveError<C::Error>>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -490,6 +539,7 @@ where
         zero,
         one,
         indirect,
+        returns,
         virtual_ip: virtual_ip.clone(),
         next_virtual_ip: virtual_ip.clone(),
         done: zero.clone(),
@@ -514,6 +564,7 @@ struct Aarch64GenerationDriver<'a, C, W> {
     zero: &'a W,
     one: &'a W,
     indirect: &'a [Aarch64IndirectTargets<'a>],
+    returns: &'a [Aarch64ReturnTargets<'a>],
     virtual_ip: [W; 64],
     next_virtual_ip: [W; 64],
     done: W,
@@ -544,6 +595,7 @@ where
             self.zero,
             self.one,
             self.indirect,
+            self.returns,
         )
         .map_err(DriveError::Driver)?;
         let active = cirrus_ert_core::compare_word(
@@ -741,6 +793,7 @@ mod tests {
             &false,
             &true,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(folded.pc, 8);
@@ -767,6 +820,7 @@ mod tests {
             memory,
             &false,
             &true,
+            &[],
             &[],
         )
         .unwrap();
@@ -796,6 +850,7 @@ mod tests {
                 memory,
                 &false,
                 &true,
+                &[],
                 &[],
             ),
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
@@ -833,6 +888,7 @@ mod tests {
             &false,
             &true,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[8, 4]);
@@ -850,6 +906,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
             &[],
         )
         .unwrap();
@@ -890,6 +947,7 @@ mod tests {
             &false,
             &true,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[12, 8]);
@@ -907,6 +965,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
             &[],
         );
         assert!(matches!(
@@ -935,6 +994,7 @@ mod tests {
             &false,
             &true,
             &[],
+            &[],
         );
         assert!(matches!(
             result,
@@ -952,7 +1012,16 @@ mod tests {
         let initial = initial_step(state, 0, &false, &true).unwrap();
         let mut entries = [0; 4];
         let mut table = CandidateTable::new(&mut entries, 0).unwrap();
-        let stepped = step(&mut (), &mut table, initial, memory, &false, &true, &[]);
+        let stepped = step(
+            &mut (),
+            &mut table,
+            initial,
+            memory,
+            &false,
+            &true,
+            &[],
+            &[],
+        );
         assert!(matches!(
             stepped,
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
@@ -994,6 +1063,7 @@ mod tests {
             &false,
             &true,
             &indirect,
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[4, 12]);
@@ -1012,6 +1082,7 @@ mod tests {
             &false,
             &true,
             &indirect,
+            &[],
         );
         assert!(matches!(
             second,
@@ -1020,6 +1091,68 @@ mod tests {
             )))
         ));
         assert_eq!(candidates.current(), &[4, 12]);
+    }
+
+    #[test]
+    fn declared_symbolic_return_muxes_targets_through_public_step() {
+        // ret; nop; svc #0; nop; svc #0
+        let code = [
+            0xd65f_03c0u32,
+            0xd503_201f,
+            0xd400_0001,
+            0xd503_201f,
+            0xd400_0001,
+        ];
+        let mut bytes = [0u8; 20];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.regs[30][0] = true;
+        state.constants[0] = Some(u64::MAX);
+        state.regs[0] = core::array::from_fn(|_| true);
+        let initial = initial_step(state, 0, &false, &true).unwrap();
+        let return_targets = [4u64, 12u64];
+        let returns = [Aarch64ReturnTargets {
+            pc: 0,
+            targets: &return_targets,
+        }];
+        let mut backing = [0u64; 8];
+        let mut candidates = CandidateTable::new(&mut backing, 0).unwrap();
+        let first = step(
+            &mut (),
+            &mut candidates,
+            initial,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+            &[],
+            &returns,
+        )
+        .unwrap();
+        assert_eq!(candidates.current(), &[4, 12]);
+        assert_eq!(first.virtual_ip, word64(12, &false, &true));
+        assert!(!first.done);
+        assert!(!first.exited);
+
+        let mut first = first;
+        first.snapshot.state.constants[0] = Some(u64::MAX);
+        first.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        let second = step(
+            &mut (),
+            &mut candidates,
+            first,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+            &[],
+            &returns,
+        );
+        assert!(matches!(
+            second,
+            Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+        ));
+        assert!(candidates.is_empty());
     }
 
     #[test]
