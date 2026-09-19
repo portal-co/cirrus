@@ -467,10 +467,11 @@ do not make the Thumb adapter depend on `disarm64`.
    owned symbolic bits through `ContextWithStorage`; remaining work is broader
    fixture coverage and a deterministic guest exit protocol.
 5. `[AI] Add AArch64 looped ERT adapter` — **in progress**: the new
-   `cirrus-aarch64-ert-loop` crate has fixed-capacity boundary snapshots and
-   predicated GPR/SP/NZCV/done folding with concrete-SP divergence rejection.
-   Remaining work is candidate body execution, shared scheduler integration,
-   recording/precompute and equivalence tests.
+   `cirrus-aarch64-ert-loop` crate has fixed-capacity boundary snapshots,
+   predicated GPR/SP/NZCV/done folding with concrete-SP divergence rejection,
+   and shared-scheduler candidate body execution for concrete control flow.
+   Remaining work is virtual-IP/symbolic boundary integration, recording/
+   precompute and equivalence tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
    boot/exit protocol is deterministic.
 
