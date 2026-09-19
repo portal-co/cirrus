@@ -672,17 +672,37 @@ where
         | Instruction::LoadExtend { .. }
         | Instruction::Store { .. }
         | Instruction::StoreUnscaled { .. } => Err(DecodeError::Unsupported(raw)),
-        Instruction::SupervisorCall => {
-            // The façade is bare-metal, not a Linux syscall emulator. Hash
-            // service selectors need the runtime/handler seam; until that is
-            // installed, accept only the declared all-ones exit selector.
-            if state.constants[0] != Some(u64::MAX) {
-                return Err(DecodeError::Unsupported(raw));
-            }
-            state.done = one.clone();
-            Ok(Flow::Exit)
-        }
+        Instruction::SupervisorCall => supervisor_call(state, raw, one),
     }
+}
+
+/// Execute an audited literal load, or delegate a non-memory form to [`step`].
+///
+/// Literal loads have a PC-derived concrete address and therefore need no
+/// symbolic storage interface. Other load/store addressing modes remain
+/// rejected until the caller-owned storage seam is introduced.
+/// Execute one instruction with the bare-metal `SVC #0` hash callback.
+///
+/// Selector `x0 = 0` passes the four 64-bit words in `x1` through `x4` to
+/// `hash`, then writes its 32-byte result back over those registers. All-ones
+/// `x0` exits. Other selectors fail closed.
+pub fn step_with_hash<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+    hash: &mut impl FnMut(&mut C, &[[W; 64]]) -> Result<[u8; 32], C::Error>,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    if !matches!(decode(pc, raw)?, Instruction::SupervisorCall) {
+        return step(context, state, pc, raw, zero, one);
+    }
+    supervisor_call_with_hash(context, state, raw, zero, one, hash)
 }
 
 /// Execute an audited literal load, or delegate a non-memory form to [`step`].
@@ -910,6 +930,48 @@ fn store_value<W>(
         _ => return Err(DecodeError::Unsupported(0)),
     }
     .ok_or(DecodeError::Memory(target))
+}
+
+fn supervisor_call<W: Clone>(
+    state: &mut State<W>,
+    raw: u32,
+    one: &W,
+) -> Result<Flow<W>, DecodeError> {
+    match state.constants[0] {
+        Some(u64::MAX) => {
+            state.done = one.clone();
+            Ok(Flow::Exit)
+        }
+        _ => Err(DecodeError::Unsupported(raw)),
+    }
+}
+
+fn supervisor_call_with_hash<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    raw: u32,
+    zero: &W,
+    one: &W,
+    hash: &mut impl FnMut(&mut C, &[[W; 64]]) -> Result<[u8; 32], C::Error>,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    match state.constants[0] {
+        Some(u64::MAX) => supervisor_call(state, raw, one),
+        Some(0) => {
+            let digest =
+                hash(context, &state.regs[1..5]).map_err(|_| DecodeError::Unsupported(raw))?;
+            for (register, chunk) in digest.chunks_exact(8).enumerate() {
+                let value = u64::from_le_bytes(chunk.try_into().expect("eight-byte digest chunk"));
+                state.regs[register + 1] = constant_word(zero, one, value);
+                state.constants[register + 1] = Some(value);
+            }
+            Ok(Flow::Next(constant_word(zero, one, 0)))
+        }
+        _ => Err(DecodeError::Unsupported(raw)),
+    }
 }
 
 fn arithmetic<C, W>(
@@ -1792,7 +1854,7 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 mod tests {
     use super::{
         BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
-        initial_state_with_arguments, read_aapcs64_results, step, step_with_memory,
+        initial_state_with_arguments, read_aapcs64_results, step, step_with_hash, step_with_memory,
         write_aapcs64_arguments,
     };
 
@@ -2412,6 +2474,53 @@ mod tests {
             Ok(Flow::Exit)
         );
         assert!(state.done);
+    }
+
+    #[test]
+    fn svc_hash_rewrites_x1_through_x4_and_rejects_unknown_selectors() {
+        let mut state = initial_state(false);
+        for (register, value) in state.regs[1..5].iter_mut().enumerate() {
+            *value = word((register as u64 + 1) << 56);
+            state.constants[register + 1] = Some((register as u64 + 1) << 56);
+        }
+        state.constants[0] = Some(0);
+        let mut calls = 0u32;
+        let digest = core::array::from_fn::<_, 32, _>(|index| 0xa5u8 ^ index as u8);
+        assert_eq!(
+            step_with_hash(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xd400_0001,
+                &false,
+                &true,
+                &mut |_, _| {
+                    calls += 1;
+                    Ok(digest)
+                }
+            ),
+            Ok(Flow::Next(word(0)))
+        );
+        assert_eq!(calls, 1);
+        for register in 1..5 {
+            let value = u64::from_le_bytes(core::array::from_fn(|index| {
+                digest[(register - 1) * 8 + index]
+            }));
+            assert_eq!(state.constants[register], Some(value));
+        }
+        state.constants[0] = Some(1);
+        assert_eq!(
+            step_with_hash(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xd400_0001,
+                &false,
+                &true,
+                &mut |_, _| { Ok([0; 32]) }
+            ),
+            Err(DecodeError::Unsupported(0xd400_0001))
+        );
     }
 
     #[test]
