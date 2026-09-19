@@ -500,3 +500,8 @@ do not make the Thumb adapter depend on `disarm64`.
 * **Prepared artifacts:** retain current loop recorder replay semantics first.
   `PreparedLoop`/repeat-until-done requires a dynamic invocation kind and is
   a separate design decision, not a prerequisite for hooks or the A64 facade.
+* **A64 precompute boundary walker:** `cirrus-aarch64-ert-loop` now has an
+  opt-in `precompute` feature with `Aarch64LoopedProgram::compile`, a
+  validated fixed-point walk over B.cond/CBZ/CBNZ/TBZ/TBNZ, direct branches,
+  declared indirect/return sites, and SVC exits. This is a cache for the
+  live body runner, not a semantic change.
