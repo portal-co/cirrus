@@ -16,7 +16,117 @@
 //! (`C4.1.9`). The raw masks below are the support authority; `disarm64`
 //! protects this hand-extracted subset against accepting an undecodable word.
 
+use cirrus_core::ContextWithValue;
+use cirrus_ert_core::{ContextWithErtOps, constant_word, select_word};
 use disarm64::decoder;
+
+/// A symbolic A64 state with 31 GPRs and separate SP.
+///
+/// Encoding register 31 is resolved by each semantic form: it is XZR in the
+/// supported control forms and never aliases `sp` here. The concrete metadata
+/// is intentionally retained beside every symbolic word for fail-closed
+/// branch/address decisions.
+#[derive(Clone)]
+pub struct State<W> {
+    /// `x0` through `x30`; x31 is not representable here.
+    pub regs: [[W; 64]; 31],
+    /// Known concrete values for `x0` through `x30`.
+    pub constants: [Option<u64>; 31],
+    /// Architectural stack pointer, distinct from x31/XZR.
+    pub sp: u64,
+    /// Symbolic done wire accumulated by [`step`].
+    pub done: W,
+}
+
+/// A symbolic A64 control-flow result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Flow<W> {
+    /// Continue at this next virtual instruction pointer.
+    Next([W; 64]),
+    /// The bare-metal ERT `SVC #0` exit completed.
+    Exit,
+}
+
+/// Construct the initial state with all GPRs and done set to `zero`.
+pub fn initial_state<W: Clone>(zero: W) -> State<W> {
+    State {
+        regs: core::array::from_fn(|_| core::array::from_fn(|_| zero.clone())),
+        constants: [None; 31],
+        sp: 0,
+        done: zero,
+    }
+}
+
+/// Execute the audited control-flow subset over a symbolic state.
+///
+/// Data-processing and memory forms remain rejected in Phase 3's first cut.
+/// Direct control uses constant targets; conditional forms emit a 64-bit
+/// virtual-IP select. `CBZ`/`CBNZ` only reads `x0..x30`; `x31` remains XZR.
+pub fn step<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    let instruction = decode(pc, raw)?;
+    let next = pc.wrapping_add(4);
+    let constant = |value| constant_word(zero, one, value);
+    match instruction {
+        Instruction::Branch { target } => Ok(Flow::Next(constant(target))),
+        Instruction::BranchLink { target } => {
+            state.regs[30] = constant(next);
+            state.constants[30] = Some(next);
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::ConditionalBranch { condition, target } => {
+            // NZCV state is not present until the arithmetic subset lands.
+            // Accept only AL here; all other conditions remain fail-closed.
+            if condition != 14 {
+                return Err(DecodeError::Unsupported(raw));
+            }
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::CompareBranch {
+            register,
+            nonzero,
+            target,
+            ..
+        } => {
+            if register == 31 {
+                // x31 is XZR for CBZ/CBNZ, never SP: CBZ is therefore
+                // always taken and CBNZ always falls through.
+                return Ok(Flow::Next(constant(if nonzero { next } else { target })));
+            }
+            let word = &state.regs[register as usize];
+            let is_zero = cirrus_ert_core::zero_word(context, word, one)
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+            let condition = if nonzero {
+                context
+                    .bitxor(is_zero, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            } else {
+                is_zero
+            };
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
+        }
+        Instruction::TestBranch { .. }
+        | Instruction::BranchRegister { .. }
+        | Instruction::BranchLinkRegister { .. }
+        | Instruction::Return => Err(DecodeError::Unsupported(raw)),
+        Instruction::SupervisorCall => Ok(Flow::Exit),
+    }
+}
 
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,7 +283,7 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, Instruction, decode};
+    use super::{DecodeError, Flow, Instruction, decode, initial_state, step};
 
     #[test]
     fn branch_targets_and_link_bit_are_extracted_from_audited_masks() {
@@ -197,7 +307,7 @@ mod tests {
             decode(0x2000, 0x5400_0040),
             Ok(Instruction::ConditionalBranch {
                 condition: 0,
-                target: 0x2008,
+                target: 0x2008
             })
         );
         assert_eq!(
@@ -206,7 +316,7 @@ mod tests {
                 register: 1,
                 nonzero: true,
                 width64: true,
-                target: 0x2008,
+                target: 0x2008
             })
         );
     }
@@ -222,6 +332,28 @@ mod tests {
         assert_eq!(
             decode(0, 0xd400_0021),
             Err(DecodeError::Unsupported(0xd400_0021))
+        );
+    }
+
+    #[test]
+    fn symbolic_cbz_selects_the_audited_target_and_x31_is_xzr() {
+        let mut state = initial_state(false);
+        state.regs[1] = core::array::from_fn(|bit| bit == 0);
+        let flow = step(&mut (), &mut state, 0x2000, 0xb500_0041, &false, &true).unwrap();
+        assert_eq!(
+            flow,
+            Flow::Next(core::array::from_fn(|bit| (0x2008u64 >> bit) & 1 != 0))
+        );
+        let zero_register = step(&mut (), &mut state, 0x2000, 0xb400_005f, &false, &true).unwrap();
+        assert_eq!(
+            zero_register,
+            Flow::Next(core::array::from_fn(|bit| (0x2008u64 >> bit) & 1 != 0))
+        );
+        let zero_register_nonzero =
+            step(&mut (), &mut state, 0x2000, 0xb500_005f, &false, &true).unwrap();
+        assert_eq!(
+            zero_register_nonzero,
+            Flow::Next(core::array::from_fn(|bit| (0x2004u64 >> bit) & 1 != 0))
         );
     }
 

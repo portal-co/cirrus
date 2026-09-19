@@ -6,4 +6,5 @@ description = "Fail-closed AArch64 decoder and symbolic ERT facade"
 
 [dependencies]
 cirrus-ert-core = { version = "0.1.0", path = "../cirrus-ert-core" }
+cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 disarm64 = { version = "0.1.26", default-features = false, features = ["full"] }
