@@ -456,9 +456,11 @@ do not make the Thumb adapter depend on `disarm64`.
    selector; `step_with_hash` now implements the selector-0 32-byte digest
    ABI through x1..x4. AAPCS64 entry/result helpers now seed/read x0..x7 and
    eight-byte caller storage slots, and `cirrus-ert-rt` now has the
-   target-gated AArch64 `SVC #0` hash/exit ABI. Remaining work is wider
-   multiply forms, stack-relative symbolic storage loads/stores, an
-   `aarch64-unknown-none` selftest image and host fixtures.
+   target-gated AArch64 `SVC #0` hash/exit ABI, and an
+   `aarch64-unknown-none` selftest image now links for the QEMU `virt`
+   layout. Remaining work is wider multiply forms, stack-relative symbolic
+   storage loads/stores, host fixture decoding coverage, and the timeout-
+   bounded QEMU runner.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
