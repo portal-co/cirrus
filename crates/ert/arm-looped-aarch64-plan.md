@@ -458,9 +458,10 @@ do not make the Thumb adapter depend on `disarm64`.
    eight-byte caller storage slots, and `cirrus-ert-rt` now has the
    target-gated AArch64 `SVC #0` hash/exit ABI, and an
    `aarch64-unknown-none` selftest image now links for the QEMU `virt`
-   layout. Remaining work is wider multiply forms, stack-relative symbolic
-   storage loads/stores, host fixture decoding coverage, and the timeout-
-   bounded QEMU runner.
+   layout. The host ELF fixture now maps the built image, decodes its
+   supported boot path, and reaches the declared exit. Remaining work is wider
+   multiply forms, stack-relative symbolic storage loads/stores, and the
+   timeout-bounded QEMU runner.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
