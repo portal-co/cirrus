@@ -18,8 +18,9 @@
 
 use cirrus_core::ContextWithValue;
 use cirrus_ert_core::{
-    ContextWithErtOps, Shift, add_bits_with_carry_out, add_overflow, arm_condition, constant_word,
-    fixed_shift, invert_word, select_word, subtract_overflow, zero_word,
+    BitOp, ContextWithErtOps, Shift, add_bits_with_carry_out, add_overflow, arm_condition,
+    bitwise_word, constant_word, fixed_shift, invert_word, select_word, subtract_overflow,
+    zero_word,
 };
 use disarm64::decoder;
 
@@ -228,6 +229,73 @@ where
                     result_constant,
                     one,
                 )?;
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::LogicalRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            operation,
+            set_flags,
+            width64,
+        } => {
+            let left_word = register_word(state, left, zero);
+            let right_word = shift_register(state, right, amount, shift, width64, zero);
+            let result = bitwise_word(context, &left_word, &right_word, operation)
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+            let result = if width64 {
+                result
+            } else {
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        result[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            let left_constant = register_constant(state, left);
+            let right_constant = register_constant(state, right)
+                .map(|value| shift_constant(value, amount, shift, width64));
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let result_constant = left_constant.zip(right_constant).map(|(left, right)| match operation {
+                BitOp::And => left & right,
+                BitOp::Or => left | right,
+                BitOp::Xor => left ^ right,
+            } & mask);
+            if set_flags {
+                let z = if width64 {
+                    zero_word(context, &result, one)
+                } else {
+                    let result32: [W; 32] = core::array::from_fn(|bit| result[bit].clone());
+                    zero_word(context, &result32, one)
+                }
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+                state.nzcv = [
+                    result[if width64 { 63 } else { 31 }].clone(),
+                    z,
+                    zero.clone(),
+                    zero.clone(),
+                ];
+                state.nzcv_constants = result_constant.map_or([None; 4], |result| {
+                    [
+                        Some((result >> if width64 { 63 } else { 31 }) & 1 != 0),
+                        Some(result == 0),
+                        Some(false),
+                        Some(false),
+                    ]
+                });
             }
             if dest != 31 {
                 state.regs[dest as usize] = result;
@@ -490,6 +558,46 @@ where
     Ok(())
 }
 
+fn register_word<W: Clone>(state: &State<W>, register: u8, zero: &W) -> [W; 64] {
+    if register == 31 {
+        core::array::from_fn(|_| zero.clone())
+    } else {
+        state.regs[register as usize].clone()
+    }
+}
+
+fn register_constant<W>(state: &State<W>, register: u8) -> Option<u64> {
+    if register == 31 {
+        Some(0)
+    } else {
+        state.constants[register as usize]
+    }
+}
+
+fn shift_register<W: Clone>(
+    state: &State<W>,
+    register: u8,
+    amount: u32,
+    shift: Shift,
+    width64: bool,
+    zero: &W,
+) -> [W; 64] {
+    let source = register_word(state, register, zero);
+    if width64 {
+        fixed_shift(&source, amount, shift, zero)
+    } else {
+        let source32: [W; 32] = core::array::from_fn(|bit| source[bit].clone());
+        let shifted = fixed_shift(&source32, amount, shift, zero);
+        core::array::from_fn(|bit| {
+            if bit < 32 {
+                shifted[bit].clone()
+            } else {
+                zero.clone()
+            }
+        })
+    }
+}
+
 fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
     let mask = if width64 {
         u64::MAX
@@ -568,6 +676,25 @@ pub enum Instruction {
         /// Whether this is subtraction rather than addition.
         subtract: bool,
         /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
+        set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// Logical shifted-register operation, including the flag-setting TST alias.
+    LogicalRegister {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// Left operand, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Right operand before the fixed shift, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Fixed right-operand shift or rotation.
+        shift: Shift,
+        /// Fixed shift amount.
+        amount: u32,
+        /// Logical operation.
+        operation: BitOp,
+        /// Whether this is the flag-setting ANDS/TST form.
         set_flags: bool,
         /// Whether this is the 64-bit X-register form.
         width64: bool,
@@ -674,6 +801,40 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             width64: raw & (1 << 31) != 0,
         });
     }
+    if raw & 0x1f20_0000 == 0x0a00_0000 {
+        let dest = (raw & 31) as u8;
+        let left = ((raw >> 5) & 31) as u8;
+        let right = ((raw >> 16) & 31) as u8;
+        let width64 = raw & (1 << 31) != 0;
+        let amount = (raw >> 10) & 63;
+        let shift = match (raw >> 22) & 3 {
+            0 => Shift::Left,
+            1 => Shift::LogicalRight,
+            2 => Shift::ArithmeticRight,
+            3 => Shift::RotateRight,
+            _ => unreachable!("two-bit shift field"),
+        };
+        if !width64 && amount >= 32 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let (operation, set_flags) = match (raw >> 29) & 3 {
+            0 => (BitOp::And, false),
+            1 => (BitOp::Or, false),
+            2 => (BitOp::Xor, false),
+            3 => (BitOp::And, true),
+            _ => unreachable!("two-bit opcode field"),
+        };
+        return Ok(Instruction::LogicalRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            operation,
+            set_flags,
+            width64,
+        });
+    }
     if raw & 0x1f20_0000 == 0x0b00_0000 {
         let dest = (raw & 31) as u8;
         let left = ((raw >> 5) & 31) as u8;
@@ -776,7 +937,7 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, Flow, Instruction, Shift, decode, initial_state, step};
+    use super::{BitOp, DecodeError, Flow, Instruction, Shift, decode, initial_state, step};
 
     fn word(value: u64) -> [bool; 64] {
         core::array::from_fn(|bit| (value >> bit) & 1 != 0)
@@ -866,6 +1027,46 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn logical_register_operations_support_xzr_shifts_and_tst() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(0xf0);
+        state.regs[2] = word(0x0f);
+        state.constants[1] = Some(0xf0);
+        state.constants[2] = Some(0x0f);
+        assert_eq!(
+            decode(0x1000, 0x8a02_0020),
+            Ok(Instruction::LogicalRegister {
+                dest: 0,
+                left: 1,
+                right: 2,
+                shift: Shift::Left,
+                amount: 0,
+                operation: BitOp::And,
+                set_flags: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x8a02_0020, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0xea02_003f, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(
+            state.nzcv_constants,
+            [Some(false), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0xaa02_03e0, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(0x0f));
     }
 
     #[test]
