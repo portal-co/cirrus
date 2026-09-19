@@ -449,11 +449,12 @@ do not make the Thumb adapter depend on `disarm64`.
    logical shifted-register forms including `TST`, `CSEL`, and low-word
    `MADD`/`MSUB`/`MUL`. Concrete memory reads now cover PC-relative literal
    loads and unsigned-immediate or signed-unscaled byte/half/word/double
-   loads with correct zero/sign extension; stores, pairs, and stack-relative
-   symbolic storage are still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
+   loads with correct zero/sign extension, plus bounded concrete stores through
+   the new mutable `RawMemory` seam; pairs and stack-relative symbolic storage
+   are still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
    selector pending the hash runtime/handler seam. Remaining work is wider
-   multiply forms, stores/pairs and caller-owned storage, the AAPCS64/SVC
-   runtime ABI and host fixtures.
+   multiply forms, pairs and caller-owned storage, the AAPCS64/SVC runtime ABI
+   and host fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
