@@ -743,6 +743,135 @@ where
     supervisor_call_with_hash(context, state, raw, zero, one, hash)
 }
 
+/// Execute an audited memory form against both mapped bytes and caller-owned
+/// symbolic stack storage.
+///
+/// A load/store whose base is architectural SP uses symbolic storage and its
+/// wire value; a concrete non-SP base continues to use the byte mapping.
+/// Concrete values may be unknown when the address is stack-derived; storage
+/// carries the exact symbolic bits.
+pub fn step_with_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    match decode(pc, raw)? {
+        Instruction::Load {
+            dest,
+            base: 31,
+            offset,
+            width,
+            signed,
+        } => load_stack(
+            context, storage, state, dest, offset, width, signed, zero, one,
+        )?,
+        Instruction::Store {
+            source,
+            base: 31,
+            offset,
+            width,
+        } => store_stack(context, storage, state, source, offset, width, zero, one)?,
+        _ => return step(context, state, pc, raw, zero, one),
+    }
+    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    dest: u8,
+    offset: u64,
+    width: u8,
+    signed: bool,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let base = stack_address(state, offset)?;
+    if dest == 31 {
+        return Ok(());
+    }
+    let bits = usize::from(width) * 8;
+    for bit in 0..64 {
+        let source_bit = bit.min(bits - 1);
+        state.regs[dest as usize][bit] = if bit >= bits && !signed {
+            zero.clone()
+        } else {
+            let index = base
+                .checked_mul(8)
+                .and_then(|base| base.checked_add(source_bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let address = storage_address(index, zero, one);
+            context
+                .storage_read(storage, &address)
+                .map_err(|_| DecodeError::Unsupported(0))?
+        };
+    }
+    state.constants[dest as usize] = None;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &State<W>,
+    source: u8,
+    offset: u64,
+    width: u8,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let base = stack_address(state, offset)?;
+    let bits = usize::from(width) * 8;
+    for bit in 0..bits {
+        let index = base
+            .checked_mul(8)
+            .and_then(|base| base.checked_add(bit as u64))
+            .ok_or(DecodeError::Malformed(0))?;
+        let address = storage_address(index, zero, one);
+        let value = if source == 31 {
+            zero.clone()
+        } else {
+            state.regs[source as usize][bit].clone()
+        };
+        context
+            .storage_write(storage, &address, value)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+    }
+    Ok(())
+}
+
+fn stack_address<W>(state: &State<W>, offset: u64) -> Result<u64, DecodeError> {
+    state
+        .sp
+        .and_then(|base| base.checked_add(offset))
+        .ok_or(DecodeError::Malformed(0))
+}
+
 /// Execute an audited literal load, or delegate a non-memory form to [`step`].
 ///
 /// Literal loads have a PC-derived concrete address and therefore need no
@@ -1748,18 +1877,12 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             if v {
                 return Err(DecodeError::Unsupported(raw));
             }
-            if base == 31 {
-                return Err(DecodeError::Unsupported(raw));
-            }
             return Ok(Instruction::Store {
                 source: (raw & 31) as u8,
                 base,
                 offset: imm12 << size,
                 width,
             });
-        }
-        if base == 31 {
-            return Err(DecodeError::Unsupported(raw));
         }
         return Ok(Instruction::Load {
             dest: (raw & 31) as u8,
@@ -1788,18 +1911,12 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             if v {
                 return Err(DecodeError::Unsupported(raw));
             }
-            if base == 31 {
-                return Err(DecodeError::Unsupported(raw));
-            }
             return Ok(Instruction::StoreUnscaled {
                 source: (raw & 31) as u8,
                 base,
                 offset,
                 width: 1u8 << size,
             });
-        }
-        if base == 31 {
-            return Err(DecodeError::Unsupported(raw));
         }
         return Ok(Instruction::LoadExtend {
             dest: (raw & 31) as u8,
@@ -2041,10 +2158,12 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::{
         BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
         initial_state_with_arguments, read_aapcs64_results, step, step_with_hash, step_with_memory,
-        write_aapcs64_arguments,
+        step_with_stack, write_aapcs64_arguments,
     };
 
     use cirrus_core::{ContextWithStorage, ContextWithValue, HasError, StorageAddressBit};
@@ -2094,7 +2213,7 @@ mod tests {
     }
 
     impl ContextWithStorage<bool> for PlainStorage {
-        type Storage = [bool; 1024];
+        type Storage = [bool];
 
         fn storage_read(
             &mut self,
@@ -2643,6 +2762,42 @@ mod tests {
             }));
             assert_eq!(slot, *value);
         }
+    }
+
+    #[test]
+    fn stack_relative_memory_moves_symbolic_storage_bits() {
+        let mut context = PlainStorage;
+        let mut storage = [false; 2048];
+        let mut state = initial_state_with_arguments(false, &true, 128, &[]).unwrap();
+        state.constants[1] = Some(0x1122_3344);
+        state.regs[1] = word(0x1122_3344);
+        assert_eq!(
+            step_with_stack(
+                &mut context,
+                &mut storage,
+                &mut state,
+                0x1000,
+                0xb900_13e1,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(
+            step_with_stack(
+                &mut context,
+                &mut storage,
+                &mut state,
+                0x1004,
+                0xb940_13e2,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[2][..32], word(0x1122_3344)[..32]);
+        assert!(state.regs[2][32..].iter().all(|bit| !*bit));
+        assert_eq!(state.constants[2], None);
     }
 
     #[test]
