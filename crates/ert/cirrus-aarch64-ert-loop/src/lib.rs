@@ -7,8 +7,10 @@
 //! this crate provides boundary snapshots, concrete agreement, and predicated
 //! folding for the shared candidate scheduler.
 
-use cirrus_aarch64_ert::State;
-use cirrus_ert_loop_core::predicated_value;
+use cirrus_aarch64_ert::{Flow, RawMemory, State, step};
+use cirrus_ert_loop_core::{
+    CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
+};
 
 /// A symbolic A64 loop-boundary snapshot.
 #[derive(Clone)]
@@ -115,6 +117,146 @@ where
     Ok(())
 }
 
+/// Execute one candidate generation through the shared fixed-capacity
+/// scheduler.
+///
+/// Each candidate body starts from `snapshot` and stops at the next symbolic
+/// control-flow result or SVC exit. Concrete successors are appended in the
+/// facade's stable order. Exited bodies leave no successor and predicate the
+/// accumulated done wire.
+pub fn run_generation<C, W>(
+    context: &mut C,
+    table: &mut CandidateTable<'_, u64>,
+    snapshot: &Aarch64Snapshot<W>,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<Aarch64Snapshot<W>, DriveError<Aarch64DriveError<C::Error>>>
+where
+    C: cirrus_core::ContextWithValue<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitOr<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitXor<bool, Wrapped = W>,
+    W: WireValue + Clone,
+{
+    let mut driver = Aarch64GenerationDriver {
+        context,
+        initial: snapshot,
+        accumulated: None,
+        memory,
+        zero,
+        one,
+    };
+    drive_generation(table, &mut driver)?;
+    driver
+        .accumulated
+        .ok_or(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+}
+
+struct Aarch64GenerationDriver<'a, C, W> {
+    context: &'a mut C,
+    initial: &'a Aarch64Snapshot<W>,
+    accumulated: Option<Aarch64Snapshot<W>>,
+    memory: RawMemory<'a>,
+    zero: &'a W,
+    one: &'a W,
+}
+
+impl<C, W> CandidateDriver<u64> for Aarch64GenerationDriver<'_, C, W>
+where
+    C: cirrus_core::ContextWithValue<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitAnd<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitOr<bool, Wrapped = W>
+        + cirrus_core::ContextWithBitXor<bool, Wrapped = W>,
+    W: WireValue + Clone,
+{
+    type Error = Aarch64DriveError<C::Error>;
+
+    fn execute(
+        &mut self,
+        candidate: u64,
+        successors: &mut dyn FnMut(u64) -> Result<(), DriveError<Self::Error>>,
+    ) -> Result<(), DriveError<Self::Error>> {
+        let mut state = self.initial.state.clone();
+        let raw = u32::from_le_bytes(
+            self.memory
+                .read64::<4>(candidate)
+                .ok_or(Aarch64DriveError::Memory(candidate))
+                .map_err(DriveError::Driver)?,
+        );
+        let flow = step(
+            self.context,
+            &mut state,
+            candidate,
+            raw,
+            self.zero,
+            self.one,
+        )
+        .map_err(Aarch64DriveError::Decode)
+        .map_err(DriveError::Driver)?;
+        let mut snapshot = Aarch64Snapshot {
+            state,
+            pc: candidate,
+        };
+        match flow {
+            Flow::Next(next_word) => {
+                let next = Aarch64Snapshot::<W>::concrete_next(&next_word)
+                    .ok_or(Aarch64DriveError::SymbolicNextPc)
+                    .map_err(DriveError::Driver)?;
+                snapshot.pc = next;
+                if let Some(accumulated) = &mut self.accumulated {
+                    fold_snapshot(self.context, self.one, &snapshot, accumulated, self.zero)
+                        .map_err(Aarch64DriveError::Fold)
+                        .map_err(DriveError::Driver)?;
+                } else {
+                    self.accumulated = Some(snapshot);
+                }
+                successors(next)?;
+            }
+            Flow::Exit => {}
+        }
+        Ok(())
+    }
+}
+
+/// A Boolean wire that may carry a host-known concrete value.
+pub trait WireValue {
+    /// Return the host-known Boolean value, if this wire is concrete.
+    fn concrete(self) -> Option<bool>;
+}
+
+impl WireValue for bool {
+    fn concrete(self) -> Option<bool> {
+        Some(self)
+    }
+}
+
+impl<W: WireValue + Clone> Aarch64Snapshot<W> {
+    fn concrete_next(word: &[W; 64]) -> Option<u64> {
+        let mut value = 0u64;
+        for (bit, wire) in word.iter().enumerate() {
+            value |= u64::from(wire.clone().concrete()?) << bit;
+        }
+        Some(value)
+    }
+}
+
+/// A candidate body could not execute or fold under A64 loop rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Aarch64DriveError<E> {
+    /// Instruction decode/execution failed.
+    Decode(cirrus_aarch64_ert::DecodeError),
+    /// The candidate instruction was unmapped.
+    Memory(u64),
+    /// The facade produced a symbolic next-PC outside a higher-level dispatch
+    /// mechanism; the first adapter cut is concrete-control only.
+    SymbolicNextPc,
+    /// Folding candidate state failed.
+    Fold(Aarch64FoldError<E>),
+    /// Every candidate in the generation exited; there is no live state to fold.
+    NoSurvivingCandidates,
+}
+
 /// A fold failed, either because a context gate failed or concrete A64 state
 /// diverged across candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +290,35 @@ mod tests {
         fold_snapshot(&mut (), &false, &inactive, &mut accumulated, &false).unwrap();
         assert_eq!(accumulated.state.regs[0][0], true);
         assert_eq!(accumulated.state.constants[0], None);
+    }
+
+    #[test]
+    fn generation_runs_concrete_bodies_and_collects_successors() {
+        let bytes = [0x01, 0x00, 0x00, 0x14]; // b +4
+        let memory = RawMemory::from_slice(&bytes);
+        let snapshot = capture(&cirrus_aarch64_ert::initial_state(false), 0);
+        let mut entries = [0; 4];
+        let mut table = CandidateTable::new(&mut entries, 0).unwrap();
+        let folded = run_generation(&mut (), &mut table, &snapshot, memory, &false, &true).unwrap();
+        assert_eq!(folded.pc, 4);
+        assert_eq!(table.current(), &[4]);
+    }
+
+    #[test]
+    fn generation_fails_closed_when_all_candidates_exit() {
+        let bytes = 0xd400_0001u32.to_le_bytes(); // svc #0
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.constants[0] = Some(u64::MAX);
+        state.regs[0] = core::array::from_fn(|_| true);
+        let snapshot = capture(&state, 0);
+        let mut entries = [0; 4];
+        let mut table = CandidateTable::new(&mut entries, 0).unwrap();
+        assert!(matches!(
+            run_generation(&mut (), &mut table, &snapshot, memory, &false, &true),
+            Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
+        ));
+        assert!(table.is_empty());
     }
 
     #[test]
