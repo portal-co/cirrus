@@ -18,7 +18,7 @@
 
 use cirrus_core::ContextWithValue;
 use cirrus_ert_core::{
-    BitOp, ContextWithErtOps, Shift, add_bits, add_bits_with_carry_out, add_overflow,
+    BitOp, ContextWithErtOps, RawMemory, Shift, add_bits, add_bits_with_carry_out, add_overflow,
     arm_condition, arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word,
     select_word, subtract_overflow, zero_word,
 };
@@ -532,6 +532,7 @@ where
             }
             Ok(Flow::Next(constant(target)))
         }
+        Instruction::LoadLiteral { .. } => Err(DecodeError::Unsupported(raw)),
         Instruction::SupervisorCall => {
             // The façade is bare-metal, not a Linux syscall emulator. Hash
             // service selectors need the runtime/handler seam; until that is
@@ -543,6 +544,51 @@ where
             Ok(Flow::Exit)
         }
     }
+}
+
+/// Execute an audited literal load, or delegate a non-memory form to [`step`].
+///
+/// Literal loads have a PC-derived concrete address and therefore need no
+/// symbolic storage interface. Other load/store addressing modes remain
+/// rejected until the caller-owned storage seam is introduced.
+pub fn step_with_memory<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    let Instruction::LoadLiteral {
+        dest,
+        width,
+        signed,
+        target,
+    } = decode(pc, raw)?
+    else {
+        return step(context, state, pc, raw, zero, one);
+    };
+    let value = match (width, signed) {
+        (4, false) => memory
+            .read64::<4>(target)
+            .map(|bytes| u64::from(u32::from_le_bytes(bytes))),
+        (8, false) => memory.read64::<8>(target).map(u64::from_le_bytes),
+        (4, true) => memory
+            .read64::<4>(target)
+            .map(|bytes| i64::from(i32::from_le_bytes(bytes)) as u64),
+        _ => return Err(DecodeError::Unsupported(raw)),
+    }
+    .ok_or(DecodeError::Memory(target))?;
+    if dest != 31 {
+        state.regs[dest as usize] = constant_word(zero, one, value);
+        state.constants[dest as usize] = Some(value);
+    }
+    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
 }
 
 fn arithmetic<C, W>(
@@ -792,6 +838,17 @@ fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
+    /// `LDR`/`LDRSW` literal with a PC-relative concrete address.
+    LoadLiteral {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Access width in bytes (four or eight).
+        width: u8,
+        /// Whether a four-byte value is sign-extended to 64 bits.
+        signed: bool,
+        /// Computed literal address.
+        target: u64,
+    },
     /// `ADR` or `ADRP`; target is the materialized PC-relative address.
     Address {
         /// Destination `Xd`, restricted to 0 through 30.
@@ -958,6 +1015,8 @@ pub enum DecodeError {
     Unsupported(u32),
     /// A near-match used a reserved register, immediate, or exception form.
     Malformed(u32),
+    /// An audited concrete memory access was unmapped.
+    Memory(u64),
 }
 
 /// Decode one A64 instruction at `pc`.
@@ -971,6 +1030,21 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x3f00_0000 == 0x1800_0000 {
+        let (width, signed) = match (raw >> 30) & 3 {
+            0 => (4, false),
+            1 => (8, false),
+            2 => (4, true),
+            _ => return Err(DecodeError::Unsupported(raw)),
+        };
+        let target = pc.wrapping_add_signed(sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2);
+        return Ok(Instruction::LoadLiteral {
+            dest: (raw & 31) as u8,
+            width,
+            signed,
+            target,
+        });
+    }
     if raw & 0x1f00_0000 == 0x1000_0000 {
         let dest = (raw & 31) as u8;
         if dest == 31 {
@@ -1176,7 +1250,10 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitOp, DecodeError, Flow, Instruction, Shift, decode, initial_state, step};
+    use super::{
+        BitOp, DecodeError, Flow, Instruction, RawMemory, Shift, decode, initial_state, step,
+        step_with_memory,
+    };
 
     fn word(value: u64) -> [bool; 64] {
         core::array::from_fn(|bit| (value >> bit) & 1 != 0)
@@ -1265,6 +1342,42 @@ mod tests {
         assert_eq!(
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
+        );
+    }
+
+    #[test]
+    fn literal_loads_are_concrete_pc_relative_and_fail_closed_when_unmapped() {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&0xfeed_face_dead_beefu64.to_le_bytes());
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0, 0x5800_0040),
+            Ok(Instruction::LoadLiteral {
+                dest: 0,
+                width: 8,
+                signed: false,
+                target: 8,
+            })
+        );
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x5800_0040, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.regs[0], word(0xfeed_face_dead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x1800_0041, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.constants[1], Some(0xdead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x9800_0042, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.constants[2], Some(0xffff_ffff_dead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x5800_0083, memory, &false, &true),
+            Err(DecodeError::Memory(16))
         );
     }
 
