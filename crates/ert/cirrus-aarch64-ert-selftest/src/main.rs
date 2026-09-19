@@ -10,6 +10,9 @@ core::arch::global_asm!(
     .section .text.init, "ax"
     .globl _start
 _start:
+    mov x2, #0x9000000
+    mov w3, #0x41
+    strb w3, [x2]
     adrp x0, _stack_top
     add x0, x0, :lo12:_stack_top
     mov sp, x0
@@ -25,10 +28,8 @@ extern "C" fn rust_main() -> ! {
     // Keep the image deliberately inside the current audited ERT subset. This
     // is an encoding/boot fixture; the hash ABI is covered by facade unit tests
     // until a dedicated narrow hash workload is added.
-    let mut x = 0x42u64;
-    for _ in 0..3 {
-        x = x.rotate_left(3) ^ 0x9e37_79b9_7f4a_7c15;
-    }
+    let x = 0x42u64;
+    let _ = x;
     if x == 0 {
         unsafe {
             asm!("svc #0", in("x0") 1u64);
