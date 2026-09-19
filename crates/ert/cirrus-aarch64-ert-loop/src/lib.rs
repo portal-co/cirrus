@@ -206,7 +206,8 @@ pub enum Aarch64Boundary<W> {
 /// Detect and resolve a symbolic A64 conditional-branch boundary.
 ///
 /// The facade's decoded branch form remains private, so the adapter audits
-/// the same raw CBZ/CBNZ and TBZ/TBNZ masks before executing the instruction.
+/// the same raw B.cond, CBZ/CBNZ and TBZ/TBNZ masks before executing the
+/// instruction.
 fn symbolic_branch_boundary<C, W>(
     context: &mut C,
     state: &State<W>,
@@ -223,6 +224,36 @@ where
     W: WireValue + Clone,
 {
     let fallthrough = pc.wrapping_add(4);
+    if raw & 0x7e00_0010 == 0x5400_0000 {
+        let condition = (raw & 15) as u8;
+        if condition >= 14 || state.nzcv_constants != [None; 4] {
+            return Ok(None);
+        }
+        let Some(condition) = cirrus_ert_core::arm_condition(
+            context,
+            state.nzcv[0].clone(),
+            state.nzcv[1].clone(),
+            state.nzcv[2].clone(),
+            state.nzcv[3].clone(),
+            condition,
+            one,
+        )?
+        else {
+            return Ok(None);
+        };
+        let taken = pc.wrapping_add_signed(cirrus_aarch64_ert::compare_branch_offset(raw));
+        let next = cirrus_ert_core::select_word(
+            context,
+            condition,
+            &word64(taken, zero, one),
+            &word64(fallthrough, zero, one),
+        )?;
+        return Ok(Some(Aarch64Boundary::SymbolicBranch {
+            next,
+            taken,
+            fallthrough,
+        }));
+    }
     if raw & 0x7e00_0000 == 0x3400_0000 {
         let register = (raw & 31) as usize;
         let nonzero = raw & (1 << 24) != 0;
@@ -672,6 +703,59 @@ mod tests {
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn symbolic_flag_branch_advances_through_public_step_generations() {
+        // b.ne +8; movz x0, #0; svc #0; nop; svc #0
+        let code = [
+            0x5400_0041u32,
+            0x5280_0000,
+            0xd400_0001,
+            0xd503_201f,
+            0xd400_0001,
+        ];
+        let mut bytes = [0u8; 20];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.nzcv[1] = true;
+        state.nzcv_constants = [None; 4];
+        let mut initial = initial_step(state, 0, &false, &true).unwrap();
+        initial.snapshot.state.constants[0] = Some(u64::MAX);
+        initial.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        let mut backing = [0u64; 8];
+        let mut candidates = CandidateTable::new(&mut backing, 0).unwrap();
+        let first = step(
+            &mut (),
+            &mut candidates,
+            initial,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+        )
+        .unwrap();
+        assert_eq!(candidates.current(), &[8, 4]);
+        assert_eq!(first.virtual_ip, word64(4, &false, &true));
+        assert!(!first.done);
+        assert!(!first.exited);
+
+        let mut first = first;
+        first.snapshot.state.constants[0] = Some(u64::MAX);
+        first.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        let second = step(
+            &mut (),
+            &mut candidates,
+            first,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+        )
+        .unwrap();
+        assert_eq!(candidates.current(), &[8, 12]);
+        assert!(!second.done);
+        assert!(!second.exited);
     }
 
     #[test]
