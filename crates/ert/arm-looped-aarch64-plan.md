@@ -446,9 +446,11 @@ do not make the Thumb adapter depend on `disarm64`.
    symbolic state now executes direct/compare/test/register control flow,
    canonical `RET x30`, `ADR`/`ADRP`, `MOVZ`/`MOVK`, immediate and shifted
    register `ADD`/`SUB` (including `ADDS`/`SUBS`, `CMP`/`CMN` aliases, NZCV),
-   and logical shifted-register forms including `TST`. Remaining work is
-   multiply/select forms, addressing/memory, the AAPCS64/SVC runtime ABI and
-   host fixtures.
+   logical shifted-register forms including `TST`, `CSEL`, and low-word
+   `MADD`/`MSUB`/`MUL`. `SVC #0` now accepts only the all-ones bare-metal exit
+   selector pending the hash runtime/handler seam. Remaining work is wider
+   multiply forms, addressing/memory, the AAPCS64/SVC runtime ABI and host
+   fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
