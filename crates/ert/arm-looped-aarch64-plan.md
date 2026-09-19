@@ -40,15 +40,15 @@
   interpreter's decoded seam, and captures the updated state plus a symbolic
   `B<cond>`/`CBZ`/`CBNZ` boundary or exit. No allocator or hidden
   storage/rstack state is introduced.
-* The Thumb generation driver now materializes all lazy NZCVQ recipes at the
-  body boundary before snapshot capture. This keeps flag folds explicit and
-  avoids silently treating `FlagWire::Zero`/overflow/shift recipes as direct
-  wires. Register constants and stack offsets now survive only when every body
-  agrees; divergent metadata is cleared to unknown.
-* Shared-driver integration remains allocation-free and caller-owned. The next
-  Phase 2 gate is an end-to-end Thumb loop entry that initializes a snapshot,
-  drives candidate generations, and validates symbolic conditional branches;
-  the current low-level driver is ready for that wrapper.
+* A public no-alloc `initial_snapshot`/`step` API now initializes the Thumb
+  state and advances one shared-scheduler generation while exposing snapshot,
+  virtual-IP, completion, and structural-exit state. The end-to-end plaintext
+  gate drives a symbolic `BNE` through two candidate generations to `SVC #0`.
+  It verifies candidate order, exit completion, and done-wire behavior.
+* Phase 2's core adapter implementation is complete. Follow-up Phase 2
+  validation expands this gate to the remaining Thumb branch encodings,
+  concrete fixture equivalence, predicated stack writes, and recorder replay;
+  those tests do not change the state/scheduler seam.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
