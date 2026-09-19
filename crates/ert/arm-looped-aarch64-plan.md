@@ -453,10 +453,11 @@ do not make the Thumb adapter depend on `disarm64`.
    the new mutable `RawMemory` seam, plus concrete LDP/STP pre/post/signed-
    offset frame forms with SP writeback; stack-relative symbolic storage is
    still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
-   selector pending the hash runtime/handler seam. AAPCS64 entry/result
-   helpers now seed x0..x7 and eight-byte caller storage slots; remaining work
-   is wider multiply forms, stack-relative symbolic storage loads/stores, the
-   SVC hash runtime/handler seam and host fixtures.
+   selector; `step_with_hash` now implements the selector-0 32-byte digest
+   ABI through x1..x4. AAPCS64 entry/result helpers now seed/read x0..x7 and
+   eight-byte caller storage slots; remaining work is wider multiply forms,
+   stack-relative symbolic storage loads/stores, guest-runtime integration and
+   host fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
