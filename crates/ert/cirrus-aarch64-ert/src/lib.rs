@@ -532,7 +532,9 @@ where
             }
             Ok(Flow::Next(constant(target)))
         }
-        Instruction::LoadLiteral { .. } => Err(DecodeError::Unsupported(raw)),
+        Instruction::LoadLiteral { .. } | Instruction::Load { .. } => {
+            Err(DecodeError::Unsupported(raw))
+        }
         Instruction::SupervisorCall => {
             // The façade is bare-metal, not a Linux syscall emulator. Hash
             // service selectors need the runtime/handler seam; until that is
@@ -564,31 +566,68 @@ where
     C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
     W: Clone,
 {
-    let Instruction::LoadLiteral {
-        dest,
-        width,
-        signed,
-        target,
-    } = decode(pc, raw)?
-    else {
-        return step(context, state, pc, raw, zero, one);
-    };
+    match decode(pc, raw)? {
+        Instruction::LoadLiteral {
+            dest,
+            width,
+            signed,
+            target,
+        } => load_literal(state, dest, width, signed, target, memory, zero, one)?,
+        Instruction::Load {
+            dest,
+            base,
+            offset,
+            width,
+            signed,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            let target = base.wrapping_add(offset);
+            load_literal(state, dest, width, signed, target, memory, zero, one)?;
+        }
+        _ => return step(context, state, pc, raw, zero, one),
+    }
+    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_literal<W: Clone>(
+    state: &mut State<W>,
+    dest: u8,
+    width: u8,
+    signed: bool,
+    target: u64,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError> {
     let value = match (width, signed) {
+        (1, false) => memory
+            .read64::<1>(target)
+            .map(|bytes| u64::from(u8::from_le_bytes(bytes))),
+        (2, false) => memory
+            .read64::<2>(target)
+            .map(|bytes| u64::from(u16::from_le_bytes(bytes))),
         (4, false) => memory
             .read64::<4>(target)
             .map(|bytes| u64::from(u32::from_le_bytes(bytes))),
         (8, false) => memory.read64::<8>(target).map(u64::from_le_bytes),
+        (1, true) => memory
+            .read64::<1>(target)
+            .map(|bytes| i64::from(i8::from_le_bytes(bytes)) as u64),
+        (2, true) => memory
+            .read64::<2>(target)
+            .map(|bytes| i64::from(i16::from_le_bytes(bytes)) as u64),
         (4, true) => memory
             .read64::<4>(target)
             .map(|bytes| i64::from(i32::from_le_bytes(bytes)) as u64),
-        _ => return Err(DecodeError::Unsupported(raw)),
+        _ => return Err(DecodeError::Unsupported(0)),
     }
     .ok_or(DecodeError::Memory(target))?;
     if dest != 31 {
         state.regs[dest as usize] = constant_word(zero, one, value);
         state.constants[dest as usize] = Some(value);
     }
-    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
+    Ok(())
 }
 
 fn arithmetic<C, W>(
@@ -838,6 +877,19 @@ fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
+    /// Unsigned-immediate integer load over a concrete register base.
+    Load {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Base register; 31 denotes the architectural SP.
+        base: u8,
+        /// Unsigned immediate offset after the size scale.
+        offset: u64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+        /// Whether the loaded value is sign-extended.
+        signed: bool,
+    },
     /// `LDR`/`LDRSW` literal with a PC-relative concrete address.
     LoadLiteral {
         /// Destination `Wt`/`Xt`; 31 discards the loaded result.
@@ -1030,6 +1082,36 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x3b20_0000 == 0x3900_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let opc = (raw >> 22) & 3;
+        let base = ((raw >> 5) & 31) as u8;
+        let imm12 = u64::from((raw >> 10) & 0xfff);
+        let width = 1u8 << size;
+        let (signed, load) = match opc {
+            0 => (false, false),
+            1 => (false, true),
+            2 if v => return Err(DecodeError::Unsupported(raw)),
+            2 => (true, true),
+            3 if size == 3 => return Err(DecodeError::Unsupported(raw)),
+            3 => (true, true),
+            _ => unreachable!("two-bit opc"),
+        };
+        if !load {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        if base == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::Load {
+            dest: (raw & 31) as u8,
+            base,
+            offset: imm12 << size,
+            width,
+            signed,
+        });
+    }
     if raw & 0x3f00_0000 == 0x1800_0000 {
         let (width, signed) = match (raw >> 30) & 3 {
             0 => (4, false),
@@ -1378,6 +1460,115 @@ mod tests {
         assert_eq!(
             step_with_memory(&mut (), &mut state, 0, 0x5800_0083, memory, &false, &true),
             Err(DecodeError::Memory(16))
+        );
+    }
+
+    #[test]
+    fn unsigned_immediate_loads_cover_widths_and_fail_closed_addresses() {
+        let mut bytes = [0u8; 64];
+        bytes[32] = 0x80;
+        bytes[34..36].copy_from_slice(&0xbeefu16.to_le_bytes());
+        bytes[36..40].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        bytes[48..56].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        state.constants[1] = Some(32);
+        assert_eq!(
+            decode(0x1000, 0xf940_0020),
+            Ok(Instruction::Load {
+                dest: 0,
+                base: 1,
+                offset: 0,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0x3940_0022,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.constants[2], Some(0x80));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0x7980_0423,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.constants[3], Some(0xffff_ffff_ffff_beef));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1008,
+                0xb940_0424,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.constants[4], Some(0xdead_beef));
+        assert_eq!(state.constants[1], Some(32));
+        assert_eq!(
+            decode(0x100c, 0xf940_0825),
+            Ok(Instruction::Load {
+                dest: 5,
+                base: 1,
+                offset: 16,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x100c,
+                0xf940_0825,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1010)))
+        );
+        assert_eq!(state.constants[5], Some(0x1122_3344_5566_7788));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1010,
+                0xb940_9826,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Memory(184))
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1010,
+                0x3900_0026,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Unsupported(0x3900_0026))
         );
     }
 
