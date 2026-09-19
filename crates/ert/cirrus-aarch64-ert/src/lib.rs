@@ -532,9 +532,9 @@ where
             }
             Ok(Flow::Next(constant(target)))
         }
-        Instruction::LoadLiteral { .. } | Instruction::Load { .. } => {
-            Err(DecodeError::Unsupported(raw))
-        }
+        Instruction::LoadLiteral { .. }
+        | Instruction::Load { .. }
+        | Instruction::LoadExtend { .. } => Err(DecodeError::Unsupported(raw)),
         Instruction::SupervisorCall => {
             // The façade is bare-metal, not a Linux syscall emulator. Hash
             // service selectors need the runtime/handler seam; until that is
@@ -582,6 +582,17 @@ where
         } => {
             let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
             let target = base.wrapping_add(offset);
+            load_literal(state, dest, width, signed, target, memory, zero, one)?;
+        }
+        Instruction::LoadExtend {
+            dest,
+            base,
+            offset,
+            width,
+            signed,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            let target = base.wrapping_add_signed(offset);
             load_literal(state, dest, width, signed, target, memory, zero, one)?;
         }
         _ => return step(context, state, pc, raw, zero, one),
@@ -890,6 +901,19 @@ pub enum Instruction {
         /// Whether the loaded value is sign-extended.
         signed: bool,
     },
+    /// Signed 9-bit unscaled integer load over a concrete register base.
+    LoadExtend {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Base register; 31 is rejected until the SP seam exists.
+        base: u8,
+        /// Sign-extended byte offset.
+        offset: i64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+        /// Whether the loaded value is sign-extended.
+        signed: bool,
+    },
     /// `LDR`/`LDRSW` literal with a PC-relative concrete address.
     LoadLiteral {
         /// Destination `Wt`/`Xt`; 31 discards the loaded result.
@@ -1109,6 +1133,32 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             base,
             offset: imm12 << size,
             width,
+            signed,
+        });
+    }
+    if raw & 0x3b20_0000 == 0x3800_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let opc = (raw >> 22) & 3;
+        let base = ((raw >> 5) & 31) as u8;
+        let offset = sign_extend((raw >> 12) & 0x1ff, 9);
+        let (signed, load) = match opc {
+            0 => (false, false),
+            1 => (false, true),
+            2 if v => return Err(DecodeError::Unsupported(raw)),
+            2 => (true, true),
+            3 if size == 3 => return Err(DecodeError::Unsupported(raw)),
+            3 => (true, true),
+            _ => unreachable!("two-bit opc"),
+        };
+        if !load || base == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::LoadExtend {
+            dest: (raw & 31) as u8,
+            base,
+            offset,
+            width: 1u8 << size,
             signed,
         });
     }
@@ -1569,6 +1619,65 @@ mod tests {
                 &true
             ),
             Err(DecodeError::Unsupported(0x3900_0026))
+        );
+    }
+
+    #[test]
+    fn unscaled_loads_use_signed_offsets_and_fail_closed_bases() {
+        let mut bytes = [0u8; 32];
+        bytes[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes[17] = 0x88;
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        state.constants[1] = Some(12);
+        assert_eq!(
+            decode(0x1000, 0xf85f_e820),
+            Ok(Instruction::LoadExtend {
+                dest: 0,
+                base: 1,
+                offset: -2,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xf85f_c820,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.constants[0], Some(0x1122_3344_5566_7788));
+        state.constants[1] = Some(8);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0x3840_9021,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.constants[1], Some(0x88));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1008,
+                0xf840_905f,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Unsupported(0xf840_905f))
         );
     }
 
