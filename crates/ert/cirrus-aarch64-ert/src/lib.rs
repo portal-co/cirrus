@@ -16,7 +16,7 @@
 //! (`C4.1.9`). The raw masks below are the support authority; `disarm64`
 //! protects this hand-extracted subset against accepting an undecodable word.
 
-use cirrus_core::ContextWithValue;
+use cirrus_core::{ContextWithStorage, ContextWithValue, StorageAddressBit};
 use cirrus_ert_core::{
     BitOp, ContextWithErtOps, RawMemory, Shift, add_bits, add_bits_with_carry_out, add_overflow,
     arm_condition, arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word,
@@ -55,6 +55,65 @@ pub enum Flow<W> {
     Next([W; 64]),
     /// The bare-metal ERT `SVC #0` exit completed.
     Exit,
+}
+
+/// Seed AAPCS64 arguments into a state and caller-owned symbolic storage.
+///
+/// Up to eight eight-byte arguments land in `x0` through `x7`. Any extra
+/// values occupy consecutive caller-reserved eight-byte storage slots starting
+/// at `stack_pointer`; the caller must reserve that window below the top of
+/// storage, as with the RISC-V facade's ABI stack convention.
+pub fn write_aapcs64_arguments<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    zero: &W,
+    one: &W,
+    arguments: &[([W; 64], Option<u64>)],
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    for (index, (word, constant)) in arguments.iter().enumerate() {
+        if index < 8 {
+            state.regs[index] = word.clone();
+            state.constants[index] = *constant;
+            continue;
+        }
+        let Some(stack_pointer) = state.sp else {
+            return Err(DecodeError::Unsupported(0));
+        };
+        let byte_address = stack_pointer.wrapping_add(
+            u64::try_from(index - 8)
+                .ok()
+                .and_then(|n| n.checked_mul(8))
+                .ok_or(DecodeError::Malformed(0))?,
+        );
+        for (bit, value) in word.iter().enumerate() {
+            let bit_index = byte_address
+                .checked_mul(8)
+                .and_then(|index| index.checked_add(bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let slot = storage_address(bit_index, zero, one);
+            context
+                .storage_write(storage, &slot, value.clone())
+                .map_err(|_| DecodeError::Unsupported(0))?;
+        }
+    }
+    Ok(())
+}
+
+fn storage_address<W: Clone>(address: u64, zero: &W, one: &W) -> [StorageAddressBit<W>; 64] {
+    core::array::from_fn(|bit| {
+        let known = (address >> bit) & 1 != 0;
+        StorageAddressBit {
+            wire: if known { one.clone() } else { zero.clone() },
+            known: Some(known),
+        }
+    })
 }
 
 /// Construct an AAPCS64 argument-carrying state.
@@ -1687,8 +1746,86 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 mod tests {
     use super::{
         BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
-        initial_state_with_arguments, step, step_with_memory,
+        initial_state_with_arguments, step, step_with_memory, write_aapcs64_arguments,
     };
+
+    use cirrus_core::{ContextWithStorage, ContextWithValue, HasError, StorageAddressBit};
+    use core::convert::Infallible;
+
+    struct PlainStorage {
+        bits: [bool; 1024],
+    }
+
+    impl HasError for PlainStorage {
+        type Error = Infallible;
+    }
+
+    impl ContextWithValue<bool> for PlainStorage {
+        type Wrapped = bool;
+    }
+
+    impl cirrus_core::ContextWithBitAnd<bool> for PlainStorage {
+        fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left && right)
+        }
+
+        fn bitand_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left &= right;
+            Ok(())
+        }
+    }
+
+    impl cirrus_core::ContextWithBitOr<bool> for PlainStorage {
+        fn bitor(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left || right)
+        }
+
+        fn bitor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left |= right;
+            Ok(())
+        }
+    }
+
+    impl cirrus_core::ContextWithBitXor<bool> for PlainStorage {
+        fn bitxor(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left != right)
+        }
+
+        fn bitxor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left ^= right;
+            Ok(())
+        }
+    }
+
+    impl ContextWithStorage<bool> for PlainStorage {
+        type Storage = [bool; 1024];
+
+        fn storage_read(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+        ) -> Result<bool, Infallible> {
+            let mut index = 0usize;
+            for (bit, lane) in address.iter().enumerate() {
+                index |= usize::from(lane.wire) << bit;
+            }
+            Ok(storage[index])
+        }
+
+        fn storage_write(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+            value: bool,
+        ) -> Result<(), Infallible> {
+            let mut index = 0usize;
+            for (bit, lane) in address.iter().enumerate() {
+                index |= usize::from(lane.wire) << bit;
+            }
+            storage[index] = value;
+            Ok(())
+        }
+    }
 
     fn word(value: u64) -> [bool; 64] {
         core::array::from_fn(|bit| (value >> bit) & 1 != 0)
@@ -2176,6 +2313,35 @@ mod tests {
             ),
             Err(DecodeError::Memory(160))
         );
+    }
+
+    #[test]
+    fn aapcs64_extra_arguments_use_eight_byte_storage_slots() {
+        let mut context = PlainStorage {
+            bits: [false; 1024],
+        };
+        let mut storage = [false; 1024];
+        let mut state = initial_state_with_arguments(false, &true, 64, &[]).unwrap();
+        let arguments =
+            core::array::from_fn::<_, 10, _>(|index| (word(index as u64), Some(index as u64)));
+        write_aapcs64_arguments(
+            &mut context,
+            &mut storage,
+            &mut state,
+            &false,
+            &true,
+            &arguments,
+        )
+        .unwrap();
+        assert_eq!(state.constants[7], Some(7));
+        for (index, value) in [8u64, 9].iter().enumerate() {
+            let slot = u64::from_le_bytes(core::array::from_fn(|byte| {
+                (0..8).fold(0u8, |value_bits, bit| {
+                    value_bits | u8::from(storage[512 + index * 64 + byte * 8 + bit]) << bit
+                })
+            }));
+            assert_eq!(slot, *value);
+        }
     }
 
     #[test]
