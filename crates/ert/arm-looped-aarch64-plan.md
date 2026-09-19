@@ -473,8 +473,8 @@ do not make the Thumb adapter depend on `disarm64`.
    body effects and next-IP selection, exits predicate done, and the public
    no-alloc `initial_step`/`step` API carries loop state across generations.
    The adapter now runs candidate bodies until a symbolic branch boundary
-   (including concrete direct branches and symbolic CBZ/CBNZ/TBZ/TBNZ) or
-   exit, rather than treating every facade step as one-instruction control.
+   (including concrete direct branches and symbolic B.cond/CBZ/CBNZ/TBZ/TBNZ)
+   or exit, rather than treating every facade step as one-instruction control.
    Remaining work is declared indirect-target handling, recording/precompute
    and equivalence tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
