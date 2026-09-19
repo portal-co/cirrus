@@ -1,9 +1,9 @@
 extern crate std;
 
 use crate::{
-    add_bits_with_carry_out, add_overflow, arm_condition, arm_condition_value,
-    arm_runtime_shift_with_carry, compare_word, subtract_overflow, subtract_word_with_carry_out,
-    zero_word, ComparePredicate, RawMemory, Shift,
+    ComparePredicate, RawMemory, Shift, add_bits_with_carry_out, add_overflow, arm_condition,
+    arm_condition_value, arm_runtime_shift_with_carry, compare_word, subtract_overflow,
+    subtract_word_with_carry_out, zero_word,
 };
 
 fn word(value: u32) -> [bool; 32] {
@@ -194,6 +194,19 @@ fn a_non_word_read_at_the_detect_address_falls_through_to_the_backing_bytes() {
 
     assert_eq!(memory.read::<1>(4), Some([5]));
     assert_eq!(memory.read::<2>(4), Some([5, 6]));
+}
+
+#[test]
+fn mutable_raw_memory_bounds_concrete_writes() {
+    let mut bytes = [0u8; 8];
+    let memory = RawMemory::from_mut_slice(&mut bytes);
+    assert_eq!(memory.write64(4, &0xdead_beefu32.to_le_bytes()), Some(()));
+    assert_eq!(memory.read64::<4>(4), Some(0xdead_beefu32.to_le_bytes()));
+    assert_eq!(memory.write64(5, &[0u8; 4]), None);
+    assert_eq!(
+        memory.read64::<8>(0),
+        Some([0, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde])
+    );
 }
 
 #[test]
