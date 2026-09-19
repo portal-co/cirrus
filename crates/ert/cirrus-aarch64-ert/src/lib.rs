@@ -206,10 +206,54 @@ where
             });
             Ok(Flow::Next(constant(next)))
         }
-        Instruction::TestBranch { .. }
-        | Instruction::BranchRegister { .. }
-        | Instruction::BranchLinkRegister { .. }
-        | Instruction::Return => Err(DecodeError::Unsupported(raw)),
+        Instruction::TestBranch {
+            register,
+            bit,
+            nonzero,
+            target,
+        } => {
+            let tested = if register == 31 {
+                zero.clone()
+            } else {
+                state.regs[register as usize][bit as usize].clone()
+            };
+            let condition = if nonzero {
+                tested
+            } else {
+                context
+                    .bitxor(tested, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            };
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
+        }
+        Instruction::BranchRegister { register } => {
+            let target = state.constants[register as usize].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::BranchLinkRegister { register } => {
+            let target = state.constants[register as usize].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            state.regs[30] = constant(next);
+            state.constants[30] = Some(next);
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::Return => {
+            let target = state.constants[30].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            Ok(Flow::Next(constant(target)))
+        }
         Instruction::SupervisorCall => Ok(Flow::Exit),
     }
 }
@@ -544,6 +588,34 @@ mod tests {
         assert_eq!(
             decode(0, 0x5280_001f),
             Err(DecodeError::Unsupported(0x5280_001f))
+        );
+    }
+
+    #[test]
+    fn test_and_register_branches_preserve_x31_and_require_concrete_targets() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(1 << 5);
+        let taken = step(&mut (), &mut state, 0x2000, 0x3728_0041, &false, &true).unwrap();
+        assert_eq!(taken, Flow::Next(word(0x2008)));
+        let xzr = step(&mut (), &mut state, 0x2000, 0x3628_005f, &false, &true).unwrap();
+        assert_eq!(xzr, Flow::Next(word(0x2008)));
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd61f_0020, &false, &true),
+            Err(DecodeError::Unsupported(0xd61f_0020))
+        );
+        state.constants[1] = Some(0x3000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd61f_0020, &false, &true),
+            Ok(Flow::Next(word(0x3000)))
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd63f_0020, &false, &true),
+            Ok(Flow::Next(word(0x3000)))
+        );
+        assert_eq!(state.constants[30], Some(0x2004));
+        assert_eq!(
+            step(&mut (), &mut state, 0x3000, 0xd65f_03c0, &false, &true),
+            Ok(Flow::Next(word(0x2004)))
         );
     }
 
