@@ -17,7 +17,10 @@
 //! protects this hand-extracted subset against accepting an undecodable word.
 
 use cirrus_core::ContextWithValue;
-use cirrus_ert_core::{ContextWithErtOps, add_bits, constant_word, invert_word, select_word};
+use cirrus_ert_core::{
+    ContextWithErtOps, add_bits_with_carry_out, add_overflow, arm_condition, constant_word,
+    invert_word, select_word, subtract_overflow, zero_word,
+};
 use disarm64::decoder;
 
 /// A symbolic A64 state with 31 GPRs and separate SP.
@@ -34,6 +37,10 @@ pub struct State<W> {
     pub constants: [Option<u64>; 31],
     /// Architectural stack pointer, distinct from x31/XZR.
     pub sp: u64,
+    /// NZCV flag wires in N, Z, C, V order.
+    pub nzcv: [W; 4],
+    /// Concrete NZCV facts in N, Z, C, V order, when known.
+    pub nzcv_constants: [Option<bool>; 4],
     /// Symbolic done wire accumulated by [`step`].
     pub done: W,
 }
@@ -53,6 +60,8 @@ pub fn initial_state<W: Clone>(zero: W) -> State<W> {
         regs: core::array::from_fn(|_| core::array::from_fn(|_| zero.clone())),
         constants: [None; 31],
         sp: 0,
+        nzcv: core::array::from_fn(|_| zero.clone()),
+        nzcv_constants: [Some(false); 4],
         done: zero,
     }
 }
@@ -85,12 +94,23 @@ where
             Ok(Flow::Next(constant(target)))
         }
         Instruction::ConditionalBranch { condition, target } => {
-            // NZCV state is not present until the arithmetic subset lands.
-            // Accept only AL here; all other conditions remain fail-closed.
-            if condition != 14 {
-                return Err(DecodeError::Unsupported(raw));
-            }
-            Ok(Flow::Next(constant(target)))
+            let condition = arm_condition(
+                context,
+                state.nzcv[0].clone(),
+                state.nzcv[1].clone(),
+                state.nzcv[2].clone(),
+                state.nzcv[3].clone(),
+                condition,
+                one,
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?
+            .ok_or(DecodeError::Malformed(raw))?;
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
         }
         Instruction::CompareBranch {
             register,
@@ -167,32 +187,22 @@ where
             source,
             immediate,
             subtract,
+            set_flags,
             width64,
         } => {
-            let source_word = &state.regs[source as usize];
+            let source_word = state.regs[source as usize].clone();
             let immediate_word = constant(immediate);
-            let result = if subtract {
-                let inverted = invert_word(context, &immediate_word, one.clone())
-                    .map_err(|_| DecodeError::Unsupported(raw))?;
-                add_bits(context, source_word, &inverted, one.clone())
-                    .map_err(|_| DecodeError::Unsupported(raw))?
-            } else {
-                add_bits(context, source_word, &immediate_word, zero.clone())
-                    .map_err(|_| DecodeError::Unsupported(raw))?
-            };
-            state.regs[dest as usize] = if width64 {
-                result
-            } else {
-                core::array::from_fn(|bit| {
-                    if bit < 32 {
-                        result[bit].clone()
-                    } else {
-                        zero.clone()
-                    }
-                })
-            };
+            let (result, carry_out) = arithmetic(
+                context,
+                &source_word,
+                &immediate_word,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
             let source_constant = state.constants[source as usize];
-            state.constants[dest as usize] = source_constant.map(|source| {
+            let result_constant = source_constant.map(|source| {
                 let result = if subtract {
                     source.wrapping_sub(immediate)
                 } else {
@@ -204,6 +214,25 @@ where
                     result & u64::from(u32::MAX)
                 }
             });
+            if set_flags {
+                update_nzcv(
+                    context,
+                    state,
+                    &source_word,
+                    &immediate_word,
+                    &result,
+                    carry_out,
+                    subtract,
+                    width64,
+                    source_constant,
+                    result_constant,
+                    one,
+                )?;
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
             Ok(Flow::Next(constant(next)))
         }
         Instruction::TestBranch {
@@ -258,6 +287,139 @@ where
     }
 }
 
+fn arithmetic<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    subtract: bool,
+    width64: bool,
+    zero: &W,
+    one: &W,
+) -> Result<([W; 64], W), DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        let right = if subtract {
+            invert_word(context, right, one.clone()).map_err(|_| DecodeError::Unsupported(0))?
+        } else {
+            right.clone()
+        };
+        add_bits_with_carry_out(
+            context,
+            left,
+            &right,
+            if subtract { one.clone() } else { zero.clone() },
+        )
+        .map_err(|_| DecodeError::Unsupported(0))
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let right32 = if subtract {
+            invert_word(context, &right32, one.clone()).map_err(|_| DecodeError::Unsupported(0))?
+        } else {
+            right32
+        };
+        let (low, carry) = add_bits_with_carry_out(
+            context,
+            &left32,
+            &right32,
+            if subtract { one.clone() } else { zero.clone() },
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        Ok((
+            core::array::from_fn(|bit| {
+                if bit < 32 {
+                    low[bit].clone()
+                } else {
+                    zero.clone()
+                }
+            }),
+            carry,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_nzcv<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    left: &[W; 64],
+    right: &[W; 64],
+    result: &[W; 64],
+    carry: W,
+    subtract: bool,
+    width64: bool,
+    left_constant: Option<u64>,
+    result_constant: Option<u64>,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let bits = if width64 { 64 } else { 32 };
+    let n = result[bits - 1].clone();
+    let z = if width64 {
+        zero_word(context, result, one)
+    } else {
+        let result32: [W; 32] = core::array::from_fn(|bit| result[bit].clone());
+        zero_word(context, &result32, one)
+    }
+    .map_err(|_| DecodeError::Unsupported(0))?;
+    let v = if subtract {
+        subtract_overflow(
+            context,
+            left[bits - 1].clone(),
+            right[bits - 1].clone(),
+            result[bits - 1].clone(),
+        )
+    } else {
+        add_overflow(
+            context,
+            left[bits - 1].clone(),
+            right[bits - 1].clone(),
+            result[bits - 1].clone(),
+        )
+    }
+    .map_err(|_| DecodeError::Unsupported(0))?;
+    state.nzcv = [n, z, carry, v];
+    let mask = if width64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    state.nzcv_constants =
+        left_constant
+            .zip(result_constant)
+            .map_or([None; 4], |(left, result)| {
+                let right = if subtract {
+                    left.wrapping_sub(result)
+                } else {
+                    result.wrapping_sub(left)
+                } & mask;
+                let sign = 1u64 << (bits - 1);
+                let carry = if subtract {
+                    left & mask >= right
+                } else {
+                    (left & mask) > mask - right
+                };
+                let overflow = if subtract {
+                    ((left ^ right) & (left ^ result) & sign) != 0
+                } else {
+                    ((left ^ result) & (right ^ result) & sign) != 0
+                };
+                [
+                    Some(result & sign != 0),
+                    Some(result & mask == 0),
+                    Some(carry),
+                    Some(overflow),
+                ]
+            });
+    Ok(())
+}
+
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
@@ -302,10 +464,10 @@ pub enum Instruction {
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
-    /// `ADD`/`SUB` immediate without flags. Register 31 forms are rejected
-    /// in this first cut because the encoding uses SP rather than XZR there.
+    /// `ADD`/`SUB` immediate. Register-31 sources are rejected in this first
+    /// cut because this encoding treats them as SP rather than XZR.
     AddImmediate {
-        /// Destination `Wd`/`Xd`, restricted to 0 through 30.
+        /// Destination `Wd`/`Xd`; 31 is accepted for flag-setting aliases.
         dest: u8,
         /// Source `Wn`/`Xn`, restricted to 0 through 30.
         source: u8,
@@ -313,6 +475,8 @@ pub enum Instruction {
         immediate: u64,
         /// Whether this is subtraction rather than addition.
         subtract: bool,
+        /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
+        set_flags: bool,
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
@@ -383,8 +547,10 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     if raw & 0x1f00_0000 == 0x1100_0000 {
         let dest = (raw & 31) as u8;
         let source = ((raw >> 5) & 31) as u8;
-        // Flag-setting forms need NZCV state and register-31 forms mean SP.
-        if raw & (1 << 29) != 0 || dest == 31 || source == 31 {
+        let set_flags = raw & (1 << 29) != 0;
+        // Source register 31 is SP for this encoding. Destination 31 is XZR
+        // for the flag-setting CMP/CMN aliases.
+        if source == 31 || (dest == 31 && !set_flags) {
             return Err(DecodeError::Unsupported(raw));
         }
         let immediate = u64::from((raw >> 10) & 0xfff) << if raw & (1 << 22) != 0 { 12 } else { 0 };
@@ -393,6 +559,7 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             source,
             immediate,
             subtract: raw & (1 << 30) != 0,
+            set_flags,
             width64: raw & (1 << 31) != 0,
         });
     }
@@ -539,6 +706,7 @@ mod tests {
                 source: 1,
                 immediate: 1,
                 subtract: false,
+                set_flags: false,
                 width64: true
             })
         );
@@ -560,6 +728,34 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn flag_setting_arithmetic_drives_conditional_branches_and_cmp_aliases() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(u64::MAX);
+        state.constants[1] = Some(u64::MAX);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xb100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0));
+        assert_eq!(
+            state.nzcv_constants,
+            [Some(false), Some(true), Some(true), Some(false)]
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x5400_0040, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        state.regs[1] = word(1);
+        state.constants[1] = Some(1);
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xf100_043f, &false, &true),
+            Ok(Flow::Next(word(0x2004)))
+        );
+        assert_eq!(state.constants[0], Some(0));
+        assert_eq!(state.nzcv_constants[1], Some(true));
     }
 
     #[test]
