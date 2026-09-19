@@ -52,6 +52,7 @@ where
         zero: W,
         one: W,
         vip: [W; 32],
+        done: W,
     ) -> Self {
         Self {
             handler,
@@ -67,7 +68,7 @@ where
             any_exit: false,
             vip: vip.clone(),
             next_vip: vip,
-            done: zero.clone(),
+            done,
         }
     }
 

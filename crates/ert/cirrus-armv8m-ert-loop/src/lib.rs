@@ -11,8 +11,9 @@
 //! virtual TrustZone state. A later wire-backed register/NZCV fold can only
 //! run after this agreement check has succeeded.
 
-use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState};
+use cirrus_armv8m_ert::{Flag, Machine, REG_COUNT, SecurityState, StorageRuntime};
 use cirrus_ert_core::ContextWithErtOps;
+pub use cirrus_ert_loop_core::CandidateTable;
 
 mod body;
 mod body_api;
@@ -21,6 +22,110 @@ mod generation;
 pub use body::{ThumbBoundary, execute_body};
 pub use body_api::execute_snapshot;
 pub use generation::{ThumbGenerationDriver, run_generation};
+
+/// The result of one shared-scheduler Thumb generation.
+#[derive(Clone)]
+pub struct ThumbStep<W, const FRAMES: usize> {
+    /// Folded architectural state for the next generation.
+    pub snapshot: ThumbSnapshot<W, FRAMES>,
+    /// Symbolic normalized virtual instruction pointer.
+    pub virtual_ip: [W; 32],
+    /// Accumulated symbolic completion wire.
+    pub done: W,
+    /// Whether every structurally represented path exited this generation.
+    pub exited: bool,
+}
+
+/// Build an initial Thumb snapshot at an odd Thumb entry pointer.
+///
+/// The public loop API normalizes the pointer to an even fetch PC internally,
+/// just as [`cirrus_armv8m_ert::ert_emit`] does. Register/stack ABI setup is
+/// intentionally separate: callers can set a snapshot's caller-owned fields
+/// before the first [`step`].
+#[allow(clippy::too_many_arguments)]
+pub fn initial_snapshot<H, W, E, const FRAMES: usize>(
+    handler: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: cirrus_armv8m_ert::RawMemory<'_>,
+    rstack: &mut [u32],
+    entry: u32,
+    zero: W,
+    one: W,
+) -> Result<ThumbSnapshot<W, FRAMES>, cirrus_armv8m_ert::ErtError<E>>
+where
+    H: cirrus_armv8m_ert::ArmHandler<bool, Wrapped = W, Error = E>,
+    W: Clone,
+    E: core::error::Error,
+{
+    if entry & 1 == 0 || storage_bits % 8 != 0 {
+        return Err(cirrus_armv8m_ert::ErtError::Unexpected);
+    }
+    let storage_bytes =
+        u32::try_from(storage_bits / 8).map_err(|_| cirrus_armv8m_ert::ErtError::Unexpected)?;
+    let mut runtime = StorageRuntime::new(handler, storage, zero.clone(), one.clone());
+    let mut regs = core::array::from_fn(|_| core::array::from_fn(|_| zero.clone()));
+    let mut constants = [None; REG_COUNT];
+    let machine = Machine::new(
+        &mut runtime,
+        mem,
+        rstack,
+        storage_bits,
+        entry & !1,
+        &mut regs,
+        &mut constants,
+        zero,
+        one,
+        storage_bytes,
+    );
+    ThumbSnapshot::capture(&machine)
+        .map_err(|ThumbSnapshotError::ReturnStackCapacity| cirrus_armv8m_ert::ErtError::Unexpected)
+}
+
+/// Execute one no-alloc Thumb loop generation through the shared scheduler.
+///
+/// `candidates` is caller-owned and must have enough capacity for both the
+/// current and next candidate sets. Carry the previous `done` wire into every
+/// call; it is folded with any exits reached by this generation.
+#[allow(clippy::too_many_arguments)]
+pub fn step<H, W, E, const FRAMES: usize>(
+    handler: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: cirrus_armv8m_ert::RawMemory<'_>,
+    rstack: &mut [u32],
+    candidates: &mut CandidateTable<'_, u32>,
+    snapshot: ThumbSnapshot<W, FRAMES>,
+    virtual_ip: [W; 32],
+    done: W,
+    zero: W,
+    one: W,
+) -> Result<ThumbStep<W, FRAMES>, cirrus_armv8m_ert::ErtError<E>>
+where
+    H: cirrus_armv8m_ert::ArmHandler<bool, Wrapped = W, Error = E>,
+    W: Clone,
+    E: core::error::Error,
+{
+    let driver = ThumbGenerationDriver::new(
+        handler,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        snapshot,
+        zero,
+        one,
+        virtual_ip,
+        done,
+    );
+    let (snapshot, virtual_ip, done, exited) = run_generation(candidates, driver)?;
+    Ok(ThumbStep {
+        snapshot,
+        virtual_ip,
+        done,
+        exited,
+    })
+}
 
 /// A snapshot could not fit in the caller-provided fixed return-frame array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +310,8 @@ where
     Ok(())
 }
 
+/// Concrete Arm state which may not be selected by a symbolic candidate
+/// predicate in the first Thumb loop-adapter cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThumbAgreement<const FRAMES: usize> {
     /// Concrete architectural stack pointer.
