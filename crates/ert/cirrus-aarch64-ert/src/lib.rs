@@ -556,6 +556,7 @@ where
             Ok(Flow::Next(constant(target)))
         }
         Instruction::StorePair { .. }
+        | Instruction::LoadPair { .. }
         | Instruction::LoadLiteral { .. }
         | Instruction::Load { .. }
         | Instruction::LoadExtend { .. }
@@ -623,6 +624,53 @@ where
             store_value(state, first, address, width, memory, raw)?;
             let second_address = address.wrapping_add(u64::from(width));
             store_value(state, second, second_address, width, memory, raw)?;
+            if matches!(mode, PairMode::PostIndex) {
+                if base == 31 {
+                    state.sp = new_base;
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+        }
+        Instruction::LoadPair {
+            first,
+            second,
+            base,
+            offset,
+            width,
+            mode,
+        } => {
+            let old_base = if base == 31 {
+                Some(state.sp)
+            } else {
+                register_constant(state, base)
+            }
+            .ok_or(DecodeError::Unsupported(raw))?;
+            let new_base = old_base.wrapping_add_signed(offset);
+            let address = match mode {
+                PairMode::SignedOffset | PairMode::PreIndex => new_base,
+                PairMode::PostIndex => old_base,
+            };
+            if matches!(mode, PairMode::PreIndex) {
+                if base == 31 {
+                    state.sp = new_base;
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+            load_literal(state, first, width, false, address, memory, zero, one)?;
+            load_literal(
+                state,
+                second,
+                width,
+                false,
+                address.wrapping_add(u64::from(width)),
+                memory,
+                zero,
+                one,
+            )?;
             if matches!(mode, PairMode::PostIndex) {
                 if base == 31 {
                     state.sp = new_base;
@@ -1056,6 +1104,21 @@ pub enum Instruction {
         /// Computed literal address.
         target: u64,
     },
+    /// Pre/post-indexed register pair load over SP or a concrete register base.
+    LoadPair {
+        /// First destination register; 31 discards the result.
+        first: u8,
+        /// Second destination register; 31 discards the result.
+        second: u8,
+        /// Base register; 31 denotes architectural SP.
+        base: u8,
+        /// Signed immediate byte offset, already size-scaled.
+        offset: i64,
+        /// Element width in bytes (four or eight).
+        width: u8,
+        /// Signed pair index mode.
+        mode: PairMode,
+    },
     /// Pre/post-indexed register pair store over SP or a concrete register base.
     StorePair {
         /// First source register; 31 stores zero.
@@ -1278,17 +1341,38 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             2 => 8,
             _ => return Err(DecodeError::Unsupported(raw)),
         };
-        if v || load {
+        if v {
             return Err(DecodeError::Unsupported(raw));
         }
         let base = ((raw >> 5) & 31) as u8;
-        return Ok(Instruction::StorePair {
-            first: (raw & 31) as u8,
-            second: ((raw >> 10) & 31) as u8,
+        let fields = (
+            (raw & 31) as u8,
+            ((raw >> 10) & 31) as u8,
             base,
-            offset: sign_extend(((raw >> 15) & 0x7f) << if size == 2 { 3 } else { 2 }, 10),
+            sign_extend(((raw >> 15) & 0x7f) << if size == 2 { 3 } else { 2 }, 10),
             width,
             mode,
+        );
+        return Ok(if load {
+            let (first, second, base, offset, width, mode) = fields;
+            Instruction::LoadPair {
+                first,
+                second,
+                base,
+                offset,
+                width,
+                mode,
+            }
+        } else {
+            let (first, second, base, offset, width, mode) = fields;
+            Instruction::StorePair {
+                first,
+                second,
+                base,
+                offset,
+                width,
+                mode,
+            }
         });
     }
     if raw & 0x3b20_0000 == 0x3900_0000 {
@@ -2035,6 +2119,53 @@ mod tests {
         assert_eq!(
             memory.read64::<8>(128),
             Some(0x99aa_bbcc_ddee_ff00u64.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn load_pair_restores_pair_and_applies_writeback() {
+        let mut bytes = [0u8; 160];
+        bytes[112..120].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes[120..128].copy_from_slice(&0x99aa_bbcc_ddee_ff00u64.to_le_bytes());
+        let memory = RawMemory::from_mut_slice(&mut bytes);
+        let mut state = initial_state_with_arguments(false, 112, &[]).unwrap();
+        assert_eq!(
+            decode(0x1000, 0xa8c2_7bfd),
+            Ok(Instruction::LoadPair {
+                first: 29,
+                second: 30,
+                base: 31,
+                offset: 32,
+                width: 8,
+                mode: PairMode::PostIndex,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xa8c2_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.sp, 144);
+        assert_eq!(state.constants[29], Some(0x1122_3344_5566_7788));
+        assert_eq!(state.constants[30], Some(0x99aa_bbcc_ddee_ff00));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xa941_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Memory(160))
         );
     }
 
