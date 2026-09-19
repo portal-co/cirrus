@@ -11,15 +11,15 @@
 use core::{array, marker::PhantomData, mem::MaybeUninit};
 
 use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
-use volar_circuit_exec_core::{select as emit_select, SelectEmitter};
+use volar_circuit_exec_core::{SelectEmitter, select as emit_select};
 
 mod compare;
 #[cfg(test)]
 mod tests;
 
 pub use compare::{
-    add_overflow, arm_condition, arm_condition_value, compare_word, subtract_overflow,
-    subtract_word_with_carry_out, zero_word, ComparePredicate,
+    ComparePredicate, add_overflow, arm_condition, arm_condition_value, compare_word,
+    subtract_overflow, subtract_word_with_carry_out, zero_word,
 };
 
 /// The Boolean operations needed by the shared symbolic-word machinery.
@@ -170,6 +170,17 @@ impl<'a> RawMemory<'a> {
         }
     }
 
+    /// Borrow `memory` as a bounded mutable mapping rooted at guest address
+    /// zero. Concrete stores are restricted to this mapping.
+    pub fn from_mut_slice(memory: &'a mut [u8]) -> Self {
+        Self {
+            base: memory.as_ptr(),
+            len: Some(memory.len()),
+            detect: None,
+            marker: PhantomData,
+        }
+    }
+
     /// Overlay a 4-byte little-endian word read at `address` with `value`, in
     /// place of the underlying backing bytes. This lets guest code that reads
     /// its real (e.g. zero-initialized) value when run natively detect
@@ -207,6 +218,36 @@ impl<'a> RawMemory<'a> {
         }))
     }
 
+    /// Write bytes at a 64-bit guest address, rejecting an overflowing or
+    /// out-of-range range before any pointer is dereferenced.
+    ///
+    /// This requires a mutable mapping created with [`RawMemory::from_mut_slice`]
+    /// or an unsafe writable constructor contract supplied by the caller.
+    #[doc(hidden)]
+    pub fn write64(&self, address: u64, bytes: &[u8]) -> Option<()> {
+        if bytes.is_empty() {
+            return Some(());
+        }
+        address.checked_add(bytes.len().checked_sub(1)? as u64)?;
+        if let Some(len) = self.len {
+            let start = usize::try_from(address).ok()?;
+            if start.checked_add(bytes.len())? > len {
+                return None;
+            }
+        }
+        // SAFETY: bounded ranges were checked above. For an unbounded mapping,
+        // the caller's `RawMemory` contract covers every concrete byte reached
+        // by execution; mutable variants additionally guarantee writability.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.base.cast_mut().wrapping_add(address as usize),
+                bytes.len(),
+            );
+        }
+        Some(())
+    }
+
     /// Read a fixed number of bytes, rejecting an overflowing or out-of-range
     /// address before any pointer is dereferenced.
     #[doc(hidden)]
@@ -214,6 +255,12 @@ impl<'a> RawMemory<'a> {
         debug_assert!(N > 0);
         address.checked_add(N.checked_sub(1)? as u32)?;
         self.read64(u64::from(address))
+    }
+}
+
+impl<'a> From<&'a mut [u8]> for RawMemory<'a> {
+    fn from(memory: &'a mut [u8]) -> Self {
+        Self::from_mut_slice(memory)
     }
 }
 
@@ -475,9 +522,7 @@ pub fn fixed_shift<W: Clone, const N: usize>(
         Shift::Left if destination_bit >= amount as usize => {
             source[destination_bit - amount as usize].clone()
         }
-        Shift::LogicalRight | Shift::ArithmeticRight
-            if destination_bit + (amount as usize) < N =>
-        {
+        Shift::LogicalRight | Shift::ArithmeticRight if destination_bit + (amount as usize) < N => {
             source[destination_bit + amount as usize].clone()
         }
         Shift::RotateRight => {
