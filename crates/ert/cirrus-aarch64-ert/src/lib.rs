@@ -6,9 +6,9 @@
 //! [`disarm64`] is used only as a classification guard. Every instruction
 //! accepted here must also satisfy an ERT-owned raw mask and field extractor;
 //! a successful broad decoder result never expands the supported ISA by
-//! itself. The initial Phase 3 cut contains only PC-relative/control-flow and
-//! `SVC #0` forms, establishing the audited decoder boundary before symbolic
-//! arithmetic and memory semantics are added.
+//! itself. The Phase 3 foundation contains audited control flow, move-wide
+//! constants, and immediate arithmetic/NZCV semantics; unlisted arithmetic
+//! and all memory forms remain fail-closed.
 //!
 //! Instruction field definitions follow Arm A-profile Architecture Reference
 //! Manual DDI0487 A64 encoding tables: B/BL (`C4.1.4`), B.cond (`C4.1.5`),
@@ -66,11 +66,11 @@ pub fn initial_state<W: Clone>(zero: W) -> State<W> {
     }
 }
 
-/// Execute the audited control-flow subset over a symbolic state.
+/// Execute the audited Phase 3 subset over a symbolic state.
 ///
-/// Data-processing and memory forms remain rejected in Phase 3's first cut.
 /// Direct control uses constant targets; conditional forms emit a 64-bit
 /// virtual-IP select. `CBZ`/`CBNZ` only reads `x0..x30`; `x31` remains XZR.
+/// Unlisted data-processing and every memory form fail closed.
 pub fn step<C, W>(
     context: &mut C,
     state: &mut State<W>,

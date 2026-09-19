@@ -441,8 +441,13 @@ do not make the Thumb adapter depend on `disarm64`.
    `cirrus-ert-loop-core`; complete callback-driven scheduling remains.
 3. `[AI] Add Thumb adapter to the ERT loop driver` — promoted internal seam,
    full Thumb state folding, hooks-at-boundaries, host gate.
-4. `[AI] Add AArch64 ERT facade with disarm64 decoding` — narrow single-pass
-   subset, guest/runtime and host ELF tests.
+4. `[AI] Add AArch64 ERT facade with disarm64 decoding` — **in progress**:
+   the allocation-free facade has an ERT-owned, `disarm64`-guarded decoder;
+   symbolic state now executes direct/compare/test/register control flow,
+   canonical `RET x30`, `MOVZ`/`MOVK`, and `ADD`/`SUB` immediate including
+   `ADDS`/`SUBS` NZCV and `CMP`/`CMN` aliases. Remaining work is shifted
+   register arithmetic, addressing/memory, the AAPCS64/SVC runtime ABI and
+   host fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
