@@ -353,7 +353,7 @@ pub fn merge_agreement<const FRAMES: usize>(
 }
 
 #[cfg(test)]
-extern crate std;
+mod api_tests;
 
 #[cfg(test)]
 mod tests {
