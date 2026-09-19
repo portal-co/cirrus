@@ -388,6 +388,30 @@ where
             }
             Ok(Flow::Next(constant(next)))
         }
+        Instruction::MultiplyHigh {
+            dest,
+            left,
+            right,
+            signed,
+            width64,
+        } => {
+            let result = multiply_high(
+                context,
+                &register_word(state, left, zero),
+                &register_word(state, right, zero),
+                signed,
+                width64,
+                zero,
+                one,
+            )?;
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = register_constant(state, left)
+                    .zip(register_constant(state, right))
+                    .map(|(left, right)| multiply_high_constant(left, right, signed, width64));
+            }
+            Ok(Flow::Next(constant(next)))
+        }
         Instruction::MultiplyAdd {
             dest,
             left,
@@ -1170,6 +1194,112 @@ where
     Ok(accumulator)
 }
 
+fn multiply_high<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    signed: bool,
+    width64: bool,
+    zero: &W,
+    one: &W,
+) -> Result<[W; 64], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        multiply_high_word(context, left, right, signed, zero, one)
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let high = multiply_high_word(context, &left32, &right32, signed, zero, one)?;
+        Ok(core::array::from_fn(|bit| {
+            if bit < 32 {
+                high[bit].clone()
+            } else {
+                zero.clone()
+            }
+        }))
+    }
+}
+
+fn multiply_high_word<C, W, const N: usize>(
+    context: &mut C,
+    left: &[W; N],
+    right: &[W; N],
+    signed: bool,
+    zero: &W,
+    one: &W,
+) -> Result<[W; N], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut low: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut high: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut addend_low = left.clone();
+    let mut addend_high: [W; N] = core::array::from_fn(|_| zero.clone());
+    for bit in 0..N {
+        let (sum_low, carry) = add_bits_with_carry_out(context, &low, &addend_low, zero.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let sum_high = add_bits(context, &high, &addend_high, carry)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        low = select_word(context, right[bit].clone(), &sum_low, &low)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = select_word(context, right[bit].clone(), &sum_high, &high)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let top = addend_low[N - 1].clone();
+        addend_low = fixed_shift(&addend_low, 1, Shift::Left, zero);
+        addend_high = fixed_shift(&addend_high, 1, Shift::Left, zero);
+        addend_high[0] = top;
+    }
+    if signed {
+        let correction = select_word(
+            context,
+            left[N - 1].clone(),
+            right,
+            &core::array::from_fn::<_, N, _>(|_| zero.clone()),
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        let inverted = invert_word(context, &correction, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = add_bits(context, &high, &inverted, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let correction = select_word(
+            context,
+            right[N - 1].clone(),
+            left,
+            &core::array::from_fn::<_, N, _>(|_| zero.clone()),
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        let inverted = invert_word(context, &correction, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = add_bits(context, &high, &inverted, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+    }
+    Ok(high)
+}
+
+fn multiply_high_constant(left: u64, right: u64, signed: bool, width64: bool) -> u64 {
+    if width64 {
+        let product = if signed {
+            ((left as i64 as i128) * (right as i64 as i128)) as u128
+        } else {
+            (left as u128) * (right as u128)
+        };
+        (product >> 64) as u64
+    } else {
+        let left = left as u32;
+        let right = right as u32;
+        let product = if signed {
+            ((left as i32 as i64) * (right as i32 as i64)) as u64
+        } else {
+            u64::from(left) * u64::from(right)
+        };
+        product >> 32
+    }
+}
+
 fn register_word<W: Clone>(state: &State<W>, register: u8, zero: &W) -> [W; 64] {
     if register == 31 {
         core::array::from_fn(|_| zero.clone())
@@ -1394,6 +1524,19 @@ pub enum Instruction {
         subtract: bool,
         /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
         set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `SMULH`/`UMULH` high-half multiply.
+    MultiplyHigh {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// First multiplier, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Second multiplier, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Whether both operands are signed.
+        signed: bool,
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
@@ -1726,6 +1869,16 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             immediate,
             subtract: raw & (1 << 30) != 0,
             set_flags,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_8000 == 0x1b40_0000 || raw & 0x7fe0_8000 == 0x1bc0_0000 {
+        let signed = raw & 0x7fe0_8000 == 0x1b40_0000;
+        return Ok(Instruction::MultiplyHigh {
+            dest: (raw & 31) as u8,
+            left: ((raw >> 5) & 31) as u8,
+            right: ((raw >> 16) & 31) as u8,
+            signed,
             width64: raw & (1 << 31) != 0,
         });
     }
@@ -2506,6 +2659,37 @@ mod tests {
             Ok(Flow::Exit)
         );
         assert!(state.done);
+    }
+
+    #[test]
+    fn high_multiplies_handle_signed_and_unsigned_halves() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(u64::MAX);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(u64::MAX);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            decode(0x1000, 0x9bc2_7c20),
+            Ok(Instruction::MultiplyHigh {
+                dest: 0,
+                left: 1,
+                right: 2,
+                signed: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9bc2_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(1));
+        assert_eq!(state.constants[0], Some(1));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9b42_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(u64::MAX));
+        assert_eq!(state.constants[0], Some(u64::MAX));
     }
 
     #[test]

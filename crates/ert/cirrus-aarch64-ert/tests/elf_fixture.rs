@@ -5,7 +5,7 @@ use std::{
     sync::OnceLock,
 };
 
-use cirrus_aarch64_ert::{Flow, RawMemory, initial_state_with_arguments, step_with_hash};
+use cirrus_aarch64_ert::{Flow, RawMemory, decode, initial_state_with_arguments, step_with_hash};
 
 const TARGET: &str = "aarch64-unknown-none";
 const BASE: u64 = 0x4000_0000;
@@ -47,6 +47,16 @@ fn aarch64_selftest_host_fixture_decodes_and_exits() {
                 assert_eq!(state.constants[0], Some(u64::MAX));
                 assert!(state.done);
                 return;
+            }
+            Err(cirrus_aarch64_ert::DecodeError::Unsupported(raw))
+                if matches!(
+                    decode(pc, raw),
+                    Ok(cirrus_aarch64_ert::Instruction::Store { .. })
+                ) =>
+            {
+                // The selftest's optional UART marker is outside the audited
+                // ERT memory model. Continue to the next instruction.
+                pc = pc.wrapping_add(4);
             }
             Err(error) => panic!("fixture failed at {pc:#x} raw={raw:#010x}: {error:?}"),
         }
