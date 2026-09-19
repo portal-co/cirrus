@@ -444,9 +444,10 @@ do not make the Thumb adapter depend on `disarm64`.
 4. `[AI] Add AArch64 ERT facade with disarm64 decoding` — **in progress**:
    the allocation-free facade has an ERT-owned, `disarm64`-guarded decoder;
    symbolic state now executes direct/compare/test/register control flow,
-   canonical `RET x30`, `MOVZ`/`MOVK`, and `ADD`/`SUB` immediate including
-   `ADDS`/`SUBS` NZCV and `CMP`/`CMN` aliases. Remaining work is shifted
-   register arithmetic, addressing/memory, the AAPCS64/SVC runtime ABI and
+   canonical `RET x30`, `ADR`/`ADRP`, `MOVZ`/`MOVK`, immediate and shifted
+   register `ADD`/`SUB` (including `ADDS`/`SUBS`, `CMP`/`CMN` aliases, NZCV),
+   and logical shifted-register forms including `TST`. Remaining work is
+   multiply/select forms, addressing/memory, the AAPCS64/SVC runtime ABI and
    host fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
