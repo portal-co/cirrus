@@ -120,6 +120,48 @@ where
                     .map_err(|_| DecodeError::Unsupported(raw))?,
             ))
         }
+        Instruction::MoveWide {
+            dest,
+            immediate,
+            shift,
+            keep,
+            width64,
+        } => {
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let field_mask = 0xffffu64 << shift;
+            let inserted = immediate << shift;
+            let result = if keep {
+                let previous = &state.regs[dest as usize];
+                let mut output = core::array::from_fn(|_| zero.clone());
+                for bit in 0..64 {
+                    let retained = if (field_mask >> bit) & 1 == 0 {
+                        previous[bit].clone()
+                    } else {
+                        zero.clone()
+                    };
+                    output[bit] = if (inserted >> bit) & 1 != 0 {
+                        one.clone()
+                    } else {
+                        retained
+                    };
+                }
+                output
+            } else {
+                constant(inserted & mask)
+            };
+            state.regs[dest as usize] = result;
+            state.constants[dest as usize] = if keep {
+                state.constants[dest as usize]
+                    .map(|previous| ((previous & !field_mask) | inserted) & mask)
+            } else {
+                Some(inserted & mask)
+            };
+            Ok(Flow::Next(constant(next)))
+        }
         Instruction::AddImmediate {
             dest,
             source,
@@ -203,6 +245,19 @@ pub enum Instruction {
         /// Destination fetch address when the condition holds.
         target: u64,
     },
+    /// `MOVZ` or `MOVK` immediate. `MOVN` remains unsupported in this cut.
+    MoveWide {
+        /// Destination `Wd`/`Xd`, restricted to 0 through 30.
+        dest: u8,
+        /// 16-bit immediate payload.
+        immediate: u64,
+        /// Bit position of the immediate payload (a multiple of 16).
+        shift: u32,
+        /// Whether this is MOVK (keep other bits) rather than MOVZ.
+        keep: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
     /// `ADD`/`SUB` immediate without flags. Register 31 forms are rejected
     /// in this first cut because the encoding uses SP rather than XZR there.
     AddImmediate {
@@ -266,6 +321,21 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x7f80_0000 == 0x5280_0000 || raw & 0x7f80_0000 == 0x7280_0000 {
+        let dest = (raw & 31) as u8;
+        let width64 = raw & (1 << 31) != 0;
+        let shift = ((raw >> 21) & 3) * 16;
+        if dest == 31 || (!width64 && shift >= 32) {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::MoveWide {
+            dest,
+            immediate: u64::from((raw >> 5) & 0xffff),
+            shift,
+            keep: raw & 0x7f80_0000 == 0x7280_0000,
+            width64,
+        });
+    }
     if raw & 0x1f00_0000 == 0x1100_0000 {
         let dest = (raw & 31) as u8;
         let source = ((raw >> 5) & 31) as u8;
@@ -445,6 +515,35 @@ mod tests {
         assert_eq!(
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
+        );
+    }
+
+    #[test]
+    fn movz_movk_decode_and_update_only_the_selected_halfword() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0, 0xd282_4680),
+            Ok(Instruction::MoveWide {
+                dest: 0,
+                immediate: 0x1234,
+                shift: 0,
+                keep: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0, 0xd282_4680, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.regs[0], word(0x1234));
+        assert_eq!(
+            step(&mut (), &mut state, 4, 0xf2a2_4680, &false, &true),
+            Ok(Flow::Next(word(8)))
+        );
+        assert_eq!(state.regs[0], word(0x1234_1234));
+        assert_eq!(
+            decode(0, 0x5280_001f),
+            Err(DecodeError::Unsupported(0x5280_001f))
         );
     }
 
