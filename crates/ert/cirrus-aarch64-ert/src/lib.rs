@@ -19,8 +19,8 @@
 use cirrus_core::ContextWithValue;
 use cirrus_ert_core::{
     BitOp, ContextWithErtOps, Shift, add_bits_with_carry_out, add_overflow, arm_condition,
-    bitwise_word, constant_word, fixed_shift, invert_word, select_word, subtract_overflow,
-    zero_word,
+    arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word, select_word,
+    subtract_overflow, zero_word,
 };
 use disarm64::decoder;
 
@@ -238,6 +238,65 @@ where
             if dest != 31 {
                 state.regs[dest as usize] = result;
                 state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::ConditionalSelect {
+            dest,
+            when_true,
+            when_false,
+            condition,
+            width64,
+        } => {
+            let condition_wire = arm_condition(
+                context,
+                state.nzcv[0].clone(),
+                state.nzcv[1].clone(),
+                state.nzcv[2].clone(),
+                state.nzcv[3].clone(),
+                condition,
+                one,
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?
+            .ok_or(DecodeError::Malformed(raw))?;
+            let selected = select_word(
+                context,
+                condition_wire,
+                &register_word(state, when_true, zero),
+                &register_word(state, when_false, zero),
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?;
+            let selected = if width64 {
+                selected
+            } else {
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        selected[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            if dest != 31 {
+                state.regs[dest as usize] = selected;
+                state.constants[dest as usize] = arm_condition_value(
+                    state.nzcv_constants[0],
+                    state.nzcv_constants[1],
+                    state.nzcv_constants[2],
+                    state.nzcv_constants[3],
+                    condition,
+                )
+                .ok_or(DecodeError::Malformed(raw))?
+                .and_then(|condition| {
+                    register_constant(state, if condition { when_true } else { when_false })
+                })
+                .map(|value| {
+                    if width64 {
+                        value
+                    } else {
+                        value & u64::from(u32::MAX)
+                    }
+                });
             }
             Ok(Flow::Next(constant(next)))
         }
@@ -692,6 +751,19 @@ pub enum Instruction {
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
+    /// `CSEL`, selecting between two registers using NZCV.
+    ConditionalSelect {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// Register selected when the condition holds, with 31 denoting XZR/WZR.
+        when_true: u8,
+        /// Register selected when the condition does not hold, with 31 denoting XZR/WZR.
+        when_false: u8,
+        /// Arm NZCV condition code.
+        condition: u8,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
     /// Logical shifted-register operation, including the flag-setting TST alias.
     LogicalRegister {
         /// Destination `Wd`/`Xd`; 31 discards the result.
@@ -822,6 +894,19 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             immediate,
             subtract: raw & (1 << 30) != 0,
             set_flags,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_0c00 == 0x1a80_0000 {
+        let condition = ((raw >> 12) & 15) as u8;
+        if condition >= 14 {
+            return Err(DecodeError::Malformed(raw));
+        }
+        return Ok(Instruction::ConditionalSelect {
+            dest: (raw & 31) as u8,
+            when_true: ((raw >> 5) & 31) as u8,
+            when_false: ((raw >> 16) & 31) as u8,
+            condition,
             width64: raw & (1 << 31) != 0,
         });
     }
@@ -1051,6 +1136,43 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn csel_selects_from_nzcv_and_preserves_xzr() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(0x11);
+        state.regs[2] = word(0x22);
+        state.constants[1] = Some(0x11);
+        state.constants[2] = Some(0x22);
+        assert_eq!(
+            decode(0x1000, 0x9a82_0020),
+            Ok(Instruction::ConditionalSelect {
+                dest: 0,
+                when_true: 1,
+                when_false: 2,
+                condition: 0,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9a82_0020, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0x22));
+        state.nzcv = [false, true, false, false];
+        state.nzcv_constants = [Some(false), Some(true), Some(false), Some(false)];
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9a82_0020, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(0x11));
+        assert_eq!(state.constants[0], Some(0x11));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0x9a9f_03e0, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(0));
     }
 
     #[test]
