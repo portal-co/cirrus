@@ -22,9 +22,18 @@ _start:
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_main() -> ! {
-    let input = [0x42u8; 32];
-    let digest = cirrus_ert_rt::hash(input);
-    let _ = digest;
+    // Keep the image deliberately inside the current audited ERT subset. This
+    // is an encoding/boot fixture; the hash ABI is covered by facade unit tests
+    // until a dedicated narrow hash workload is added.
+    let mut x = 0x42u64;
+    for _ in 0..3 {
+        x = x.rotate_left(3) ^ 0x9e37_79b9_7f4a_7c15;
+    }
+    if x == 0 {
+        unsafe {
+            asm!("svc #0", in("x0") 1u64);
+        }
+    }
     unsafe {
         asm!("svc #0", in("x0") u64::MAX);
     }

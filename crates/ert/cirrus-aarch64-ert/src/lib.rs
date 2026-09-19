@@ -18,11 +18,13 @@
 
 use cirrus_core::{ContextWithStorage, ContextWithValue, StorageAddressBit};
 use cirrus_ert_core::{
-    BitOp, ContextWithErtOps, RawMemory, Shift, add_bits, add_bits_with_carry_out, add_overflow,
+    BitOp, ContextWithErtOps, Shift, add_bits, add_bits_with_carry_out, add_overflow,
     arm_condition, arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word,
     select_word, subtract_overflow, zero_word,
 };
 use disarm64::decoder;
+
+pub use cirrus_ert_core::RawMemory;
 
 /// A symbolic A64 state with 31 GPRs and separate SP.
 ///
@@ -226,6 +228,12 @@ where
             state.constants[dest as usize] = Some(target);
             Ok(Flow::Next(constant(next)))
         }
+        Instruction::MoveStackPointer { source } => {
+            state.sp_word = state.regs[source as usize].clone();
+            state.sp = state.constants[source as usize];
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::NoOperation => Ok(Flow::Next(constant(next))),
         Instruction::Branch { target } => Ok(Flow::Next(constant(target))),
         Instruction::BranchLink { target } => {
             state.regs[30] = constant(next);
@@ -284,6 +292,7 @@ where
             immediate,
             shift,
             keep,
+            inverted,
             width64,
         } => {
             let mask = if width64 {
@@ -292,7 +301,12 @@ where
                 u64::from(u32::MAX)
             };
             let field_mask = 0xffffu64 << shift;
-            let inserted = immediate << shift;
+            let shifted = immediate << shift;
+            let inserted = if inverted {
+                !shifted & mask
+            } else {
+                shifted & mask
+            };
             let result = if keep {
                 let previous = &state.regs[dest as usize];
                 let mut output = core::array::from_fn(|_| zero.clone());
@@ -1317,6 +1331,13 @@ pub enum Instruction {
         /// Computed PC-relative address.
         target: u64,
     },
+    /// `MOV SP, Xn` architectural SP assignment.
+    MoveStackPointer {
+        /// Source register, restricted to 0 through 30.
+        source: u8,
+    },
+    /// `NOP` (`HINT #0`) only; other HINT/system encodings remain rejected.
+    NoOperation,
     /// `B imm26`; target is `pc + sign_extend(imm26 << 2)`.
     Branch {
         /// Destination fetch address.
@@ -1345,7 +1366,7 @@ pub enum Instruction {
         /// Destination fetch address when the condition holds.
         target: u64,
     },
-    /// `MOVZ` or `MOVK` immediate. `MOVN` remains unsupported in this cut.
+    /// `MOVZ`, `MOVK`, or `MOVN` immediate.
     MoveWide {
         /// Destination `Wd`/`Xd`, restricted to 0 through 30.
         dest: u8,
@@ -1353,8 +1374,10 @@ pub enum Instruction {
         immediate: u64,
         /// Bit position of the immediate payload (a multiple of 16).
         shift: u32,
-        /// Whether this is MOVK (keep other bits) rather than MOVZ.
+        /// Whether this is MOVK (keep other bits) rather than MOVZ/MOVN.
         keep: bool,
+        /// Whether this is MOVN, bitwise-inverting the immediate field.
+        inverted: bool,
         /// Whether this is the 64-bit X-register form.
         width64: bool,
     },
@@ -1502,6 +1525,17 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0xffff_ffe0 == 0x9100_0000 {
+        let dest = raw & 31;
+        let source = ((raw >> 5) & 31) as u8;
+        if dest != 31 || source == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::MoveStackPointer { source });
+    }
+    if raw == 0xd503_201f {
+        return Ok(Instruction::NoOperation);
+    }
     if raw & 0x7e00_0000 == 0x2800_0000 {
         let size = (raw >> 30) & 3;
         let v = raw & (1 << 26) != 0;
@@ -1659,7 +1693,7 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             base.wrapping_add_signed(sign_extend(immediate, 21) << if page { 12 } else { 0 });
         return Ok(Instruction::Address { dest, target });
     }
-    if raw & 0x7f80_0000 == 0x5280_0000 || raw & 0x7f80_0000 == 0x7280_0000 {
+    if matches!(raw & 0x7f80_0000, 0x1280_0000 | 0x5280_0000 | 0x7280_0000) {
         let dest = (raw & 31) as u8;
         let width64 = raw & (1 << 31) != 0;
         let shift = ((raw >> 21) & 3) * 16;
@@ -1671,6 +1705,7 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
             immediate: u64::from((raw >> 5) & 0xffff),
             shift,
             keep: raw & 0x7f80_0000 == 0x7280_0000,
+            inverted: raw & 0x7f80_0000 == 0x1280_0000,
             width64,
         });
     }
@@ -1679,7 +1714,8 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
         let source = ((raw >> 5) & 31) as u8;
         let set_flags = raw & (1 << 29) != 0;
         // Source register 31 is SP for this encoding. Destination 31 is XZR
-        // for the flag-setting CMP/CMN aliases.
+        // for the flag-setting CMP/CMN aliases; without flags it is the MOV
+        // SP, Xn architectural SP assignment.
         if source == 31 || (dest == 31 && !set_flags) {
             return Err(DecodeError::Unsupported(raw));
         }
@@ -1861,9 +1897,7 @@ mod tests {
     use cirrus_core::{ContextWithStorage, ContextWithValue, HasError, StorageAddressBit};
     use core::convert::Infallible;
 
-    struct PlainStorage {
-        bits: [bool; 1024],
-    }
+    struct PlainStorage;
 
     impl HasError for PlainStorage {
         type Error = Infallible;
@@ -2426,9 +2460,7 @@ mod tests {
 
     #[test]
     fn aapcs64_extra_arguments_use_eight_byte_storage_slots() {
-        let mut context = PlainStorage {
-            bits: [false; 1024],
-        };
+        let mut context = PlainStorage;
         let mut storage = [false; 1024];
         let mut state = initial_state_with_arguments(false, &true, 64, &[]).unwrap();
         let arguments =
@@ -2761,6 +2793,7 @@ mod tests {
                 immediate: 0x1234,
                 shift: 0,
                 keep: false,
+                inverted: false,
                 width64: true,
             })
         );
@@ -2827,9 +2860,10 @@ mod tests {
             decode(2, 0x1400_0000),
             Err(DecodeError::Malformed(0x1400_0000))
         );
+        assert_eq!(decode(0, 0xd503_201f), Ok(Instruction::NoOperation));
         assert_eq!(
-            decode(0, 0xd503_201f),
-            Err(DecodeError::Unsupported(0xd503_201f))
+            decode(0, 0xd503_203f),
+            Err(DecodeError::Unsupported(0xd503_203f))
         );
     }
 }
