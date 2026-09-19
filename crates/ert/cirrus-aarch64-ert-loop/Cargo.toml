@@ -4,6 +4,10 @@ edition = "2024"
 version.workspace = true
 description = "Looped symbolic AArch64 ERT adapter"
 
+[features]
+default = []
+precompute = []
+
 [dependencies]
 cirrus-aarch64-ert = { version = "0.1.0", path = "../cirrus-aarch64-ert" }
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }

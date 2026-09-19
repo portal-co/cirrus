@@ -7,6 +7,9 @@
 //! this crate provides boundary snapshots, concrete agreement, and predicated
 //! folding for the shared candidate scheduler.
 
+#[cfg(feature = "precompute")]
+extern crate alloc;
+
 use cirrus_aarch64_ert::{DecodeError, Flow, RawMemory, State, step as execute_instruction};
 use cirrus_ert_loop_core::{
     CandidateDriver, CandidateTable, DriveError, drive_generation, predicated_value,
@@ -116,6 +119,12 @@ where
     }
     Ok(())
 }
+
+#[cfg(feature = "precompute")]
+mod program;
+
+#[cfg(feature = "precompute")]
+pub use program::Aarch64LoopedProgram;
 
 /// The result of one shared-scheduler AArch64 generation.
 #[derive(Clone)]
