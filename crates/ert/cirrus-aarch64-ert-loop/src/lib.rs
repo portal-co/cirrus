@@ -159,6 +159,7 @@ pub fn step<C, W>(
     memory: RawMemory<'_>,
     zero: &W,
     one: &W,
+    indirect: &[Aarch64IndirectTargets<'_>],
 ) -> Result<Aarch64Step<W>, DriveError<Aarch64DriveError<C::Error>>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -175,6 +176,7 @@ where
         memory,
         zero,
         one,
+        indirect,
     )?;
     let done = predicated_value(context, previous.done.clone(), one.clone(), generation_done)
         .map_err(Aarch64DriveError::Context)
@@ -199,8 +201,31 @@ pub enum Aarch64Boundary<W> {
         /// Concrete fallthrough target.
         fallthrough: u64,
     },
+    /// The body stopped at a declared bounded indirect branch target set.
+    IndirectBranch {
+        /// Symbolic selected next-PC word.
+        next: [W; 64],
+        /// Declared concrete targets in caller declaration order.
+        targets: [u64; 8],
+        /// Number of live entries in `targets`.
+        len: usize,
+    },
     /// The body reached the declared SVC exit.
     Exit,
+}
+
+/// The declared exhaustive target set of one bounded indirect A64 branch.
+///
+/// Register 31 is rejected by the facade decoder, so the adapter can key
+/// declarations by instruction PC. The declaration must be exhaustive: the
+/// constant mux's last leaf is the default, so an undeclared reachable target
+/// would silently resolve to it.
+#[derive(Clone, Copy, Debug)]
+pub struct Aarch64IndirectTargets<'a> {
+    /// The `BR`/`BLR` instruction address.
+    pub pc: u64,
+    /// Every concrete target the instruction may resolve to.
+    pub targets: &'a [u64],
 }
 
 /// Detect and resolve a symbolic A64 conditional-branch boundary.
@@ -337,6 +362,7 @@ pub fn execute_body<C, W>(
     memory: RawMemory<'_>,
     zero: &W,
     one: &W,
+    indirect: &[Aarch64IndirectTargets<'_>],
 ) -> Result<Aarch64Boundary<W>, Aarch64DriveError<C::Error>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -356,6 +382,45 @@ where
             .map_err(Aarch64DriveError::Context)?
         {
             return Ok(boundary);
+        }
+        if raw & 0xffff_fc1f == 0xd61f_0000 || raw & 0xffff_fc1f == 0xd63f_0000 {
+            let register = ((raw >> 5) & 31) as usize;
+            if state.constants[register].is_none() {
+                let Some(declaration) = indirect.iter().position(|site| site.pc == pc) else {
+                    return Err(Aarch64DriveError::Decode(
+                        cirrus_aarch64_ert::DecodeError::Unsupported(raw),
+                    ));
+                };
+                let targets = indirect[declaration].targets;
+                if targets.is_empty() || targets.len() > 8 {
+                    return Err(Aarch64DriveError::SymbolicNextPc);
+                }
+                let mut next = word64(targets[targets.len() - 1], zero, one);
+                for target in targets[..targets.len() - 1].iter().rev() {
+                    let target_word = word64(*target, zero, one);
+                    let active = cirrus_ert_core::compare_word(
+                        context,
+                        &state.regs[register],
+                        &target_word,
+                        cirrus_ert_core::ComparePredicate::Eq,
+                        one,
+                    )
+                    .map_err(Aarch64DriveError::Context)?;
+                    next = cirrus_ert_core::select_word(context, active, &target_word, &next)
+                        .map_err(Aarch64DriveError::Context)?;
+                }
+                if raw & 0xffff_fc1f == 0xd63f_0000 {
+                    state.regs[30] = word64(pc.wrapping_add(4), zero, one);
+                    state.constants[30] = Some(pc.wrapping_add(4));
+                }
+                let mut fixed = [0; 8];
+                fixed[..targets.len()].copy_from_slice(targets);
+                return Ok(Aarch64Boundary::IndirectBranch {
+                    next,
+                    targets: fixed,
+                    len: targets.len(),
+                });
+            }
         }
         let flow = execute_instruction(context, state, pc, raw, zero, one)
             .map_err(Aarch64DriveError::Decode)?;
@@ -408,6 +473,7 @@ pub fn run_generation<C, W>(
     memory: RawMemory<'_>,
     zero: &W,
     one: &W,
+    indirect: &[Aarch64IndirectTargets<'_>],
 ) -> Result<(Aarch64Snapshot<W>, [W; 64], W, bool), DriveError<Aarch64DriveError<C::Error>>>
 where
     C: cirrus_core::ContextWithValue<bool, Wrapped = W>
@@ -423,6 +489,7 @@ where
         memory,
         zero,
         one,
+        indirect,
         virtual_ip: virtual_ip.clone(),
         next_virtual_ip: virtual_ip.clone(),
         done: zero.clone(),
@@ -446,6 +513,7 @@ struct Aarch64GenerationDriver<'a, C, W> {
     memory: RawMemory<'a>,
     zero: &'a W,
     one: &'a W,
+    indirect: &'a [Aarch64IndirectTargets<'a>],
     virtual_ip: [W; 64],
     next_virtual_ip: [W; 64],
     done: W,
@@ -475,6 +543,7 @@ where
             self.memory,
             self.zero,
             self.one,
+            self.indirect,
         )
         .map_err(DriveError::Driver)?;
         let active = cirrus_ert_core::compare_word(
@@ -496,7 +565,7 @@ where
                     candidate
                 }
             }
-            Aarch64Boundary::Exit => candidate,
+            Aarch64Boundary::IndirectBranch { .. } | Aarch64Boundary::Exit => candidate,
         };
         let snapshot = Aarch64Snapshot {
             state,
@@ -528,6 +597,32 @@ where
                 successors(taken)?;
                 if fallthrough != taken {
                     successors(fallthrough)?;
+                }
+            }
+            Aarch64Boundary::IndirectBranch {
+                next: next_word,
+                targets,
+                len,
+            } => {
+                if let Some(accumulated) = &mut self.accumulated {
+                    fold_snapshot(self.context, &active, &snapshot, accumulated, self.zero)
+                        .map_err(Aarch64DriveError::Fold)
+                        .map_err(DriveError::Driver)?;
+                } else {
+                    self.accumulated = Some(snapshot);
+                }
+                for bit in 0..64 {
+                    self.next_virtual_ip[bit] = predicated_value(
+                        self.context,
+                        active.clone(),
+                        next_word[bit].clone(),
+                        self.next_virtual_ip[bit].clone(),
+                    )
+                    .map_err(Aarch64DriveError::Context)
+                    .map_err(DriveError::Driver)?;
+                }
+                for target in targets[..len].iter().copied() {
+                    successors(target)?;
                 }
             }
             Aarch64Boundary::Exit => {
@@ -645,6 +740,7 @@ mod tests {
             memory,
             &false,
             &true,
+            &[],
         )
         .unwrap();
         assert_eq!(folded.pc, 8);
@@ -671,6 +767,7 @@ mod tests {
             memory,
             &false,
             &true,
+            &[],
         )
         .unwrap();
         assert_eq!(folded.pc, 0);
@@ -699,6 +796,7 @@ mod tests {
                 memory,
                 &false,
                 &true,
+                &[],
             ),
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
@@ -734,6 +832,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[8, 4]);
@@ -751,6 +850,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[8, 12]);
@@ -789,6 +889,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
         )
         .unwrap();
         assert_eq!(candidates.current(), &[12, 8]);
@@ -806,6 +907,7 @@ mod tests {
             RawMemory::from_slice(&bytes),
             &false,
             &true,
+            &[],
         );
         assert!(matches!(
             second,
@@ -832,6 +934,7 @@ mod tests {
             memory,
             &false,
             &true,
+            &[],
         );
         assert!(matches!(
             result,
@@ -849,12 +952,74 @@ mod tests {
         let initial = initial_step(state, 0, &false, &true).unwrap();
         let mut entries = [0; 4];
         let mut table = CandidateTable::new(&mut entries, 0).unwrap();
-        let stepped = step(&mut (), &mut table, initial, memory, &false, &true);
+        let stepped = step(&mut (), &mut table, initial, memory, &false, &true, &[]);
         assert!(matches!(
             stepped,
             Err(DriveError::Driver(Aarch64DriveError::NoSurvivingCandidates))
         ));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn declared_indirect_branch_muxes_targets_through_public_step() {
+        // br x1; movz x0,#0; svc #0; nop; svc #0
+        let code = [
+            0xd61f_0020u32,
+            0x5280_0000,
+            0xd400_0001,
+            0xd503_201f,
+            0xd400_0001,
+        ];
+        let mut bytes = [0u8; 20];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut state = cirrus_aarch64_ert::initial_state(false);
+        state.regs[1][0] = true;
+        state.constants[0] = Some(u64::MAX);
+        state.regs[0] = core::array::from_fn(|_| true);
+        let initial = initial_step(state, 0, &false, &true).unwrap();
+        let targets = [4u64, 12u64];
+        let indirect = [Aarch64IndirectTargets {
+            pc: 0,
+            targets: &targets,
+        }];
+        let mut backing = [0u64; 8];
+        let mut candidates = CandidateTable::new(&mut backing, 0).unwrap();
+        let first = step(
+            &mut (),
+            &mut candidates,
+            initial,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+            &indirect,
+        )
+        .unwrap();
+        assert_eq!(candidates.current(), &[4, 12]);
+        assert_eq!(first.virtual_ip, word64(12, &false, &true));
+        assert!(!first.done);
+        assert!(!first.exited);
+
+        let mut first = first;
+        first.snapshot.state.constants[0] = Some(u64::MAX);
+        first.snapshot.state.regs[0] = core::array::from_fn(|_| true);
+        let second = step(
+            &mut (),
+            &mut candidates,
+            first,
+            RawMemory::from_slice(&bytes),
+            &false,
+            &true,
+            &indirect,
+        );
+        assert!(matches!(
+            second,
+            Err(DriveError::Driver(Aarch64DriveError::Decode(
+                cirrus_aarch64_ert::DecodeError::Unsupported(0xd400_0001)
+            )))
+        ));
+        assert_eq!(candidates.current(), &[4, 12]);
     }
 
     #[test]
