@@ -55,6 +55,29 @@ pub enum Flow<W> {
     Exit,
 }
 
+/// Construct an AAPCS64 argument-carrying state.
+///
+/// Up to eight eight-byte arguments land in `x0` through `x7`; every extra
+/// argument is written into caller-reserved eight-byte stack slots starting
+/// at `stack_pointer`. The stack pointer is required to be 16-byte aligned.
+pub fn initial_state_with_arguments<W: Clone>(
+    zero: W,
+    stack_pointer: u64,
+    arguments: &[Option<u64>],
+) -> Result<State<W>, DecodeError> {
+    if stack_pointer & 15 != 0 {
+        return Err(DecodeError::Malformed(0));
+    }
+    let mut state = initial_state(zero);
+    state.sp = stack_pointer;
+    for (index, value) in arguments.iter().take(8).enumerate() {
+        if let Some(value) = value {
+            state.constants[index] = Some(*value);
+        }
+    }
+    Ok(state)
+}
+
 /// Construct the initial state with all GPRs and done set to `zero`.
 pub fn initial_state<W: Clone>(zero: W) -> State<W> {
     State {
@@ -532,7 +555,8 @@ where
             }
             Ok(Flow::Next(constant(target)))
         }
-        Instruction::LoadLiteral { .. }
+        Instruction::StorePair { .. }
+        | Instruction::LoadLiteral { .. }
         | Instruction::Load { .. }
         | Instruction::LoadExtend { .. }
         | Instruction::Store { .. }
@@ -569,6 +593,45 @@ where
     W: Clone,
 {
     match decode(pc, raw)? {
+        Instruction::StorePair {
+            first,
+            second,
+            base,
+            offset,
+            width,
+            mode,
+        } => {
+            let old_base = if base == 31 {
+                Some(state.sp)
+            } else {
+                register_constant(state, base)
+            }
+            .ok_or(DecodeError::Unsupported(raw))?;
+            let new_base = old_base.wrapping_add_signed(offset);
+            let address = match mode {
+                PairMode::SignedOffset | PairMode::PreIndex => new_base,
+                PairMode::PostIndex => old_base,
+            };
+            if matches!(mode, PairMode::PreIndex) {
+                if base == 31 {
+                    state.sp = new_base;
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+            store_value(state, first, address, width, memory, raw)?;
+            let second_address = address.wrapping_add(u64::from(width));
+            store_value(state, second, second_address, width, memory, raw)?;
+            if matches!(mode, PairMode::PostIndex) {
+                if base == 31 {
+                    state.sp = new_base;
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+        }
         Instruction::LoadLiteral {
             dest,
             width,
@@ -993,6 +1056,21 @@ pub enum Instruction {
         /// Computed literal address.
         target: u64,
     },
+    /// Pre/post-indexed register pair store over SP or a concrete register base.
+    StorePair {
+        /// First source register; 31 stores zero.
+        first: u8,
+        /// Second source register; 31 stores zero.
+        second: u8,
+        /// Base register; 31 denotes architectural SP.
+        base: u8,
+        /// Signed immediate byte offset, already size-scaled.
+        offset: i64,
+        /// Element width in bytes (four or eight).
+        width: u8,
+        /// Signed pair index mode.
+        mode: PairMode,
+    },
     /// `ADR` or `ADRP`; target is the materialized PC-relative address.
     Address {
         /// Destination `Xd`, restricted to 0 through 30.
@@ -1150,6 +1228,17 @@ pub enum Instruction {
     SupervisorCall,
 }
 
+/// Addressing mode for a supported register-pair form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairMode {
+    /// Store at `base + offset` without changing the base.
+    SignedOffset,
+    /// Write `base + offset` back before storing.
+    PreIndex,
+    /// Store at `base`, then write `base + offset` back.
+    PostIndex,
+}
+
 /// A word was not an audited A64 form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
@@ -1174,6 +1263,34 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x7e00_0000 == 0x2800_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let load = raw & (1 << 22) != 0;
+        let mode = match (raw >> 23) & 3 {
+            1 => PairMode::PostIndex,
+            2 => PairMode::SignedOffset,
+            3 => PairMode::PreIndex,
+            _ => return Err(DecodeError::Malformed(raw)),
+        };
+        let width = match size {
+            0 => 4,
+            2 => 8,
+            _ => return Err(DecodeError::Unsupported(raw)),
+        };
+        if v || load {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let base = ((raw >> 5) & 31) as u8;
+        return Ok(Instruction::StorePair {
+            first: (raw & 31) as u8,
+            second: ((raw >> 10) & 31) as u8,
+            base,
+            offset: sign_extend(((raw >> 15) & 0x7f) << if size == 2 { 3 } else { 2 }, 10),
+            width,
+            mode,
+        });
+    }
     if raw & 0x3b20_0000 == 0x3900_0000 {
         let size = (raw >> 30) & 3;
         let v = raw & (1 << 26) != 0;
@@ -1476,8 +1593,8 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitOp, DecodeError, Flow, Instruction, RawMemory, Shift, decode, initial_state, step,
-        step_with_memory,
+        BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
+        initial_state_with_arguments, step, step_with_memory,
     };
 
     fn word(value: u64) -> [bool; 64] {
@@ -1859,6 +1976,65 @@ mod tests {
                 &true
             ),
             Err(DecodeError::Memory(544))
+        );
+    }
+
+    #[test]
+    fn store_pair_updates_frames_and_sp_under_the_indexing_rules() {
+        let mut bytes = [0u8; 160];
+        let memory = RawMemory::from_mut_slice(&mut bytes);
+        let mut state = initial_state_with_arguments(false, 144, &[Some(1)]).unwrap();
+        state.constants[1] = Some(1);
+        state.constants[5] = Some(0xdead_beef);
+        state.constants[30] = Some(0x2000);
+        assert_eq!(
+            decode(0x1000, 0xa9bf_87e5),
+            Ok(Instruction::StorePair {
+                first: 5,
+                second: 1,
+                base: 31,
+                offset: -8,
+                width: 8,
+                mode: PairMode::PreIndex,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xa9bf_87e5,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.sp, 136);
+        assert_eq!(memory.read64::<8>(136), Some(0xdead_beefu64.to_le_bytes()));
+        assert_eq!(memory.read64::<8>(144), Some(1u64.to_le_bytes()));
+        state.constants[29] = Some(0x1122_3344_5566_7788);
+        state.constants[30] = Some(0x99aa_bbcc_ddee_ff00);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xa9bf_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.sp, 120);
+        assert_eq!(
+            memory.read64::<8>(120),
+            Some(0x1122_3344_5566_7788u64.to_le_bytes())
+        );
+        assert_eq!(
+            memory.read64::<8>(128),
+            Some(0x99aa_bbcc_ddee_ff00u64.to_le_bytes())
         );
     }
 
