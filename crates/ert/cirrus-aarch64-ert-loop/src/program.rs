@@ -211,4 +211,19 @@ mod tests {
         assert!(program.return_sites().is_empty());
         assert!(program.indirect_sites().is_empty());
     }
+
+    #[test]
+    fn compile_walks_tbz_and_b_cond_boundaries() {
+        // tbnz x1, #0, +8; nop; svc #0; svc #0
+        let code = [0x3728_0041u32, 0xd503_201f, 0xd400_0001, 0xd400_0001];
+        let mut bytes = [0u8; 16];
+        for (index, word) in code.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let memory = RawMemory::from_slice(&bytes);
+        let program = Aarch64LoopedProgram::compile(&memory, 0, &[], &[], 8).unwrap();
+        assert_eq!(program.boundaries().get(&0), Some(&(8, 4)));
+        assert!(program.return_sites().is_empty());
+        assert!(program.indirect_sites().is_empty());
+    }
 }
