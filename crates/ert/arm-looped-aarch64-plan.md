@@ -447,10 +447,13 @@ do not make the Thumb adapter depend on `disarm64`.
    canonical `RET x30`, `ADR`/`ADRP`, `MOVZ`/`MOVK`, immediate and shifted
    register `ADD`/`SUB` (including `ADDS`/`SUBS`, `CMP`/`CMN` aliases, NZCV),
    logical shifted-register forms including `TST`, `CSEL`, and low-word
-   `MADD`/`MSUB`/`MUL`. `SVC #0` now accepts only the all-ones bare-metal exit
+   `MADD`/`MSUB`/`MUL`. Concrete memory reads now cover PC-relative literal
+   loads and unsigned-immediate byte/half/word/double loads with correct
+   zero/sign extension; stores, pairs, and stack-relative symbolic storage are
+   still rejected. `SVC #0` now accepts only the all-ones bare-metal exit
    selector pending the hash runtime/handler seam. Remaining work is wider
-   multiply forms, addressing/memory, the AAPCS64/SVC runtime ABI and host
-   fixtures.
+   multiply forms, stores/pairs and caller-owned storage, the AAPCS64/SVC
+   runtime ABI and host fixtures.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
