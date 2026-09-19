@@ -1,6 +1,6 @@
 # ERT Arm roadmap: Thumb hooks, shared loop driver, and AArch64
 
-**Status: Phase 1 complete; Phase 2 shared-driver substrate extracted.**
+**Status: Phases 1–2 core implementation complete; Phase 3 AArch64 decoder/control-state foundation underway.**
 
 ## Delivery record
 
@@ -16,7 +16,7 @@
   `ArmCallRegistry` and register-only `NoOp`/`ReturnConstants` replacements.
   The synchronous hook remains available in the default no-alloc build.
 
-### Phase 2 — shared driver substrate — **IN PROGRESS**
+### Phase 2 — shared driver substrate — **CORE IMPLEMENTATION COMPLETE**
 
 * `cirrus-ert-loop-core` owns the no-alloc, caller-buffered candidate
   generation lifecycle (deduplication, capacity failure, tail compaction), the
@@ -49,6 +49,21 @@
   validation expands this gate to the remaining Thumb branch encodings,
   concrete fixture equivalence, predicated stack writes, and recorder replay;
   those tests do not change the state/scheduler seam.
+
+### Phase 3 — AArch64 facade — **IN PROGRESS**
+
+* Added `cirrus-aarch64-ert`, a separate no-alloc facade with
+  `disarm64 0.1.26` pinned without default features and enabled only as a
+  decode classification guard.
+* The initial audited raw-mask allowlist covers `B`/`BL`, `B.cond`,
+  `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`, canonical `RET X30`, and bare-metal
+  `SVC #0`. It extracts PC-relative targets locally, rejects unlisted decoded
+  forms, checks PC alignment, and rejects reserved condition/register forms.
+* The first symbolic state has 31 separate 64-bit GPR words, concrete metadata,
+  separate SP, and a done wire. `CBZ`/`CBNZ` emits a virtual-IP select; the
+  x31/XZR distinction is pinned by tests. Arithmetic, NZCV tracking, memory,
+  AAPCS64 entry/exit, hooks, and the AArch64 loop adapter remain subsequent
+  Phase 3 work.
 
 This is the Arm counterpart to [`ert-looped-rv64-plan.md`](ert-looped-rv64-plan.md).
 It deliberately separates three deliverables while designing their shared seams
