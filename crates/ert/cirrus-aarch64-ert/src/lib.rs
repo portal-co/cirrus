@@ -88,6 +88,11 @@ where
     let next = pc.wrapping_add(4);
     let constant = |value| constant_word(zero, one, value);
     match instruction {
+        Instruction::Address { dest, target } => {
+            state.regs[dest as usize] = constant(target);
+            state.constants[dest as usize] = Some(target);
+            Ok(Flow::Next(constant(next)))
+        }
         Instruction::Branch { target } => Ok(Flow::Next(constant(target))),
         Instruction::BranchLink { target } => {
             state.regs[30] = constant(next);
@@ -623,6 +628,13 @@ fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
 /// A supported, audited A64 instruction form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Instruction {
+    /// `ADR` or `ADRP`; target is the materialized PC-relative address.
+    Address {
+        /// Destination `Xd`, restricted to 0 through 30.
+        dest: u8,
+        /// Computed PC-relative address.
+        target: u64,
+    },
     /// `B imm26`; target is `pc + sign_extend(imm26 << 2)`.
     Branch {
         /// Destination fetch address.
@@ -767,6 +779,18 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x1f00_0000 == 0x1000_0000 {
+        let dest = (raw & 31) as u8;
+        if dest == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let immediate = ((raw >> 29) & 3) | (((raw >> 5) & 0x7f_ffff) << 2);
+        let page = raw & (1 << 31) != 0;
+        let base = if page { pc & !0xfff } else { pc };
+        let target =
+            base.wrapping_add_signed(sign_extend(immediate, 21) << if page { 12 } else { 0 });
+        return Ok(Instruction::Address { dest, target });
+    }
     if raw & 0x7f80_0000 == 0x5280_0000 || raw & 0x7f80_0000 == 0x7280_0000 {
         let dest = (raw & 31) as u8;
         let width64 = raw & (1 << 31) != 0;
@@ -1026,6 +1050,33 @@ mod tests {
         assert_eq!(
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
+        );
+    }
+
+    #[test]
+    fn adr_and_adrp_materialize_audited_pc_relative_addresses() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0x1000, 0x1000_0040),
+            Ok(Instruction::Address {
+                dest: 0,
+                target: 0x1008,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x1000_0040, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0x1008));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1234, 0xb000_0000, &false, &true),
+            Ok(Flow::Next(word(0x1238)))
+        );
+        assert_eq!(state.regs[0], word(0x2000));
+        assert_eq!(state.constants[0], Some(0x2000));
+        assert_eq!(
+            decode(0, 0x1000_001f),
+            Err(DecodeError::Unsupported(0x1000_001f))
         );
     }
 
