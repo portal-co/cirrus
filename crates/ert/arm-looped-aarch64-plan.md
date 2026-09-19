@@ -469,10 +469,11 @@ do not make the Thumb adapter depend on `disarm64`.
 5. `[AI] Add AArch64 looped ERT adapter` — **in progress**: the new
    `cirrus-aarch64-ert-loop` crate has fixed-capacity boundary snapshots,
    predicated GPR/SP/NZCV/done folding with concrete-SP divergence rejection,
-   and shared-scheduler candidate body execution. Virtual-IP dispatch now
-   gates body effects and next-IP selection, with predicated done accumulation
-   for exits. Remaining work is broader symbolic control-flow bodies,
-   recording/precompute and equivalence tests.
+   and shared-scheduler candidate body execution. Virtual-IP dispatch gates
+   body effects and next-IP selection, exits predicate done, and the public
+   no-alloc `initial_step`/`step` API carries loop state across generations.
+   Remaining work is broader symbolic control-flow bodies, recording/
+   precompute and equivalence tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
    boot/exit protocol is deterministic.
 
