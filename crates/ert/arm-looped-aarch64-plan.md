@@ -462,8 +462,9 @@ do not make the Thumb adapter depend on `disarm64`.
    supported boot path, and reaches the declared exit. A timeout-bounded QEMU
    fixture is present but ignored because `virt` remains resident after the
    bare-metal SVC; it needs a UART/semihosting exit protocol before becoming a
-   gate. Remaining work is wider multiply forms and stack-relative symbolic
-   storage loads/stores.
+   gate. High-half `SMULH`/`UMULH` now have audited symbolic/concrete
+   semantics; remaining work is stack-relative symbolic storage loads/stores
+   and a deterministic guest exit protocol.
 5. `[AI] Add AArch64 looped ERT adapter` — generic core integration,
    candidate/recording/precompute tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
