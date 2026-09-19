@@ -475,9 +475,9 @@ do not make the Thumb adapter depend on `disarm64`.
    The adapter now runs candidate bodies until a symbolic branch boundary
    (including concrete direct branches and symbolic B.cond/CBZ/CBNZ/TBZ/TBNZ)
    or exit, rather than treating every facade step as one-instruction control.
-   Declared symbolic `BR`/`BLR` sites now emit a bounded constant mux over an
-   exhaustive caller-supplied target set. Remaining work is recording/
-   precompute and equivalence tests.
+   Declared symbolic `BR`/`BLR` and `RET` sites now emit a bounded constant
+   mux over exhaustive caller-supplied target sets. Remaining work is
+   recording/precompute and equivalence tests.
 6. `[AI] Add AArch64 bare-metal QEMU compatibility gate` — only once the
    boot/exit protocol is deterministic.
 
