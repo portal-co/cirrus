@@ -17,7 +17,7 @@
 //! protects this hand-extracted subset against accepting an undecodable word.
 
 use cirrus_core::ContextWithValue;
-use cirrus_ert_core::{ContextWithErtOps, constant_word, select_word};
+use cirrus_ert_core::{ContextWithErtOps, add_bits, constant_word, invert_word, select_word};
 use disarm64::decoder;
 
 /// A symbolic A64 state with 31 GPRs and separate SP.
@@ -120,6 +120,50 @@ where
                     .map_err(|_| DecodeError::Unsupported(raw))?,
             ))
         }
+        Instruction::AddImmediate {
+            dest,
+            source,
+            immediate,
+            subtract,
+            width64,
+        } => {
+            let source_word = &state.regs[source as usize];
+            let immediate_word = constant(immediate);
+            let result = if subtract {
+                let inverted = invert_word(context, &immediate_word, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?;
+                add_bits(context, source_word, &inverted, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            } else {
+                add_bits(context, source_word, &immediate_word, zero.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            };
+            state.regs[dest as usize] = if width64 {
+                result
+            } else {
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        result[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            let source_constant = state.constants[source as usize];
+            state.constants[dest as usize] = source_constant.map(|source| {
+                let result = if subtract {
+                    source.wrapping_sub(immediate)
+                } else {
+                    source.wrapping_add(immediate)
+                };
+                if width64 {
+                    result
+                } else {
+                    result & u64::from(u32::MAX)
+                }
+            });
+            Ok(Flow::Next(constant(next)))
+        }
         Instruction::TestBranch { .. }
         | Instruction::BranchRegister { .. }
         | Instruction::BranchLinkRegister { .. }
@@ -158,6 +202,20 @@ pub enum Instruction {
         width64: bool,
         /// Destination fetch address when the condition holds.
         target: u64,
+    },
+    /// `ADD`/`SUB` immediate without flags. Register 31 forms are rejected
+    /// in this first cut because the encoding uses SP rather than XZR there.
+    AddImmediate {
+        /// Destination `Wd`/`Xd`, restricted to 0 through 30.
+        dest: u8,
+        /// Source `Wn`/`Xn`, restricted to 0 through 30.
+        source: u8,
+        /// Zero-extended immediate after its optional 12-bit shift.
+        immediate: u64,
+        /// Whether this is subtraction rather than addition.
+        subtract: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
     },
     /// `TBZ`/`TBNZ`.
     TestBranch {
@@ -208,6 +266,22 @@ pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
     }
     decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
 
+    if raw & 0x1f00_0000 == 0x1100_0000 {
+        let dest = (raw & 31) as u8;
+        let source = ((raw >> 5) & 31) as u8;
+        // Flag-setting forms need NZCV state and register-31 forms mean SP.
+        if raw & (1 << 29) != 0 || dest == 31 || source == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let immediate = u64::from((raw >> 10) & 0xfff) << if raw & (1 << 22) != 0 { 12 } else { 0 };
+        return Ok(Instruction::AddImmediate {
+            dest,
+            source,
+            immediate,
+            subtract: raw & (1 << 30) != 0,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
     if raw & 0x7c00_0000 == 0x1400_0000 {
         let target = pc.wrapping_add_signed(sign_extend(raw & 0x03ff_ffff, 26) << 2);
         return Ok(if raw & 0x8000_0000 == 0 {
@@ -285,6 +359,10 @@ fn sign_extend(value: u32, width: u32) -> i64 {
 mod tests {
     use super::{DecodeError, Flow, Instruction, decode, initial_state, step};
 
+    fn word(value: u64) -> [bool; 64] {
+        core::array::from_fn(|bit| (value >> bit) & 1 != 0)
+    }
+
     #[test]
     fn branch_targets_and_link_bit_are_extracted_from_audited_masks() {
         assert_eq!(
@@ -336,25 +414,51 @@ mod tests {
     }
 
     #[test]
+    fn add_sub_immediate_preserve_x31_xzr_and_w_zero_extension() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(4);
+        state.constants[1] = Some(4);
+        assert_eq!(
+            decode(0x1000, 0x9100_0420),
+            Ok(Instruction::AddImmediate {
+                dest: 0,
+                source: 1,
+                immediate: 1,
+                subtract: false,
+                width64: true
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(5));
+        assert_eq!(state.constants[0], Some(5));
+        state.regs[1] = word(0x1_0000_0000);
+        state.constants[1] = Some(0x1_0000_0000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x1100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(1));
+        assert_eq!(state.constants[0], Some(1));
+        assert_eq!(
+            decode(0, 0x9100_043f),
+            Err(DecodeError::Unsupported(0x9100_043f))
+        );
+    }
+
+    #[test]
     fn symbolic_cbz_selects_the_audited_target_and_x31_is_xzr() {
         let mut state = initial_state(false);
         state.regs[1] = core::array::from_fn(|bit| bit == 0);
         let flow = step(&mut (), &mut state, 0x2000, 0xb500_0041, &false, &true).unwrap();
-        assert_eq!(
-            flow,
-            Flow::Next(core::array::from_fn(|bit| (0x2008u64 >> bit) & 1 != 0))
-        );
+        assert_eq!(flow, Flow::Next(word(0x2008)));
         let zero_register = step(&mut (), &mut state, 0x2000, 0xb400_005f, &false, &true).unwrap();
-        assert_eq!(
-            zero_register,
-            Flow::Next(core::array::from_fn(|bit| (0x2008u64 >> bit) & 1 != 0))
-        );
+        assert_eq!(zero_register, Flow::Next(word(0x2008)));
         let zero_register_nonzero =
             step(&mut (), &mut state, 0x2000, 0xb500_005f, &false, &true).unwrap();
-        assert_eq!(
-            zero_register_nonzero,
-            Flow::Next(core::array::from_fn(|bit| (0x2004u64 >> bit) & 1 != 0))
-        );
+        assert_eq!(zero_register_nonzero, Flow::Next(word(0x2004)));
     }
 
     #[test]
