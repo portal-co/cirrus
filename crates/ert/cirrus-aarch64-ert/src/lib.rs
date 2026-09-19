@@ -532,7 +532,16 @@ where
             }
             Ok(Flow::Next(constant(target)))
         }
-        Instruction::SupervisorCall => Ok(Flow::Exit),
+        Instruction::SupervisorCall => {
+            // The façade is bare-metal, not a Linux syscall emulator. Hash
+            // service selectors need the runtime/handler seam; until that is
+            // installed, accept only the declared all-ones exit selector.
+            if state.constants[0] != Some(u64::MAX) {
+                return Err(DecodeError::Unsupported(raw));
+            }
+            state.done = one.clone();
+            Ok(Flow::Exit)
+        }
     }
 }
 
@@ -1257,6 +1266,22 @@ mod tests {
             decode(0, 0x9100_043f),
             Err(DecodeError::Unsupported(0x9100_043f))
         );
+    }
+
+    #[test]
+    fn svc_exit_requires_the_bare_metal_all_ones_selector() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xd400_0001, &false, &true),
+            Err(DecodeError::Unsupported(0xd400_0001))
+        );
+        state.regs[0] = word(u64::MAX);
+        state.constants[0] = Some(u64::MAX);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xd400_0001, &false, &true),
+            Ok(Flow::Exit)
+        );
+        assert!(state.done);
     }
 
     #[test]
