@@ -1,9 +1,18 @@
 {
-  "description": "New circuit compiler, for everywhere",
-  "devDependencies": {
-    "zshy": "^0.7.0"
-  },
-  "name": "@portal-solutions/cirrus",
-  "type": "module",
-  "workspaces": []
+    "description": "New circuit compiler, for everywhere",
+    "devDependencies": {
+        "typescript": "^5.7.3",
+        "zshy": "^0.7.0"
+    },
+    "scripts": {
+        "build": "npm run build --workspaces",
+        "check": "npx tsc --noEmit",
+        "test": "npm run check && npm run build && node packages/cirrus-boolar/test/semantics.mjs"
+    },
+    "name": "@portal-solutions/cirrus",
+    "type": "module",
+    "private": true,
+    "workspaces": [
+        "packages/*"
+    ]
 }

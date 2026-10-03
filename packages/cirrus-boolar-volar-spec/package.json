@@ -1,0 +1,22 @@
+{
+  "name": "@portal-solutions/cirrus-boolar-volar-spec",
+  "version": "0.1.0",
+  "description": "Concrete-boolean Volar-spec operation registry for cirrus-boolar",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "peerDependencies": {
+    "@portal-solutions/cirrus-boolar": "^0.1.0",
+    "@portal-solutions/volar-spec-ts": "^0.1.0"
+  },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  }
+}

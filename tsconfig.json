@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "paths": {
+      "@portal-solutions/cirrus-boolar": ["./packages/cirrus-boolar/src/index.ts"],
+      "@portal-solutions/cirrus-boolar-volar-spec": ["./packages/cirrus-boolar-volar-spec/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts"]
+}
