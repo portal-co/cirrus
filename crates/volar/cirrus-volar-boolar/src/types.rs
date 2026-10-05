@@ -21,8 +21,8 @@ pub enum VolarTypeMapError {
     InvalidReference(IRTypeId),
     /// A source type directly or indirectly contained itself.
     RecursiveType(IRTypeId),
-    /// Z3 values do not have a GF(2) Cirrus representation.
-    Z3(IRTypeId),
+    /// Prime/extension-field values are not supported by this Boolean backend.
+    UnsupportedType(IRTypeId),
     /// Volar block/function types are control-flow descriptors, not values a
     /// typed Cirrus trace can contain.
     ControlType(IRTypeId),
@@ -32,8 +32,8 @@ pub enum VolarTypeMapError {
 
 /// Mirror every representable Volar IR type into a Cirrus [`TypeTable`].
 ///
-/// Packed `_128`/`_256`, AES8, Galois64, lane vectors, and tuples retain
-/// their exact identity.  Z3 and control-flow-only types are rejected at this
+/// Packed `_128`/`_256`, lane vectors, and tuples retain their exact identity.
+/// Non-Boolean primitive, field, and control-flow types are rejected at this
 /// boundary, before any VOLE/garbling backend sees them.
 pub fn lower_volar_types(source: &IRTypes) -> Result<VolarTypeMap, VolarTypeMapError> {
     let mut types = TypeTable::new();
@@ -83,9 +83,6 @@ fn lower_type(
         IRType::Primitive(Type::_64) => types.intern(VolarType::U64),
         IRType::Primitive(Type::_128) => types.intern(VolarType::U128),
         IRType::Primitive(Type::_256) => types.intern(VolarType::U256),
-        IRType::Primitive(Type::AES8) => types.intern(VolarType::Aes8),
-        IRType::Primitive(Type::Galois64) => types.intern(VolarType::Galois64),
-        IRType::Primitive(Type::Z3) => return Err(VolarTypeMapError::Z3(id)),
         IRType::Vec(lanes, element) => {
             if *lanes == 0 {
                 return Err(VolarTypeMapError::EmptyVector(id));
@@ -105,6 +102,9 @@ fn lower_type(
         }
         IRType::Block { .. } | IRType::Func { .. } => {
             return Err(VolarTypeMapError::ControlType(id));
+        }
+        IRType::ExtField { .. } | IRType::PrimeField { .. } => {
+            return Err(VolarTypeMapError::UnsupportedType(id));
         }
         _ => return Err(VolarTypeMapError::ControlType(id)),
     };
@@ -153,9 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_z3_before_typed_execution() {
+    fn rejects_prime_fields_before_typed_execution() {
         let mut source = IRTypes::new();
-        let z3 = source.primitive(Type::Z3);
-        assert_eq!(lower_volar_types(&source), Err(VolarTypeMapError::Z3(z3)));
+        let prime = source.push(IRType::PrimeField {
+            k: 3,
+            n: alloc::vec![1],
+        });
+        assert_eq!(
+            lower_volar_types(&source),
+            Err(VolarTypeMapError::UnsupportedType(prime))
+        );
     }
 }

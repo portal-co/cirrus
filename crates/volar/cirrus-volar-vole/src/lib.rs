@@ -6,12 +6,13 @@
 //!
 //! # Scope
 //!
-//! This is a same-process/ideal-functionality SIMULATION of both roles (see
-//! `volar_spec::vole::setup::vole_commit_bit`'s own doc: "In a real
-//! protocol the prover and verifier would each see only one half; this
-//! single-process API is used to drive the ideal functionality from
-//! tests."). It validates the arithmetization/soundness logic; it is NOT a
-//! real 2-party networked protocol.
+//! The existing context/execute APIs are a same-process/ideal-functionality
+//! simulation of both roles (see `volar_spec::vole::setup::vole_commit_bit`'s
+//! own doc). The experimental [`mlkem_ferret`] module separately establishes
+//! ML-KEM base OT → IKNP → Ferret pools and chosen-bit VOLE shares for prover
+//! and verifier over a caller-supplied transport. It does not make the existing
+//! context/execute APIs a two-party network protocol, nor is it a reviewed or
+//! production-ready cryptographic profile.
 //!
 //! `Op::Create(bool)` (a compile-time-known constant, never a witness --
 //! see this workspace's other backends for the same convention) maps to a
@@ -30,6 +31,8 @@ mod hook;
 #[cfg(feature = "iop-accumulator")]
 pub mod iop_accumulator;
 mod locked;
+/// Experimental role-separated ML-KEM base OT → IKNP → Ferret bootstrap.
+pub mod mlkem_ferret;
 mod mode_b_relation;
 #[cfg(feature = "spartan-whir-adapter")]
 mod spartan_whir_adapter;
@@ -43,6 +46,10 @@ pub use locked::{
     LockedVoleProverContext, LockedVoleProverStorage, LockedVoleProverStorageContext,
     LockedVoleVerifierContext, LockedVoleVerifierStorage, LockedVoleVerifierStorageContext,
     MutexPuller, MutexPusher, PullerByRef,
+};
+pub use mlkem_ferret::{
+    MlKemFerretError, MlKemFerretProver, MlKemFerretVerifier, mlkem_ferret_prover,
+    mlkem_ferret_verifier,
 };
 pub use mode_b_relation::{
     ActualBooleanSemantics, CircuitId, ConstraintSemantics, KOALABEAR_MODULUS,

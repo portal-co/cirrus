@@ -7,4 +7,3 @@ description.workspace = true
 [dependencies]
 digest = "0.11.3"
 ml-kem = "0.3.2"
-rand = { version = "0.10.2", default-features = false }
