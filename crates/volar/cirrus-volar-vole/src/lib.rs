@@ -9,9 +9,10 @@
 //! The existing context/execute APIs are a same-process/ideal-functionality
 //! simulation of both roles (see `volar_spec::vole::setup::vole_commit_bit`'s
 //! own doc). The experimental [`mlkem_ferret`] module separately establishes
-//! ML-KEM base OT → IKNP → Ferret pools and chosen-bit VOLE shares for prover
-//! and verifier over a caller-supplied transport. It does not make the existing
-//! context/execute APIs a two-party network protocol, nor is it a reviewed or
+//! direct ML-KEM MiniOT setup COTs, then runs a Ferret-Reg setup iteration and
+//! seeds the official main profile for prover/verifier chosen-bit VOLE shares.
+//! It removes IKNP from this chain but does not make the existing
+//! context/execute APIs a two-party network protocol or provide a reviewed,
 //! production-ready cryptographic profile.
 //!
 //! `Op::Create(bool)` (a compile-time-known constant, never a witness --
@@ -31,7 +32,7 @@ mod hook;
 #[cfg(feature = "iop-accumulator")]
 pub mod iop_accumulator;
 mod locked;
-/// Experimental role-separated ML-KEM base OT → IKNP → Ferret bootstrap.
+/// Experimental role-separated ML-KEM MiniOT → Ferret-Reg bootstrap without IKNP.
 pub mod mlkem_ferret;
 mod mode_b_relation;
 #[cfg(feature = "spartan-whir-adapter")]
@@ -49,7 +50,7 @@ pub use locked::{
 };
 pub use mlkem_ferret::{
     MlKemFerretError, MlKemFerretProver, MlKemFerretVerifier, mlkem_ferret_prover,
-    mlkem_ferret_verifier,
+    mlkem_ferret_prover_with_params, mlkem_ferret_verifier, mlkem_ferret_verifier_with_params,
 };
 pub use mode_b_relation::{
     ActualBooleanSemantics, CircuitId, ConstraintSemantics, KOALABEAR_MODULUS,

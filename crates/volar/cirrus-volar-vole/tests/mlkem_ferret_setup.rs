@@ -5,9 +5,12 @@ use std::{
     time::Duration,
 };
 
-use cirrus_volar_vole::{mlkem_ferret_prover, mlkem_ferret_verifier};
+use cirrus_volar_vole::{mlkem_ferret_prover_with_params, mlkem_ferret_verifier_with_params};
 use miniot::{TryCryptoRng, TryRng};
-use volar_spec::ot::{ferret::FERRET_REG_TOY, two_party::StackIo};
+use volar_spec::ot::{
+    ferret::{FERRET_REG_TOY, FerretParams},
+    two_party::StackIo,
+};
 
 /// Deterministic test-only generator. Never use for protocol security.
 struct TestRng(u64);
@@ -61,9 +64,14 @@ impl StackIo for MessageIo {
 }
 
 #[test]
-fn mlkem_iknp_bootstrap_runs_separate_roles_through_repeated_ferret_refills() {
-    let params = FERRET_REG_TOY;
-    let commit_count = params.output_cot_count(false) + 1;
+fn direct_mlkem_bootstrap_runs_separate_roles_through_ferret_refill() {
+    let setup_params = FerretParams {
+        n: 512,
+        k: 32,
+        t: 7,
+    };
+    let main_params = FERRET_REG_TOY;
+    let commit_count = setup_params.n - main_params.seed_cot_count(false) + 1;
     let (prover_tx, verifier_rx) = sync_channel(1);
     let (verifier_tx, prover_rx) = sync_channel(1);
     let mut prover_io = MessageIo {
@@ -77,8 +85,9 @@ fn mlkem_iknp_bootstrap_runs_separate_roles_through_repeated_ferret_refills() {
 
     let prover = thread::spawn(move || {
         let mut rng = TestRng(0x5052_4F56_4552);
-        let mut session = mlkem_ferret_prover(&mut rng, params, &mut prover_io)
-            .expect("prover ML-KEM/IKNP setup failed");
+        let mut session =
+            mlkem_ferret_prover_with_params(&mut rng, setup_params, main_params, &mut prover_io)
+                .expect("prover direct ML-KEM/Ferret setup failed");
         let shares = (0..commit_count)
             .map(|index| {
                 let bit = index % 2 == 0;
@@ -90,8 +99,13 @@ fn mlkem_iknp_bootstrap_runs_separate_roles_through_repeated_ferret_refills() {
 
     let verifier = thread::spawn(move || {
         let mut rng = TestRng(0x5645_5249_4649_4552);
-        let mut session = mlkem_ferret_verifier(&mut rng, params, &mut verifier_io)
-            .expect("verifier ML-KEM/IKNP setup failed");
+        let mut session = mlkem_ferret_verifier_with_params(
+            &mut rng,
+            setup_params,
+            main_params,
+            &mut verifier_io,
+        )
+        .expect("verifier direct ML-KEM/Ferret setup failed");
         let shares = (0..commit_count)
             .map(|_| session.commit_input(&mut rng, &mut verifier_io))
             .collect::<Vec<_>>();
@@ -107,8 +121,9 @@ fn mlkem_iknp_bootstrap_runs_separate_roles_through_repeated_ferret_refills() {
     assert_eq!(prover_remaining, verifier_remaining);
     assert_eq!(
         prover_remaining,
-        2 * params.output_cot_count(false) - commit_count,
-        "consuming across a Ferret output boundary must trigger another refill"
+        setup_params.n - main_params.seed_cot_count(false) + main_params.output_cot_count(false)
+            - commit_count,
+        "consuming through the setup pool must trigger a main-profile refill"
     );
     for ((bit, prover), verifier) in prover_shares.iter().zip(&verifier_shares) {
         let expected = prover.v[0] + prover.u[0][0] * delta;

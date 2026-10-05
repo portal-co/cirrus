@@ -1,9 +1,11 @@
-//! Role-separated ML-KEM base OT → IKNP COT → refillable Ferret stack.
+//! Role-separated ML-KEM-1024 MiniOT → Ferret-Reg setup/main COT stack.
 //!
-//! The verifier owns the correlated-OT `Delta`; the prover owns the COT
-//! receiver choices/values. Neither session contains the other role's state.
-//! The ML-KEM-1024 MiniOT seed bootstrap is semi-honest and is experimental;
-//! it is not a malicious-secure protocol or a production-reviewed profile.
+//! The prover owns the COT receiver choices/values; the verifier owns the
+//! correlated-OT `Delta`. Direct MiniOT establishes the Ferret-Reg setup seed,
+//! then one official setup-parameter Ferret iteration creates enough COTs to
+//! seed the official main-iteration profile. The direct KEM-to-COT bootstrap
+//! is experimental and semi-honest; it is not a paper-standard bootstrap or a
+//! production-reviewed cryptographic construction.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -11,26 +13,20 @@ use core::fmt;
 use cipher::consts::U1;
 use cirrus_core::Pusher;
 use hybrid_array::Array;
-use miniot::CryptoRng;
-use sha3::Sha3_256;
+use miniot::{
+    CIPHERTEXT_BYTES, CryptoRng, ENCAPSULATION_KEY_BYTES, MiniOtDecodeError, SHARED_KEY_BYTES,
+};
 use volar_spec::{
     SpecRng,
     field::Galois128,
     ot::{
         ferret::{
-            CotPoolReceiver, CotPoolSender, FerretParams, FerretReceiverSeed, FerretSenderSeed,
-            PoolSeedError, checked_seed_cot_count,
-        },
-        iknp::{
-            IKNP_KAPPA, IKNP_KAPPA_BYTES, IknpUMsg, iknp_receiver_finish, iknp_receiver_u_cols,
-            iknp_sender_from_u, pack_kappa,
+            CotPoolReceiver, CotPoolSender, FERRET_REG_MAIN, FERRET_REG_SETUP, FerretParams,
+            FerretReceiverSeed, FerretSenderSeed, PoolSeedError, checked_seed_cot_count,
         },
         two_party::{
             StackIo, stack_bea95_receiver, stack_bea95_sender, stack_refill_receiver,
             stack_refill_sender,
-        },
-        wire::{
-            TAG_BEA95, TAG_FERRET_MPCOT, TAG_FERRET_OPEN, TAG_IKNP_CORR, TAG_IKNP_U, encode_iknp_u,
         },
     },
     vole::{
@@ -39,19 +35,55 @@ use volar_spec::{
     },
 };
 
-const TAG_MLKEM_PUBLIC_KEYS: u8 = 13;
-const TAG_MLKEM_CIPHERTEXTS: u8 = 14;
+const TAG_MLKEM_COT_KEYS: u8 = 13;
+const TAG_MLKEM_COT_RESPONSES: u8 = 14;
+/// Keep each batched MiniOT message below the cloud helper's 128 KiB frame cap.
+const MINIOT_BATCH_SIZE: usize = 16;
+/// Bound the number of base COTs admitted by the parameterized test/profile API.
+const MAX_SETUP_SEED_COTS: usize = 50_000;
+/// Maximum one-time setup iteration size admitted by the Ferret-Reg profile.
+const MAX_SETUP_PROFILE_COTS: usize = FERRET_REG_SETUP.n;
+/// Maximum main iteration size admitted by the Ferret-Reg profile.
+const MAX_MAIN_PROFILE_COTS: usize = FERRET_REG_MAIN.n;
+/// Ferret-Reg's Table 2 semi-honest main seed COT count.
+const MAX_MAIN_SEED_COTS: usize = 606_907;
 
-/// Errors detected while establishing the ML-KEM/IKNP/Ferret seed state.
+/// Errors detected while establishing the direct ML-KEM/Ferret seed state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MlKemFerretError {
     /// Ferret parameters or independently generated seed dimensions are invalid.
     FerretSeed(PoolSeedError),
     /// A fixed-size ML-KEM MiniOT message was malformed.
-    MiniOt(miniot::MiniOtDecodeError),
-    /// An IKNP message had the wrong shape or contained non-canonical bits.
-    InvalidIknpMessage,
-    /// Verifier Delta must be nonzero for the Quicksilver verifier relation.
+    MiniOt(MiniOtDecodeError),
+    /// The setup seed exceeds the explicitly bounded MiniOT bootstrap limit.
+    BootstrapTooLarge {
+        /// Number of setup-seed COTs requested by the parameters.
+        requested: usize,
+        /// Maximum setup-seed COT count admitted by this API.
+        maximum: usize,
+    },
+    /// A requested regular Ferret profile exceeds the researched Reg dimensions.
+    ProfileTooLarge {
+        /// Requested output count.
+        requested: usize,
+        /// Maximum output count admitted for this profile.
+        maximum: usize,
+    },
+    /// The main profile's seed exceeds the researched Reg seed dimensions.
+    MainSeedTooLarge {
+        /// Requested main-profile seed count.
+        requested: usize,
+        /// Maximum main-profile seed count admitted by this API.
+        maximum: usize,
+    },
+    /// The setup iteration cannot produce enough COTs for the main seed.
+    SetupOutputTooSmall {
+        /// Number of COTs required by the main profile's seed.
+        required: usize,
+        /// Total number of COTs produced by the setup profile.
+        available: usize,
+    },
+    /// The verifier's Delta must be nonzero for the Quicksilver verifier relation.
     ZeroDelta,
 }
 
@@ -60,7 +92,25 @@ impl fmt::Display for MlKemFerretError {
         match self {
             Self::FerretSeed(error) => write!(formatter, "invalid Ferret seed: {error:?}"),
             Self::MiniOt(error) => write!(formatter, "invalid ML-KEM MiniOT message: {error:?}"),
-            Self::InvalidIknpMessage => formatter.write_str("invalid IKNP message shape"),
+            Self::BootstrapTooLarge { requested, maximum } => write!(
+                formatter,
+                "ML-KEM bootstrap needs {requested} COTs; limit is {maximum}"
+            ),
+            Self::ProfileTooLarge { requested, maximum } => write!(
+                formatter,
+                "Ferret-Reg profile needs {requested} output COTs; limit is {maximum}"
+            ),
+            Self::MainSeedTooLarge { requested, maximum } => write!(
+                formatter,
+                "Ferret-Reg main seed needs {requested} COTs; limit is {maximum}"
+            ),
+            Self::SetupOutputTooSmall {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "Ferret setup produced {available} COTs; main seed needs {required}"
+            ),
             Self::ZeroDelta => {
                 formatter.write_str("verifier Delta was zero after bounded sampling")
             }
@@ -76,8 +126,8 @@ impl From<PoolSeedError> for MlKemFerretError {
     }
 }
 
-impl From<miniot::MiniOtDecodeError> for MlKemFerretError {
-    fn from(error: miniot::MiniOtDecodeError) -> Self {
+impl From<MiniOtDecodeError> for MlKemFerretError {
+    fn from(error: MiniOtDecodeError) -> Self {
         Self::MiniOt(error)
     }
 }
@@ -111,88 +161,14 @@ fn fresh_block(rng: &mut dyn CryptoRng) -> [u8; 16] {
     block
 }
 
-fn fresh_seed(rng: &mut dyn CryptoRng) -> [u8; IKNP_KAPPA_BYTES] {
-    let mut seed = [0u8; IKNP_KAPPA_BYTES];
-    for byte in &mut seed {
-        *byte = rng.next_u32() as u8;
-    }
-    seed
+fn xor_block(left: &[u8; 16], right: &[u8; 16]) -> [u8; 16] {
+    core::array::from_fn(|index| left[index] ^ right[index])
 }
 
-fn payload_seed(seed: &[u8; IKNP_KAPPA_BYTES]) -> [u8; 32] {
-    let mut payload = [0u8; 32];
-    payload[..IKNP_KAPPA_BYTES].copy_from_slice(seed);
+fn block_payload(block: &[u8; 16]) -> [u8; SHARED_KEY_BYTES] {
+    let mut payload = [0u8; SHARED_KEY_BYTES];
+    payload[..16].copy_from_slice(block);
     payload
-}
-
-fn decode_iknp_u(bytes: &[u8], m: usize) -> Result<IknpUMsg, MlKemFerretError> {
-    let Some(header) = bytes.get(..4) else {
-        return Err(MlKemFerretError::InvalidIknpMessage);
-    };
-    let count = u32::from_le_bytes(header.try_into().unwrap()) as usize;
-    if count != IKNP_KAPPA {
-        return Err(MlKemFerretError::InvalidIknpMessage);
-    }
-    let col_len = 4usize
-        .checked_add(m)
-        .ok_or(MlKemFerretError::InvalidIknpMessage)?;
-    let expected = 4usize
-        .checked_add(
-            IKNP_KAPPA
-                .checked_mul(col_len)
-                .ok_or(MlKemFerretError::InvalidIknpMessage)?,
-        )
-        .ok_or(MlKemFerretError::InvalidIknpMessage)?;
-    if bytes.len() != expected {
-        return Err(MlKemFerretError::InvalidIknpMessage);
-    }
-    let mut offset = 4;
-    let mut u_cols = Vec::with_capacity(IKNP_KAPPA);
-    for _ in 0..IKNP_KAPPA {
-        let encoded_len =
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        if encoded_len != m {
-            return Err(MlKemFerretError::InvalidIknpMessage);
-        }
-        let mut column = Vec::with_capacity(m);
-        for value in &bytes[offset..offset + m] {
-            match value {
-                0 => column.push(false),
-                1 => column.push(true),
-                _ => return Err(MlKemFerretError::InvalidIknpMessage),
-            }
-        }
-        offset += m;
-        u_cols.push(column);
-    }
-    Ok(IknpUMsg { u_cols })
-}
-
-fn decode_iknp_corrections(
-    bytes: &[u8],
-    m: usize,
-) -> Result<Vec<[u8; IKNP_KAPPA_BYTES]>, MlKemFerretError> {
-    let Some(header) = bytes.get(..4) else {
-        return Err(MlKemFerretError::InvalidIknpMessage);
-    };
-    let count = u32::from_le_bytes(header.try_into().unwrap()) as usize;
-    let expected = 4usize
-        .checked_add(
-            m.checked_mul(IKNP_KAPPA_BYTES)
-                .ok_or(MlKemFerretError::InvalidIknpMessage)?,
-        )
-        .ok_or(MlKemFerretError::InvalidIknpMessage)?;
-    if count != m || bytes.len() != expected {
-        return Err(MlKemFerretError::InvalidIknpMessage);
-    }
-    let mut corrections = Vec::with_capacity(m);
-    for chunk in bytes[4..].chunks_exact(IKNP_KAPPA_BYTES) {
-        let mut row = [0u8; IKNP_KAPPA_BYTES];
-        row.copy_from_slice(chunk);
-        corrections.push(row);
-    }
-    Ok(corrections)
 }
 
 fn to_field_block(block: [u8; 16]) -> Array<Galois128, U1> {
@@ -203,66 +179,203 @@ fn bit_to_field(bit: bool) -> Galois128 {
     Galois128(u128::from(bit))
 }
 
-/// Establish a prover's IKNP/Ferret pool from ML-KEM base OT.
+fn encoded_key_batch_len(count: usize) -> usize {
+    count * 2 * ENCAPSULATION_KEY_BYTES
+}
+
+fn encoded_response_batch_len(count: usize) -> usize {
+    count * 2 * (CIPHERTEXT_BYTES + SHARED_KEY_BYTES)
+}
+
+fn validate_message_length(bytes: &[u8], expected: usize) -> Result<(), MlKemFerretError> {
+    if bytes.len() != expected {
+        return Err(MlKemFerretError::MiniOt(MiniOtDecodeError::InvalidLength {
+            expected,
+            found: bytes.len(),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_profiles(
+    setup_params: FerretParams,
+    main_params: FerretParams,
+) -> Result<(usize, usize), MlKemFerretError> {
+    let setup_seed_count = checked_seed_cot_count(setup_params)?;
+    let main_seed_count = checked_seed_cot_count(main_params)?;
+    if setup_params.n > MAX_SETUP_PROFILE_COTS {
+        return Err(MlKemFerretError::ProfileTooLarge {
+            requested: setup_params.n,
+            maximum: MAX_SETUP_PROFILE_COTS,
+        });
+    }
+    if main_params.n > MAX_MAIN_PROFILE_COTS {
+        return Err(MlKemFerretError::ProfileTooLarge {
+            requested: main_params.n,
+            maximum: MAX_MAIN_PROFILE_COTS,
+        });
+    }
+    if main_seed_count > MAX_MAIN_SEED_COTS {
+        return Err(MlKemFerretError::MainSeedTooLarge {
+            requested: main_seed_count,
+            maximum: MAX_MAIN_SEED_COTS,
+        });
+    }
+    if setup_seed_count > MAX_SETUP_SEED_COTS {
+        return Err(MlKemFerretError::BootstrapTooLarge {
+            requested: setup_seed_count,
+            maximum: MAX_SETUP_SEED_COTS,
+        });
+    }
+    if setup_params.n < main_seed_count {
+        return Err(MlKemFerretError::SetupOutputTooSmall {
+            required: main_seed_count,
+            available: setup_params.n,
+        });
+    }
+    Ok((setup_seed_count, main_seed_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use volar_spec::ot::ferret::FERRET_REG_TOY;
+
+    #[test]
+    fn parameterized_profiles_are_bounded_before_protocol_io() {
+        let oversized_setup = FerretParams {
+            n: MAX_SETUP_PROFILE_COTS + 1,
+            ..FERRET_REG_SETUP
+        };
+        assert_eq!(
+            validate_profiles(oversized_setup, FERRET_REG_TOY),
+            Err(MlKemFerretError::ProfileTooLarge {
+                requested: MAX_SETUP_PROFILE_COTS + 1,
+                maximum: MAX_SETUP_PROFILE_COTS,
+            })
+        );
+
+        let oversized_main = FerretParams {
+            n: MAX_MAIN_PROFILE_COTS + 1,
+            ..FERRET_REG_TOY
+        };
+        assert_eq!(
+            validate_profiles(FERRET_REG_SETUP, oversized_main),
+            Err(MlKemFerretError::ProfileTooLarge {
+                requested: MAX_MAIN_PROFILE_COTS + 1,
+                maximum: MAX_MAIN_PROFILE_COTS,
+            })
+        );
+
+        let oversized_main_seed = FerretParams {
+            n: 1_000_000,
+            k: MAX_MAIN_SEED_COTS,
+            t: 1,
+        };
+        assert_eq!(
+            validate_profiles(FERRET_REG_SETUP, oversized_main_seed),
+            Err(MlKemFerretError::MainSeedTooLarge {
+                requested: MAX_MAIN_SEED_COTS + 20,
+                maximum: MAX_MAIN_SEED_COTS,
+            })
+        );
+    }
+}
+
+/// Establish the paper's Ferret-Reg setup/main profiles using ML-KEM MiniOT
+/// directly for the semi-honest setup-seed COTs.
 ///
-/// The caller's `StackIo` must preserve message order and tags. This side
-/// receives only its random COT choices/values and never learns verifier Delta.
+/// The standard parameterized entry point is bounded to Ferret-Reg's official
+/// setup seed size. It does not make the KEM-to-COT composition standard or
+/// production-ready; callers must use a reviewed, authenticated transport.
 pub fn mlkem_ferret_prover<Io: StackIo>(
     rng: &mut dyn CryptoRng,
-    params: FerretParams,
     io: &mut Io,
 ) -> Result<MlKemFerretProver, MlKemFerretError> {
-    let m = checked_seed_cot_count(params)?;
+    mlkem_ferret_prover_with_params(rng, FERRET_REG_SETUP, FERRET_REG_MAIN, io)
+}
+
+/// Test/profile variant of [`mlkem_ferret_prover`] with explicit regular
+/// setup and main parameters. The seed COT limit is always enforced.
+pub fn mlkem_ferret_prover_with_params<Io: StackIo>(
+    rng: &mut dyn CryptoRng,
+    setup_params: FerretParams,
+    main_params: FerretParams,
+    io: &mut Io,
+) -> Result<MlKemFerretProver, MlKemFerretError> {
+    let (m, _) = validate_profiles(setup_params, main_params)?;
     let mut receiver_bits = Vec::with_capacity(m);
     for _ in 0..m {
         receiver_bits.push((rng.next_u32() & 1) != 0);
     }
 
-    let mut seeds_0 = [[0u8; IKNP_KAPPA_BYTES]; IKNP_KAPPA];
-    let mut seeds_1 = [[0u8; IKNP_KAPPA_BYTES]; IKNP_KAPPA];
-    for index in 0..IKNP_KAPPA {
-        seeds_0[index] = fresh_seed(rng);
-        seeds_1[index] = fresh_seed(rng);
-    }
+    let mut receiver_values = Vec::with_capacity(m);
+    for batch_start in (0..m).step_by(MINIOT_BATCH_SIZE) {
+        let count = (m - batch_start).min(MINIOT_BATCH_SIZE);
+        let mut secret_keys = Vec::with_capacity(count);
+        let mut encoded_keys = Vec::with_capacity(encoded_key_batch_len(count));
+        for choice in &receiver_bits[batch_start..batch_start + count] {
+            let (keys, secret_key) = miniot::miniot_start_recv::<2>(rng, usize::from(*choice));
+            encoded_keys.extend_from_slice(&miniot::encode_public_keys(&keys));
+            secret_keys.push(secret_key);
+        }
+        io.send(TAG_MLKEM_COT_KEYS, &encoded_keys);
 
-    // The prover is the MiniOT sender/IKNP receiver: the verifier sends a
-    // choice-selected decapsulation key and obtains exactly one seed per pair.
-    for index in 0..IKNP_KAPPA {
-        let public_keys = io.recv(TAG_MLKEM_PUBLIC_KEYS);
-        let response = miniot::miniot_sender_encoded::<2>(
-            rng,
-            [payload_seed(&seeds_0[index]), payload_seed(&seeds_1[index])],
-            &public_keys,
-        )?;
-        io.send(TAG_MLKEM_CIPHERTEXTS, &response);
+        let responses = io.recv(TAG_MLKEM_COT_RESPONSES);
+        validate_message_length(&responses, encoded_response_batch_len(count))?;
+        let response_size = 2 * (CIPHERTEXT_BYTES + SHARED_KEY_BYTES);
+        for (offset, (choice, secret_key)) in receiver_bits[batch_start..batch_start + count]
+            .iter()
+            .zip(secret_keys)
+            .enumerate()
+        {
+            let start = offset * response_size;
+            let selected = miniot::miniot_finish_recv_encoded::<2>(
+                &responses[start..start + response_size],
+                usize::from(*choice),
+                secret_key,
+            )?;
+            let mut value = [0u8; 16];
+            value.copy_from_slice(&selected[..16]);
+            receiver_values.push(value);
+        }
     }
-
-    let (t_cols, u_msg) = iknp_receiver_u_cols::<Sha3_256>(m, &receiver_bits, &seeds_0, &seeds_1);
-    io.send(TAG_IKNP_U, &encode_iknp_u(&u_msg));
-    let corrections = decode_iknp_corrections(&io.recv(TAG_IKNP_CORR), m)?;
-    let receiver_values =
-        iknp_receiver_finish::<Sha3_256, 16>(&receiver_bits, &t_cols, &corrections);
 
     let seed = FerretReceiverSeed {
         u: receiver_bits,
         w: receiver_values,
     };
-    Ok(MlKemFerretProver {
-        pool: CotPoolReceiver::from_seed(params, seed)?,
-    })
+    let mut setup_pool = CotPoolReceiver::from_seed(setup_params, seed)?;
+    {
+        let mut ferret_rng = CryptoSpecRng(rng);
+        // This is the one-time Ferret-Reg setup iteration, not IKNP.
+        stack_refill_receiver(&mut ferret_rng, &mut setup_pool, io);
+    }
+    let pool = setup_pool.reprofile(main_params)?;
+    Ok(MlKemFerretProver { pool })
 }
 
-/// Establish a verifier's IKNP/Ferret pool from ML-KEM base OT.
+/// Establish the paper's Ferret-Reg setup/main profiles using ML-KEM MiniOT
+/// directly for the semi-honest setup-seed COTs.
 ///
-/// The verifier's Delta never leaves this role. ML-KEM decoy public keys are
-/// handcrafted by `miniot` without secret keys; malformed peer keys are
-/// parsed once and rejected, never retried/rejection-sampled.
+/// The standard parameterized entry point is bounded to Ferret-Reg's official
+/// setup seed size. The verifier's `Delta` remains private to this role.
 pub fn mlkem_ferret_verifier<Io: StackIo>(
     rng: &mut dyn CryptoRng,
-    params: FerretParams,
     io: &mut Io,
 ) -> Result<MlKemFerretVerifier, MlKemFerretError> {
-    let m = checked_seed_cot_count(params)?;
+    mlkem_ferret_verifier_with_params(rng, FERRET_REG_SETUP, FERRET_REG_MAIN, io)
+}
+
+/// Test/profile variant of [`mlkem_ferret_verifier`] with explicit regular
+/// setup and main parameters. The seed COT limit is always enforced.
+pub fn mlkem_ferret_verifier_with_params<Io: StackIo>(
+    rng: &mut dyn CryptoRng,
+    setup_params: FerretParams,
+    main_params: FerretParams,
+    io: &mut Io,
+) -> Result<MlKemFerretVerifier, MlKemFerretError> {
+    let (m, _) = validate_profiles(setup_params, main_params)?;
     let delta_msg = (0..64)
         .find_map(|_| {
             let candidate = fresh_block(rng);
@@ -270,48 +383,41 @@ pub fn mlkem_ferret_verifier<Io: StackIo>(
         })
         .ok_or(MlKemFerretError::ZeroDelta)?;
 
-    let delta_ot = core::array::from_fn(|_| (rng.next_u32() & 1) != 0);
-    let delta_ot_bytes = pack_kappa(&delta_ot);
-    let mut chosen_seeds = [[0u8; IKNP_KAPPA_BYTES]; IKNP_KAPPA];
-
-    // The verifier is the MiniOT receiver/IKNP sender and retains each
-    // selected decapsulation key until that OT response has been opened.
-    for index in 0..IKNP_KAPPA {
-        let (public_keys, secret_key) =
-            miniot::miniot_start_recv::<2>(rng, usize::from(delta_ot[index]));
-        io.send(
-            TAG_MLKEM_PUBLIC_KEYS,
-            &miniot::encode_public_keys(&public_keys),
-        );
-        let response = io.recv(TAG_MLKEM_CIPHERTEXTS);
-        let selected = miniot::miniot_finish_recv_encoded::<2>(
-            &response,
-            usize::from(delta_ot[index]),
-            secret_key,
-        )?;
-        chosen_seeds[index].copy_from_slice(&selected[..IKNP_KAPPA_BYTES]);
+    let mut sender_values = Vec::with_capacity(m);
+    for batch_start in (0..m).step_by(MINIOT_BATCH_SIZE) {
+        let count = (m - batch_start).min(MINIOT_BATCH_SIZE);
+        let encoded_keys = io.recv(TAG_MLKEM_COT_KEYS);
+        validate_message_length(&encoded_keys, encoded_key_batch_len(count))?;
+        let key_pair_size = 2 * ENCAPSULATION_KEY_BYTES;
+        let mut responses = Vec::with_capacity(encoded_response_batch_len(count));
+        for offset in 0..count {
+            let start = offset * key_pair_size;
+            let key_pair = &encoded_keys[start..start + key_pair_size];
+            let q = fresh_block(rng);
+            let q_xor_delta = xor_block(&q, &delta_msg);
+            let response = miniot::miniot_sender_encoded::<2>(
+                rng,
+                [block_payload(&q), block_payload(&q_xor_delta)],
+                key_pair,
+            )?;
+            responses.extend_from_slice(&response);
+            sender_values.push(q);
+        }
+        io.send(TAG_MLKEM_COT_RESPONSES, &responses);
     }
-
-    let u_msg = decode_iknp_u(&io.recv(TAG_IKNP_U), m)?;
-    let (sender_values, corrections) = iknp_sender_from_u::<Sha3_256, 16>(
-        m,
-        &delta_msg,
-        &delta_ot,
-        &delta_ot_bytes,
-        &chosen_seeds,
-        &u_msg,
-    );
-    io.send(
-        TAG_IKNP_CORR,
-        &volar_spec::ot::wire::encode_iknp_corr(&corrections),
-    );
 
     let seed = FerretSenderSeed {
         delta: delta_msg,
         q: sender_values,
     };
+    let mut setup_pool = CotPoolSender::from_seed(setup_params, seed)?;
+    {
+        let mut ferret_rng = CryptoSpecRng(rng);
+        stack_refill_sender(&mut ferret_rng, &mut setup_pool, io);
+    }
+    let pool = setup_pool.reprofile(main_params)?;
     Ok(MlKemFerretVerifier {
-        pool: CotPoolSender::from_seed(params, seed)?,
+        pool,
         delta: Delta {
             delta: to_field_block(delta_msg),
         },
@@ -331,7 +437,8 @@ impl MlKemFerretProver {
         vole_commit_bit_prover_share(to_field_block(value), bit_to_field, bit)
     }
 
-    /// Run one refillable Ferret iteration, preserving the seed watermark.
+    /// Run one fresh Ferret main-profile iteration when the seed watermark is
+    /// reached, preserving the remaining COT buffer.
     pub fn refill<Io: StackIo>(&mut self, rng: &mut dyn CryptoRng, io: &mut Io) {
         let mut rng = CryptoSpecRng(rng);
         stack_refill_receiver(&mut rng, &mut self.pool, io);
@@ -355,7 +462,8 @@ impl MlKemFerretVerifier {
         vole_commit_bit_verifier_share(to_field_block(value))
     }
 
-    /// Run one refillable Ferret iteration, preserving the seed watermark.
+    /// Run one fresh Ferret main-profile iteration when the seed watermark is
+    /// reached, preserving the remaining COT buffer.
     pub fn refill<Io: StackIo>(&mut self, rng: &mut dyn CryptoRng, io: &mut Io) {
         let mut rng = CryptoSpecRng(rng);
         stack_refill_sender(&mut rng, &mut self.pool, io);
@@ -401,20 +509,16 @@ pub fn prover_context<'a, 'b>(
     }
 }
 
-/// Expose the protocol's post-setup message tags to transports and harnesses.
+/// Expose the protocol's message tags to transports and harnesses.
 pub mod message_tags {
-    /// Prover → verifier: batch of two ML-KEM public keys for one base OT.
-    pub const MLKEM_PUBLIC_KEYS: u8 = super::TAG_MLKEM_PUBLIC_KEYS;
-    /// Verifier → prover: ML-KEM ciphertexts and masked base-OT seed payloads.
-    pub const MLKEM_CIPHERTEXTS: u8 = super::TAG_MLKEM_CIPHERTEXTS;
-    /// Prover → verifier: IKNP `u` columns.
-    pub const IKNP_U: u8 = super::TAG_IKNP_U;
-    /// Verifier → prover: IKNP correction rows.
-    pub const IKNP_CORRECTIONS: u8 = super::TAG_IKNP_CORR;
+    /// Prover → verifier: batch of two ML-KEM public keys per setup COT.
+    pub const MLKEM_COT_KEYS: u8 = super::TAG_MLKEM_COT_KEYS;
+    /// Verifier → prover: batch of two ML-KEM ciphertext/masked-value pairs.
+    pub const MLKEM_COT_RESPONSES: u8 = super::TAG_MLKEM_COT_RESPONSES;
     /// Ferret receiver → sender: LPN seed and SPCOT choices.
-    pub const FERRET_OPEN: u8 = super::TAG_FERRET_OPEN;
+    pub const FERRET_OPEN: u8 = volar_spec::ot::wire::TAG_FERRET_OPEN;
     /// Ferret sender → receiver: MPCOT ciphertexts.
-    pub const FERRET_MPCOT: u8 = super::TAG_FERRET_MPCOT;
+    pub const FERRET_MPCOT: u8 = volar_spec::ot::wire::TAG_FERRET_MPCOT;
     /// Prover → verifier: Bea95 chosen-bit correction.
-    pub const BEA95: u8 = super::TAG_BEA95;
+    pub const BEA95: u8 = volar_spec::ot::wire::TAG_BEA95;
 }
