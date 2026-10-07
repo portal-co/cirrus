@@ -25,23 +25,30 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use volar_spec::binfhe::circuit_bs::{CircuitBootstrappingKey, circuit_bootstrap};
-use volar_spec::binfhe::keys::BootstrappingKey;
-use volar_spec::binfhe::lwe::{LweCiphertext, binfhe_not, binfhe_trivial, wire_delta};
+use volar_spec::binfhe::keys::BinfheBootstrappingKey;
+use volar_spec::binfhe::lwe::{
+    BinfheLweCiphertext, binfhe_not, binfhe_trivial, wire_delta,
+};
 use volar_spec::binfhe::params::{std128, toy};
 use volar_spec::binfhe::pbs::binfhe_lut_read_dyn;
-use volar_spec::binfhe::rgsw::{RgswCiphertext, cmux};
-use volar_spec::binfhe::rlwe::RlweCiphertext;
+use volar_spec::binfhe::rgsw::{BinfheRgswCiphertext, binfhe_rgsw_cmux};
+use volar_spec::binfhe::rlwe::BinfheRlweCiphertext;
 
 use cirrus_recompile_bytecode::variant::{VariantOperationSet, VariantProfile};
 
 /// V2 Toy ciphertext types at the profile's const-generic shape.
-pub type ToyWire = LweCiphertext<{ toy::N_LWE }>;
+pub type ToyWire = BinfheLweCiphertext<{ toy::N_LWE }>;
 /// V2 Toy RGSW value (circuit-bootstrap result).
-pub type ToyRgsw = RgswCiphertext<{ toy::BIG_N }, { toy::BS_ELL }>;
+pub type ToyRgsw = BinfheRgswCiphertext<{ toy::BIG_N }, { toy::BS_ELL }>;
 /// V2 Toy RLWE content cell.
-pub type ToyCell = RlweCiphertext<{ toy::BIG_N }>;
+pub type ToyCell = BinfheRlweCiphertext<{ toy::BIG_N }>;
 /// V2 Toy bootstrapping key.
-pub type ToyBk = BootstrappingKey<{ toy::N_LWE }, { toy::BIG_N }, { toy::BS_ELL }, { toy::KS_ELL }>;
+pub type ToyBk = BinfheBootstrappingKey<
+    { toy::N_LWE },
+    { toy::BIG_N },
+    { toy::BS_ELL },
+    { toy::KS_ELL },
+>;
 /// V2 Toy circuit-bootstrapping key (contains the bootstrapping key).
 pub type ToyCbk = CircuitBootstrappingKey<
     { toy::N_LWE },
@@ -166,21 +173,28 @@ impl VariantOperationSet for BinFheToyOps<'_> {
         then_cell: &Self::Cell,
         else_cell: &Self::Cell,
     ) -> Result<Self::Cell, Self::Error> {
-        Ok(cmux::<{ toy::BIG_N }, { toy::LOG_Q }, { toy::BS_ELL }, { toy::BS_BASE_LOG }>(
-            selector, then_cell, else_cell,
-        ))
+        Ok(binfhe_rgsw_cmux::<
+            { toy::BIG_N },
+            { toy::LOG_Q },
+            { toy::BS_ELL },
+            { toy::BS_BASE_LOG },
+        >(selector, then_cell, else_cell))
     }
 }
 
 /// V2 Std128 ciphertext types at the profile's const-generic shape.
-pub type Std128Wire = LweCiphertext<{ std128::N_LWE }>;
+pub type Std128Wire = BinfheLweCiphertext<{ std128::N_LWE }>;
 /// V2 Std128 RGSW value.
-pub type Std128Rgsw = RgswCiphertext<{ std128::BIG_N }, { std128::BS_ELL }>;
+pub type Std128Rgsw = BinfheRgswCiphertext<{ std128::BIG_N }, { std128::BS_ELL }>;
 /// V2 Std128 RLWE content cell.
-pub type Std128Cell = RlweCiphertext<{ std128::BIG_N }>;
+pub type Std128Cell = BinfheRlweCiphertext<{ std128::BIG_N }>;
 /// V2 Std128 bootstrapping key.
-pub type Std128Bk =
-    BootstrappingKey<{ std128::N_LWE }, { std128::BIG_N }, { std128::BS_ELL }, { std128::KS_ELL }>;
+pub type Std128Bk = BinfheBootstrappingKey<
+    { std128::N_LWE },
+    { std128::BIG_N },
+    { std128::BS_ELL },
+    { std128::KS_ELL },
+>;
 /// V2 Std128 circuit-bootstrapping key.
 pub type Std128Cbk = CircuitBootstrappingKey<
     { std128::N_LWE },
@@ -294,9 +308,12 @@ impl VariantOperationSet for BinFheStd128Ops<'_> {
         then_cell: &Self::Cell,
         else_cell: &Self::Cell,
     ) -> Result<Self::Cell, Self::Error> {
-        Ok(cmux::<{ std128::BIG_N }, { std128::LOG_Q }, { std128::BS_ELL }, { std128::BS_BASE_LOG }>(
-            selector, then_cell, else_cell,
-        ))
+        Ok(binfhe_rgsw_cmux::<
+            { std128::BIG_N },
+            { std128::LOG_Q },
+            { std128::BS_ELL },
+            { std128::BS_BASE_LOG },
+        >(selector, then_cell, else_cell))
     }
 }
 
@@ -311,9 +328,16 @@ mod tests {
     };
     use volar_spec::SpecRng;
     use volar_spec::binfhe::circuit_bs::gen_circuit_bootstrapping_key;
-    use volar_spec::binfhe::lwe::{gen_lwe_secret_key, lwe_decrypt, lwe_encrypt, wire_delta};
+    use volar_spec::binfhe::lwe::{
+        binfhe_gen_lwe_secret_key as gen_lwe_secret_key, binfhe_lwe_decrypt as lwe_decrypt,
+        binfhe_lwe_encrypt as lwe_encrypt, wire_delta,
+    };
     use volar_spec::binfhe::plan::{BootstrapPlan, FailureBudget, LutSpec, PlanOp, execute_plan};
-    use volar_spec::binfhe::rlwe::{RlweSecretKey, gen_rlwe_secret_key, rlwe_phase};
+    use volar_spec::binfhe::rlwe::{
+        BinfheRlweSecretKey as RlweSecretKey,
+        binfhe_gen_rlwe_secret_key as gen_rlwe_secret_key,
+        binfhe_rlwe_phase as rlwe_phase,
+    };
 
     /// Deterministic splitmix64 RNG (same construction as Volar's fixtures).
     struct TestRng(u64);
@@ -417,7 +441,7 @@ mod tests {
     }
 
     struct ToyKeys {
-        lwe: volar_spec::binfhe::lwe::LweSecretKey<{ toy::N_LWE }>,
+        lwe: volar_spec::binfhe::lwe::BinfheLweSecretKey<{ toy::N_LWE }>,
         rlwe: RlweSecretKey<{ toy::BIG_N }>,
         cbk: ToyCbk,
     }
@@ -490,9 +514,12 @@ mod tests {
         fn encrypt_cell(&self, keys: &Self::Keys, bit: bool, seed: u64) -> Self::Cell {
             let mut rng = TestRng::new(seed);
             let msg = if bit { 1u32 << (toy::LOG_Q - 3) } else { 0 };
-            volar_spec::binfhe::rlwe::rlwe_encrypt_scalar::<{ toy::BIG_N }, { toy::LOG_Q }, 0, _>(
-                msg, &keys.rlwe, &mut rng,
-            )
+            volar_spec::binfhe::rlwe::binfhe_rlwe_encrypt_scalar::<
+                { toy::BIG_N },
+                { toy::LOG_Q },
+                0,
+                _,
+            >(msg, &keys.rlwe, &mut rng)
         }
 
         fn cell_bit(&self, keys: &Self::Keys, ct: &Self::Cell) -> bool {
@@ -524,7 +551,7 @@ mod tests {
     }
 
     struct Std128Keys {
-        lwe: volar_spec::binfhe::lwe::LweSecretKey<{ std128::N_LWE }>,
+        lwe: volar_spec::binfhe::lwe::BinfheLweSecretKey<{ std128::N_LWE }>,
         rlwe: RlweSecretKey<{ std128::BIG_N }>,
         cbk: Std128Cbk,
     }
@@ -585,7 +612,7 @@ mod tests {
         fn encrypt_cell(&self, keys: &Self::Keys, bit: bool, seed: u64) -> Self::Cell {
             let mut rng = TestRng::new(seed);
             let msg = if bit { 1u32 << (std128::LOG_Q - 3) } else { 0 };
-            volar_spec::binfhe::rlwe::rlwe_encrypt_scalar::<
+            volar_spec::binfhe::rlwe::binfhe_rlwe_encrypt_scalar::<
                 { std128::BIG_N },
                 { std128::LOG_Q },
                 { std128::CBD_ETA },
@@ -665,7 +692,7 @@ mod tests {
                     }
                     VariantRecord::Lut { inputs, table } => {
                         ops.push(PlanOp::Lut {
-                            inputs: volar_spec::binfhe::plan::LutInputs::from_slice(inputs),
+                            inputs: inputs.clone(),
                             table: *table,
                             out: wires,
                         });
@@ -1045,7 +1072,7 @@ mod tests {
                     }
                     PlanOp::Lut { inputs, table, .. } => {
                         records.push(VariantRecord::Lut {
-                            inputs: inputs.as_ref().to_vec(),
+                            inputs: inputs.clone(),
                             table: *table,
                         });
                     }
@@ -1095,7 +1122,7 @@ mod tests {
             k_max: K_MAX,
             luts: vec![LutSpec { entries: vec![false, true, true, false] }],
             layers: vec![vec![PlanOp::Lut {
-                inputs: volar_spec::binfhe::plan::LutInputs::from_slice(&[0, 1]),
+                inputs: vec![0, 1],
                 table: 0,
                 out: 2,
             }]],
