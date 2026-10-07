@@ -23,8 +23,8 @@ use cirrus_core::{
 };
 
 use crate::{
-    apply_and, apply_mux, apply_not, index_matches_known_bits, known_storage_address, one,
-    unknown_bits, BoolarContext, ExecuteError, Value, Wire,
+    BoolarContext, ExecuteError, Value, Wire, apply_and, apply_mux, apply_not,
+    index_matches_known_bits, known_storage_address, one, unknown_bits,
 };
 
 /// Sparse, lazily-materialized backing for one [`SparseMuxTreeContext`] lane.
@@ -267,7 +267,9 @@ where
     C: ContextWithCreate<bool>,
 {
     fn create(&mut self, value: bool) -> Result<Self::Wrapped, Self::Error> {
-        self.inner.create(value).map_err(SparseStorageError::Context)
+        self.inner
+            .create(value)
+            .map_err(SparseStorageError::Context)
     }
 }
 
@@ -280,7 +282,9 @@ where
         left: Self::Wrapped,
         right: Self::Wrapped,
     ) -> Result<Self::Wrapped, Self::Error> {
-        self.inner.bitand(left, right).map_err(SparseStorageError::Context)
+        self.inner
+            .bitand(left, right)
+            .map_err(SparseStorageError::Context)
     }
 
     fn bitand_assign(
@@ -303,7 +307,9 @@ where
         left: Self::Wrapped,
         right: Self::Wrapped,
     ) -> Result<Self::Wrapped, Self::Error> {
-        self.inner.bitor(left, right).map_err(SparseStorageError::Context)
+        self.inner
+            .bitor(left, right)
+            .map_err(SparseStorageError::Context)
     }
 
     fn bitor_assign(
@@ -326,7 +332,9 @@ where
         left: Self::Wrapped,
         right: Self::Wrapped,
     ) -> Result<Self::Wrapped, Self::Error> {
-        self.inner.bitxor(left, right).map_err(SparseStorageError::Context)
+        self.inner
+            .bitxor(left, right)
+            .map_err(SparseStorageError::Context)
     }
 
     fn bitxor_assign(

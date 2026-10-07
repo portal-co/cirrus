@@ -8,8 +8,8 @@ use cirrus_core::{
 };
 
 use crate::{
-    ert_emit, simple_add, ArmDefaultHandler, DefaultHandler, ErtError, RawMemory,
-    SecurityAttribute, SecurityState,
+    ArmDefaultHandler, DefaultHandler, ErtError, RawMemory, SecurityAttribute, SecurityState,
+    ert_emit, simple_add,
 };
 
 fn word(value: u32) -> [bool; 32] {
@@ -236,19 +236,21 @@ fn run_counting(
     let mut rstack = [0; 16];
     let mut vstack = [false; 128];
     let storage_bits = vstack.len();
-    assert!(ert_emit(
-        &mut handler,
-        &mut vstack,
-        storage_bits,
-        RawMemory::from(&image[..]),
-        &mut rstack,
-        1,
-        regs,
-        constants,
-        false,
-        true,
-    )
-    .is_ok());
+    assert!(
+        ert_emit(
+            &mut handler,
+            &mut vstack,
+            storage_bits,
+            RawMemory::from(&image[..]),
+            &mut rstack,
+            1,
+            regs,
+            constants,
+            false,
+            true,
+        )
+        .is_ok()
+    );
     handler.inner.context
 }
 
@@ -380,14 +382,16 @@ fn secure_gateway_re_enters_secure_state_and_permits_a_gated_svc() {
     let mut regs = [[false; 32]; 16];
     let mut constants = [None; 16];
     let with_gateway = [0x2004, 0x4704, 0xe97f, 0xe97f, 0x2000, 0x3801, 0xdf00];
-    assert!(run_with(
-        &with_gateway,
-        &mut regs,
-        &mut constants,
-        secure_only,
-        non_secure_callable_at_four,
-    )
-    .is_ok());
+    assert!(
+        run_with(
+            &with_gateway,
+            &mut regs,
+            &mut constants,
+            secure_only,
+            non_secure_callable_at_four,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -404,12 +408,14 @@ fn thumb16_arithmetic_flags_and_conditional_branch_execute() {
     let mut constants = [None; 16];
     exit(&mut regs, &mut constants);
     // movs r1, #3; subs r1, #3; bne +2; movs r2, #9; svc #0
-    assert!(run(
-        &[0x2103, 0x3903, 0xd100, 0x2209, 0xdf00],
-        &mut regs,
-        &mut constants
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[0x2103, 0x3903, 0xd100, 0x2209, 0xdf00],
+            &mut regs,
+            &mut constants
+        )
+        .is_ok()
+    );
     assert_eq!(constants[1], Some(0));
     assert_eq!(constants[2], Some(9));
 }
@@ -421,12 +427,14 @@ fn apsr_nzcvq_round_trips_only_its_architectural_bits() {
     // msr APSR_nzcvq, r1; mrs r2, APSR; svc #0
     regs[1] = word(0xabff_ffff);
     exit(&mut regs, &mut constants);
-    assert!(run(
-        &[0xf381, 0x8800, 0xf3ef, 0x8200, 0xdf00],
-        &mut regs,
-        &mut constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[0xf381, 0x8800, 0xf3ef, 0x8200, 0xdf00],
+            &mut regs,
+            &mut constants,
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[2]), 0xa800_0000);
     assert_eq!(constants[2], None);
 
@@ -435,12 +443,14 @@ fn apsr_nzcvq_round_trips_only_its_architectural_bits() {
     concrete_regs[1] = word(0xabff_ffff);
     concrete_constants[1] = Some(0xabff_ffff);
     exit(&mut concrete_regs, &mut concrete_constants);
-    assert!(run(
-        &[0xf381, 0x8800, 0xf3ef, 0x8200, 0xdf00],
-        &mut concrete_regs,
-        &mut concrete_constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[0xf381, 0x8800, 0xf3ef, 0x8200, 0xdf00],
+            &mut concrete_regs,
+            &mut concrete_constants,
+        )
+        .is_ok()
+    );
     assert_eq!(concrete_constants[2], Some(0xa800_0000));
 }
 
@@ -485,12 +495,14 @@ fn symbolic_carry_flows_through_adc_and_sbc() {
     regs[2] = word(0);
     regs[3] = word(0x2000_0000);
     exit(&mut regs, &mut constants);
-    assert!(run(
-        &[0xf383, 0x8800, 0x4151, 0x4191, 0xf3ef, 0x8400, 0xdf00,],
-        &mut regs,
-        &mut constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[0xf383, 0x8800, 0x4151, 0x4191, 0xf3ef, 0x8400, 0xdf00,],
+            &mut regs,
+            &mut constants,
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[1]), 0);
     assert_eq!(constants[1], None);
     assert_eq!(value(&regs[4]), 0x6000_0000);
@@ -512,12 +524,16 @@ fn logical_move_and_shift_flag_writers_preserve_or_update_nzcvq() {
     exit(&mut regs, &mut constants);
     // msr APSR_nzcvq,r3; lsls r1,r1,#1; movs r4,#0; ands r1,r4;
     // mrs r2,APSR; svc #0.
-    assert!(run(
-        &[0xf383, 0x8800, 0x0049, 0x2400, 0x4021, 0xf3ef, 0x8200, 0xdf00,],
-        &mut regs,
-        &mut constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xf383, 0x8800, 0x0049, 0x2400, 0x4021, 0xf3ef, 0x8200, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants,
+        )
+        .is_ok()
+    );
     // The shift produces zero and C=1; ANDS keeps C/V/Q while retaining the
     // zero result, so NZCVQ is 0b01111.
     assert_eq!(constants[2], Some(0x7800_0000));
@@ -576,19 +592,21 @@ fn symbolic_cmp_and_single_instruction_it_materialize_compiler_booleans() {
         // The non-flag-setting wide move preserves CMP's flags while the
         // predicated MOVS materializes the 0/1 value and its selected NZ
         // side effects.
-        assert!(run(
-            &[
-                0x4291,
-                0xf04f,
-                0x0300,
-                0xbf08 | ((condition as u16) << 4),
-                0x2301,
-                0xdf00,
-            ],
-            &mut regs,
-            &mut constants,
-        )
-        .is_ok());
+        assert!(
+            run(
+                &[
+                    0x4291,
+                    0xf04f,
+                    0x0300,
+                    0xbf08 | ((condition as u16) << 4),
+                    0x2301,
+                    0xdf00,
+                ],
+                &mut regs,
+                &mut constants,
+            )
+            .is_ok()
+        );
         assert_eq!(value(&regs[3]), expected as u32);
         assert_eq!(constants[3], None);
     }
@@ -655,15 +673,17 @@ fn thumb2_constants_shifted_logic_and_long_multiply_decode() {
     exit(&mut regs, &mut constants);
     // movw/movt r1,#0x12345678; add.w r2,r1,#4; ror.w r3,r2,#8;
     // eor.w r4,r3,r2,ror #4; umull r5,r6,r1,r2; svc #0.
-    assert!(run(
-        &[
-            0xf245, 0x6178, 0xf2c1, 0x2134, 0xf101, 0x0204, 0xea4f, 0x2332, 0xea83, 0x1432, 0xfba1,
-            0x5602, 0xdf00,
-        ],
-        &mut regs,
-        &mut constants
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xf245, 0x6178, 0xf2c1, 0x2134, 0xf101, 0x0204, 0xea4f, 0x2332, 0xea83, 0x1432,
+                0xfba1, 0x5602, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants
+        )
+        .is_ok()
+    );
     assert_eq!(constants[1], Some(0x1234_5678));
     assert_eq!(constants[2], Some(0x1234_567c));
     assert_eq!(constants[3], Some(0x7c12_3456));
@@ -730,19 +750,21 @@ fn a_concrete_load_at_the_detect_address_returns_the_overridden_word() {
     let mut vstack = [false; 128];
     let storage_bits = vstack.len();
 
-    assert!(ert_emit(
-        &mut handler,
-        &mut vstack,
-        storage_bits,
-        memory,
-        &mut rstack,
-        1,
-        &mut regs,
-        &mut constants,
-        false,
-        true,
-    )
-    .is_ok());
+    assert!(
+        ert_emit(
+            &mut handler,
+            &mut vstack,
+            storage_bits,
+            memory,
+            &mut rstack,
+            1,
+            &mut regs,
+            &mut constants,
+            false,
+            true,
+        )
+        .is_ok()
+    );
 
     assert_eq!(constants[1], Some(0xdead_beef));
 }
@@ -828,12 +850,16 @@ fn high_register_moves_keep_the_sha_state_registers_distinct() {
     exit(&mut regs, &mut constants);
     // movw r11,#0xe667; movt r11,#0x6a09; mov r0,r11; mov r1,r0;
     // movs r0,#0; subs r0,#1; svc #0.
-    assert!(run(
-        &[0xf24e, 0x6b67, 0xf6c6, 0x2b09, 0x4658, 0x4601, 0x2000, 0x3801, 0xdf00,],
-        &mut regs,
-        &mut constants
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xf24e, 0x6b67, 0xf6c6, 0x2b09, 0x4658, 0x4601, 0x2000, 0x3801, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[1]), 0x6a09_e667);
 }
 
@@ -848,15 +874,17 @@ fn sha_frame_spills_preserve_the_selected_high_registers() {
     regs[10] = word(c);
     // sub sp,#16; strd r3,r9,[sp,#4]; str.w r10,[sp]; str r0,[sp,#12];
     // ldr.w r1,[sp,#12]; ldr.w r2,[sp]; add sp,#16; exit.
-    assert!(run(
-        &[
-            0xb084, 0xe9cd, 0x3901, 0xf8cd, 0xa000, 0x9003, 0xf8dd, 0x100c, 0xf8dd, 0x2000, 0xb004,
-            0x2000, 0x3801, 0xdf00,
-        ],
-        &mut regs,
-        &mut constants
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xb084, 0xe9cd, 0x3901, 0xf8cd, 0xa000, 0x9003, 0xf8dd, 0x100c, 0xf8dd, 0x2000,
+                0xb004, 0x2000, 0x3801, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[1]), b);
     assert_eq!(value(&regs[2]), c);
 }
@@ -868,12 +896,16 @@ fn register_indexed_stack_load_store_keeps_a_concrete_index() {
     regs[2] = word(0x1234_5678);
     // sub sp,#16; mov r3,sp; movs r1,#4; str r2,[r3,r1];
     // ldr r4,[r3,r1]; add sp,#16; exit.
-    assert!(run(
-        &[0xb084, 0x466b, 0x2104, 0x505a, 0x585c, 0xb004, 0x2000, 0x3801, 0xdf00,],
-        &mut regs,
-        &mut constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xb084, 0x466b, 0x2104, 0x505a, 0x585c, 0xb004, 0x2000, 0x3801, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants,
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[4]), 0x1234_5678);
 }
 
@@ -892,12 +924,16 @@ fn thumb2_mla_mls_and_long_products_decode() {
     constants[6] = None;
     // mla r3,r1,r2,r4; mls r5,r1,r2,r6; umull r7,r8,r1,r2;
     // smull r9,r10,r1,r2; svc #0.
-    assert!(run(
-        &[0xfb01, 0x4302, 0xfb01, 0x6512, 0xfba1, 0x7802, 0xfb81, 0x9a02, 0xdf00,],
-        &mut regs,
-        &mut constants,
-    )
-    .is_ok());
+    assert!(
+        run(
+            &[
+                0xfb01, 0x4302, 0xfb01, 0x6512, 0xfba1, 0x7802, 0xfb81, 0x9a02, 0xdf00,
+            ],
+            &mut regs,
+            &mut constants,
+        )
+        .is_ok()
+    );
     assert_eq!(value(&regs[3]), 74);
     assert_eq!(value(&regs[5]), 37);
     assert_eq!(value(&regs[7]), 63);

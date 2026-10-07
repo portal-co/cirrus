@@ -7,6 +7,7 @@ description.workspace = true
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 volar-spec.workspace = true
+volar-oram.workspace = true
 digest.workspace = true
 hybrid-array.workspace = true
 cipher.workspace = true

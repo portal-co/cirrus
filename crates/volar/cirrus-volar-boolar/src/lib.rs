@@ -14,21 +14,21 @@ mod typed;
 mod types;
 
 pub use address_trim::{
-    trim_storage_addr_width, trim_storage_element_bits, AddressTrimError, WASM_BYTE_ADDRESS_BITS,
+    AddressTrimError, WASM_BYTE_ADDRESS_BITS, trim_storage_addr_width, trim_storage_element_bits,
 };
 pub use sparse::{SparseBank, SparseMuxTreeContext, SparseStorageError};
-pub use typed::{lower_volar_circuit, TypedLowerError};
-pub use types::{lower_volar_types, VolarTypeMap, VolarTypeMapError};
+pub use typed::{TypedLowerError, lower_volar_circuit};
+pub use types::{VolarTypeMap, VolarTypeMapError, lower_volar_types};
 
 use alloc::{string::String, vec::Vec};
-use cirrus_recompile_core::{
-    Idx, Op, Program, StorageBank as ProgramStorageBank, StorageInitSegment, StorageOp,
-    StorageOpKind,
-};
 use cirrus_core::{
     ContextWithBitAnd, ContextWithBitAndByRef, ContextWithBitOr, ContextWithBitOrByRef,
     ContextWithBitXor, ContextWithBitXorByRef, ContextWithCreate, ContextWithCreateByRef,
     ContextWithStorage, ContextWithValue, HasError, StorageAddressBit,
+};
+use cirrus_recompile_core::{
+    Idx, Op, Program, StorageBank as ProgramStorageBank, StorageInitSegment, StorageOp,
+    StorageOpKind,
 };
 use lazy_repo::{ChunkCodec, Repository};
 use lazy_repo_crypto::{EncryptedScratch, ScratchSlot, ScratchStore};
@@ -85,14 +85,17 @@ fn program_storage_bank(
 /// Storage reads/writes, bank identities, LSB-first addresses, static segments,
 /// and statement order are preserved. `Not` is expanded as XOR with a fresh
 /// public-one slot, matching the Boolean recompile vocabulary.
-pub fn lower_boolar_program<P: Clone>(
-    circuit: &BCircuit<P>,
-) -> Result<Program, ProgramLowerError> {
+pub fn lower_boolar_program<P: Clone>(circuit: &BCircuit<P>) -> Result<Program, ProgramLowerError> {
     let mut program = Program::default();
     let mut values = Vec::with_capacity(circuit.params as usize + circuit.stmts.len());
 
     for segment in &circuit.pre_init {
-        let bank = program_storage_bank(&mut program, segment.storage, segment.lane, segment.addr.len())?;
+        let bank = program_storage_bank(
+            &mut program,
+            segment.storage,
+            segment.lane,
+            segment.addr.len(),
+        )?;
         program.storage_init.push(StorageInitSegment {
             bank,
             addr: segment.addr.clone(),
@@ -114,7 +117,12 @@ pub fn lower_boolar_program<P: Clone>(
             program.ops.push(Op::Create(true));
             one = Some(constant);
         }
-        let value = |value: IRVarId| values.get(value.0 as usize).copied().ok_or(ProgramLowerError::MissingValue(value));
+        let value = |value: IRVarId| {
+            values
+                .get(value.0 as usize)
+                .copied()
+                .ok_or(ProgramLowerError::MissingValue(value))
+        };
         let slot = Idx(program.ops.len() as u32);
         let op = match &node.kind {
             BIrStmt::Zero => Op::Create(false),
@@ -123,19 +131,44 @@ pub fn lower_boolar_program<P: Clone>(
             BIrStmt::Or(a, b) => Op::BitOr(value(*a)?, value(*b)?),
             BIrStmt::Xor(a, b) => Op::BitXor(value(*a)?, value(*b)?),
             BIrStmt::Not(input) => Op::BitXor(value(*input)?, one.expect("not initializes one")),
-            BIrStmt::StorageRead { storage, lane, addr } => {
+            BIrStmt::StorageRead {
+                storage,
+                lane,
+                addr,
+            } => {
                 let bank = program_storage_bank(&mut program, *storage, *lane, addr.len())?;
-                let address = addr.iter().map(|address| value(*address)).collect::<Result<Vec<_>, _>>()?;
-                let id = u32::try_from(program.storage_ops.len()).map_err(|_| ProgramLowerError::UnsupportedStatement)?;
-                program.storage_ops.push(StorageOp { kind: StorageOpKind::Read, bank, address, value: None });
+                let address = addr
+                    .iter()
+                    .map(|address| value(*address))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = u32::try_from(program.storage_ops.len())
+                    .map_err(|_| ProgramLowerError::UnsupportedStatement)?;
+                program.storage_ops.push(StorageOp {
+                    kind: StorageOpKind::Read,
+                    bank,
+                    address,
+                    value: None,
+                });
                 Op::Storage(id)
             }
-            BIrStmt::StorageWrite { storage, lane, src, addr } => {
+            BIrStmt::StorageWrite {
+                storage,
+                lane,
+                src,
+                addr,
+            } => {
                 let bank = program_storage_bank(&mut program, *storage, *lane, addr.len())?;
-                let address = addr.iter().map(|address| value(*address)).collect::<Result<Vec<_>, _>>()?;
-                let id = u32::try_from(program.storage_ops.len()).map_err(|_| ProgramLowerError::UnsupportedStatement)?;
+                let address = addr
+                    .iter()
+                    .map(|address| value(*address))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = u32::try_from(program.storage_ops.len())
+                    .map_err(|_| ProgramLowerError::UnsupportedStatement)?;
                 program.storage_ops.push(StorageOp {
-                    kind: StorageOpKind::Write, bank, address, value: Some(value(*src)?),
+                    kind: StorageOpKind::Write,
+                    bank,
+                    address,
+                    value: Some(value(*src)?),
                 });
                 Op::Storage(id)
             }
@@ -2101,19 +2134,19 @@ mod tests {
     use cirrus_core::{
         ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, ContextWithCreate, HasError,
     };
-    use cirrus_recompile_core::{interpret, Recorder};
+    use cirrus_recompile_core::{Recorder, interpret};
     use core::convert::Infallible;
     use lazy_repo::{CacheConfig, ContentId, MemorySource};
     use std::{cell::RefCell, collections::BTreeMap};
     use volar_ir::boolar::BIrPreInitSegment;
-    use volar_ir::lazy::{chunk_b_circuit, BStmtChunk};
+    use volar_ir::lazy::{BStmtChunk, chunk_b_circuit};
     use volar_ir_common::Node;
 
     #[test]
     fn bounded_riscv_fixture_lowers_to_initialized_five_bit_memory() {
         use volar_riscv_test_programs::{parse_and_expand, wat_gen::test_program_wat};
         use volar_vaffle_target::{
-            import_config::WaffleImportConfig, waffle_lower::lower_waffle_module, VaffleTarget,
+            VaffleTarget, import_config::WaffleImportConfig, waffle_lower::lower_waffle_module,
         };
 
         let wasm = wat::parse_str(test_program_wat()).expect("RISC fixture WAT should assemble");
@@ -2194,11 +2227,14 @@ mod tests {
 
         let program = lower_boolar_program(&source).unwrap();
         assert_eq!(program.inputs, vec![Idx(0), Idx(1), Idx(2)]);
-        assert_eq!(program.storage_banks, vec![ProgramStorageBank {
-            storage: STORAGE.0 as u64,
-            lane: LANE.0 as u64,
-            address_bits: 2,
-        }]);
+        assert_eq!(
+            program.storage_banks,
+            vec![ProgramStorageBank {
+                storage: STORAGE.0 as u64,
+                lane: LANE.0 as u64,
+                address_bits: 2,
+            }]
+        );
         assert_eq!(program.storage_init.len(), 1);
         assert!(matches!(program.ops[3], Op::Storage(0)));
         assert!(matches!(program.ops[4], Op::Storage(1)));
@@ -2574,16 +2610,22 @@ mod tests {
             .unwrap();
         assert_eq!(bank.live_len(), 2, "only the two touched cells exist");
 
-        assert!(context
-            .storage_read(&mut bank, &sparse_known_address(34, 5))
-            .unwrap());
-        assert!(!context
-            .storage_read(&mut bank, &sparse_known_address(34, 1 << 30))
-            .unwrap());
+        assert!(
+            context
+                .storage_read(&mut bank, &sparse_known_address(34, 5))
+                .unwrap()
+        );
+        assert!(
+            !context
+                .storage_read(&mut bank, &sparse_known_address(34, 1 << 30))
+                .unwrap()
+        );
         // An untouched address defaults to false and materializes on read.
-        assert!(!context
-            .storage_read(&mut bank, &sparse_known_address(34, 42))
-            .unwrap());
+        assert!(
+            !context
+                .storage_read(&mut bank, &sparse_known_address(34, 42))
+                .unwrap()
+        );
         assert_eq!(bank.live_len(), 3);
     }
 
@@ -2627,8 +2669,16 @@ mod tests {
 
         // Two live cells over 24 unknown bits: a handful of gates, nowhere
         // near a 16-million-way dense tree.
-        assert!(context.inner().ands < 100, "ands = {}", context.inner().ands);
-        assert!(context.inner().xors < 100, "xors = {}", context.inner().xors);
+        assert!(
+            context.inner().ands < 100,
+            "ands = {}",
+            context.inner().ands
+        );
+        assert!(
+            context.inner().xors < 100,
+            "xors = {}",
+            context.inner().xors
+        );
     }
 
     #[test]
@@ -2658,12 +2708,16 @@ mod tests {
             .storage_write(&mut bank, &symbolic_address, true)
             .unwrap();
 
-        assert!(!context
-            .storage_read(&mut bank, &sparse_known_address(2, 0))
-            .unwrap());
-        assert!(context
-            .storage_read(&mut bank, &sparse_known_address(2, 1))
-            .unwrap());
+        assert!(
+            !context
+                .storage_read(&mut bank, &sparse_known_address(2, 0))
+                .unwrap()
+        );
+        assert!(
+            context
+                .storage_read(&mut bank, &sparse_known_address(2, 1))
+                .unwrap()
+        );
     }
 
     #[test]

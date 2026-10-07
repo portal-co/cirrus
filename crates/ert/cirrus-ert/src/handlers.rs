@@ -1,7 +1,7 @@
 use core::array;
 
 use cirrus_ert_core::{
-    compare_word, fixed_shift, partial_bitwise_word, runtime_shift, BitOp, ComparePredicate, Shift,
+    BitOp, ComparePredicate, Shift, compare_word, fixed_shift, partial_bitwise_word, runtime_shift,
 };
 use rv_asm::{Imm, Inst, Reg};
 
@@ -142,19 +142,13 @@ pub fn execute<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord
         Inst::Slli { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::Left),
         Inst::SlliW { imm, dest, src1 } => shift_w(machine, imm, dest, src1, Shift::Left),
         Inst::Srli { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::LogicalRight),
-        Inst::SrliW { imm, dest, src1 } => {
-            shift_w(machine, imm, dest, src1, Shift::LogicalRight)
-        }
-        Inst::Srai { imm, dest, src1 } => {
-            shift(machine, imm, dest, src1, Shift::ArithmeticRight)
-        }
+        Inst::SrliW { imm, dest, src1 } => shift_w(machine, imm, dest, src1, Shift::LogicalRight),
+        Inst::Srai { imm, dest, src1 } => shift(machine, imm, dest, src1, Shift::ArithmeticRight),
         Inst::SraiW { imm, dest, src1 } => {
             shift_w(machine, imm, dest, src1, Shift::ArithmeticRight)
         }
         Inst::Sll { dest, src1, src2 } => runtime_shift_h(machine, dest, src1, src2, Shift::Left),
-        Inst::SllW { dest, src1, src2 } => {
-            runtime_shift_w(machine, dest, src1, src2, Shift::Left)
-        }
+        Inst::SllW { dest, src1, src2 } => runtime_shift_w(machine, dest, src1, src2, Shift::Left),
         Inst::Srl { dest, src1, src2 } => {
             runtime_shift_h(machine, dest, src1, src2, Shift::LogicalRight)
         }
@@ -268,7 +262,10 @@ fn set_less_than_immediate<W: Clone, E: core::error::Error, const BITS: usize, R
     let immediate = imm.as_i32() as i64 as u64;
     machine.offs[dest.0 as usize] = None;
     if let Some(left) = machine.reg_consts[src1.0 as usize] {
-        machine.write_constant(dest, compare_concrete::<BITS>(left, immediate, predicate) as u64);
+        machine.write_constant(
+            dest,
+            compare_concrete::<BITS>(left, immediate, predicate) as u64,
+        );
         return next(machine);
     }
     let right = machine.word_from_constant(immediate);
@@ -298,7 +295,9 @@ fn compare_concrete<const BITS: usize>(left: u64, right: u64, predicate: Compare
     }
 }
 
-fn next<W, E, const BITS: usize, R: RstackWord>(machine: &Machine<'_, W, E, BITS, R>) -> Result<Flow, ErtError<E>> {
+fn next<W, E, const BITS: usize, R: RstackWord>(
+    machine: &Machine<'_, W, E, BITS, R>,
+) -> Result<Flow, ErtError<E>> {
     Ok(Flow::Next(machine.pc + machine.inst_len))
 }
 
@@ -463,8 +462,13 @@ fn add_w<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord>(
     } else {
         machine.zero.clone()
     };
-    let low = add_bits(machine.t, &w_low(&machine.regs[src1.0 as usize]), &right, carry)
-        .map_err(ErtError::Emitted)?;
+    let low = add_bits(
+        machine.t,
+        &w_low(&machine.regs[src1.0 as usize]),
+        &right,
+        carry,
+    )
+    .map_err(ErtError::Emitted)?;
     machine.regs[dest.0 as usize] = w_extend(&low);
     machine.reg_consts[dest.0 as usize] = None;
     next(machine)
@@ -680,17 +684,16 @@ fn shift_w<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWord>(
     let amount = imm.as_u32() & 31;
     let source = machine.regs[src1.0 as usize].clone();
     machine.offs[dest.0 as usize] = None;
-    machine.reg_consts[dest.0 as usize] =
-        machine.reg_consts[src1.0 as usize].map(|value| {
-            let low = value as u32;
-            let result = match direction {
-                Shift::Left => low << amount,
-                Shift::LogicalRight => low >> amount,
-                Shift::ArithmeticRight => (low as i32 >> amount) as u32,
-                Shift::RotateRight => unreachable!("RISC-V has no rotate form"),
-            };
-            sext32(u64::from(result))
-        });
+    machine.reg_consts[dest.0 as usize] = machine.reg_consts[src1.0 as usize].map(|value| {
+        let low = value as u32;
+        let result = match direction {
+            Shift::Left => low << amount,
+            Shift::LogicalRight => low >> amount,
+            Shift::ArithmeticRight => (low as i32 >> amount) as u32,
+            Shift::RotateRight => unreachable!("RISC-V has no rotate form"),
+        };
+        sext32(u64::from(result))
+    });
     let shifted = fixed_shift(&w_low(&source), amount, direction, &machine.zero);
     machine.regs[dest.0 as usize] = w_extend(&shifted);
     next(machine)
@@ -716,14 +719,9 @@ fn runtime_shift_h<W: Clone, E: core::error::Error, const BITS: usize, R: Rstack
     }
 
     machine.reg_consts[dest.0 as usize] = None;
-    machine.regs[dest.0 as usize] = runtime_shift(
-        machine.t,
-        &source,
-        &amount_word,
-        direction,
-        &machine.zero,
-    )
-    .map_err(ErtError::Emitted)?;
+    machine.regs[dest.0 as usize] =
+        runtime_shift(machine.t, &source, &amount_word, direction, &machine.zero)
+            .map_err(ErtError::Emitted)?;
     next(machine)
 }
 
@@ -742,18 +740,17 @@ fn runtime_shift_w<W: Clone, E: core::error::Error, const BITS: usize, R: Rstack
     machine.offs[dest.0 as usize] = None;
 
     if let Some(amount) = machine.reg_consts[src2.0 as usize] {
-        machine.reg_consts[dest.0 as usize] =
-            machine.reg_consts[src1.0 as usize].map(|value| {
-                let low = value as u32;
-                let amount = (amount as u32) & 31;
-                let result = match direction {
-                    Shift::Left => low << amount,
-                    Shift::LogicalRight => low >> amount,
-                    Shift::ArithmeticRight => (low as i32 >> amount) as u32,
-                    Shift::RotateRight => unreachable!("RISC-V has no rotate form"),
-                };
-                sext32(u64::from(result))
-            });
+        machine.reg_consts[dest.0 as usize] = machine.reg_consts[src1.0 as usize].map(|value| {
+            let low = value as u32;
+            let amount = (amount as u32) & 31;
+            let result = match direction {
+                Shift::Left => low << amount,
+                Shift::LogicalRight => low >> amount,
+                Shift::ArithmeticRight => (low as i32 >> amount) as u32,
+                Shift::RotateRight => unreachable!("RISC-V has no rotate form"),
+            };
+            sext32(u64::from(result))
+        });
         let shifted = fixed_shift(
             &w_low(&source),
             (amount as u32) & 31,
@@ -777,7 +774,13 @@ fn runtime_shift_w<W: Clone, E: core::error::Error, const BITS: usize, R: Rstack
     next(machine)
 }
 
-fn select_word<W: Clone, E: core::error::Error, const N: usize, const BITS: usize, R: RstackWord>(
+fn select_word<
+    W: Clone,
+    E: core::error::Error,
+    const N: usize,
+    const BITS: usize,
+    R: RstackWord,
+>(
     machine: &mut Machine<'_, W, E, BITS, R>,
     condition: W,
     then: &[W; N],
@@ -893,8 +896,8 @@ fn multiply_full<W: Clone, E: core::error::Error, const BITS: usize, R: RstackWo
             machine.zero.clone(),
         )
         .map_err(ErtError::Emitted)?;
-        let sum_high = add_bits(machine.t, &acc_high, &addend_high, carry)
-            .map_err(ErtError::Emitted)?;
+        let sum_high =
+            add_bits(machine.t, &acc_high, &addend_high, carry).map_err(ErtError::Emitted)?;
         acc_low = select_word(machine, multiplier_bit.clone(), &sum_low, &acc_low)?;
         acc_high = select_word(machine, multiplier_bit.clone(), &sum_high, &acc_high)?;
         let top = addend_low[BITS - 1].clone();
@@ -924,8 +927,8 @@ fn multiply_by_constant<W: Clone, E: core::error::Error, const BITS: usize, R: R
             )
             .map_err(ErtError::Emitted)?;
             acc_low = sum_low;
-            acc_high = add_bits(machine.t, &acc_high, &addend_high, carry)
-                .map_err(ErtError::Emitted)?;
+            acc_high =
+                add_bits(machine.t, &acc_high, &addend_high, carry).map_err(ErtError::Emitted)?;
         }
         let top = addend_low[BITS - 1].clone();
         addend_low = shift_left_one(&addend_low, &machine.zero);
@@ -975,7 +978,12 @@ fn subtract_if_negative<W: Clone, E: core::error::Error, const BITS: usize, R: R
         Some(_) => subtract_word(machine, &value, subtrahend),
         None => {
             let difference = subtract_word(machine, &value, subtrahend)?;
-            select_word(machine, signed_operand[BITS - 1].clone(), &difference, &value)
+            select_word(
+                machine,
+                signed_operand[BITS - 1].clone(),
+                &difference,
+                &value,
+            )
         }
     }
 }
