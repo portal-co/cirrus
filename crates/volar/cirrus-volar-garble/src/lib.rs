@@ -29,6 +29,7 @@ use volar_spec::{
     vole::VoleArray,
 };
 
+pub mod bitgc;
 pub mod cut_and_choose;
 
 /// The garbler-side context: streams one [`GarbleTable`] per AND gate to
