@@ -14,6 +14,7 @@ spartan-whir-adapter = ["dep:spartan-whir", "dep:p3-field"]
 [dependencies]
 cirrus-core = { version = "0.1.0", path = "../../cirrus-core" }
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
+miniot = { version = "0.1.0", path = "../../../crates/miniot" }
 volar-spec.workspace = true
 hybrid-array.workspace = true
 cipher.workspace = true

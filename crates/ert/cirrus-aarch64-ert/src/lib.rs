@@ -1,0 +1,3220 @@
+#![no_std]
+#![warn(missing_docs)]
+
+//! A deliberately narrow, fail-closed AArch64 ERT decoder.
+//!
+//! [`disarm64`] is used only as a classification guard. Every instruction
+//! accepted here must also satisfy an ERT-owned raw mask and field extractor;
+//! a successful broad decoder result never expands the supported ISA by
+//! itself. The Phase 3 foundation contains audited control flow, move-wide
+//! constants, and immediate arithmetic/NZCV semantics; unlisted arithmetic
+//! and all memory forms remain fail-closed.
+//!
+//! Instruction field definitions follow Arm A-profile Architecture Reference
+//! Manual DDI0487 A64 encoding tables: B/BL (`C4.1.4`), B.cond (`C4.1.5`),
+//! CBZ/CBNZ (`C4.1.6`), TBZ/TBNZ (`C4.1.7`), BR/BLR/RET (`C4.1.8`), and SVC
+//! (`C4.1.9`). The raw masks below are the support authority; `disarm64`
+//! protects this hand-extracted subset against accepting an undecodable word.
+
+use cirrus_core::{ContextWithStorage, ContextWithValue, StorageAddressBit};
+use cirrus_ert_core::{
+    BitOp, ContextWithErtOps, Shift, add_bits, add_bits_with_carry_out, add_overflow,
+    arm_condition, arm_condition_value, bitwise_word, constant_word, fixed_shift, invert_word,
+    select_word, subtract_overflow, zero_word,
+};
+use disarm64::decoder;
+
+pub use cirrus_ert_core::RawMemory;
+
+/// A symbolic A64 state with 31 GPRs and separate SP.
+///
+/// Encoding register 31 is resolved by each semantic form: it is XZR in the
+/// supported control forms and never aliases `sp` here. The concrete metadata
+/// is intentionally retained beside every symbolic word for fail-closed
+/// branch/address decisions.
+#[derive(Clone)]
+pub struct State<W> {
+    /// `x0` through `x30`; x31 is not representable here.
+    pub regs: [[W; 64]; 31],
+    /// Known concrete values for `x0` through `x30`.
+    pub constants: [Option<u64>; 31],
+    /// Architectural stack pointer wires, distinct from x31/XZR.
+    pub sp_word: [W; 64],
+    /// Known architectural stack pointer value.
+    pub sp: Option<u64>,
+    /// NZCV flag wires in N, Z, C, V order.
+    pub nzcv: [W; 4],
+    /// Concrete NZCV facts in N, Z, C, V order, when known.
+    pub nzcv_constants: [Option<bool>; 4],
+    /// Symbolic done wire accumulated by [`step`].
+    pub done: W,
+}
+
+/// A symbolic A64 control-flow result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Flow<W> {
+    /// Continue at this next virtual instruction pointer.
+    Next([W; 64]),
+    /// The bare-metal ERT `SVC #0` exit completed.
+    Exit,
+}
+
+/// Seed AAPCS64 arguments into a state and caller-owned symbolic storage.
+///
+/// Up to eight eight-byte arguments land in `x0` through `x7`. Any extra
+/// values occupy consecutive caller-reserved eight-byte storage slots starting
+/// at `stack_pointer`; the caller must reserve that window below the top of
+/// storage, as with the RISC-V facade's ABI stack convention.
+pub fn write_aapcs64_arguments<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    zero: &W,
+    one: &W,
+    arguments: &[([W; 64], Option<u64>)],
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    for (index, (word, constant)) in arguments.iter().enumerate() {
+        if index < 8 {
+            state.regs[index] = word.clone();
+            state.constants[index] = *constant;
+            continue;
+        }
+        let Some(stack_pointer) = state.sp else {
+            return Err(DecodeError::Unsupported(0));
+        };
+        let byte_address = stack_pointer.wrapping_add(
+            u64::try_from(index - 8)
+                .ok()
+                .and_then(|n| n.checked_mul(8))
+                .ok_or(DecodeError::Malformed(0))?,
+        );
+        for (bit, value) in word.iter().enumerate() {
+            let bit_index = byte_address
+                .checked_mul(8)
+                .and_then(|index| index.checked_add(bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let slot = storage_address(bit_index, zero, one);
+            context
+                .storage_write(storage, &slot, value.clone())
+                .map_err(|_| DecodeError::Unsupported(0))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read AAPCS64 results from a state and caller-owned symbolic storage.
+///
+/// Up to eight eight-byte results come from `x0` through `x7`; any extra
+/// results are read from the same eight-byte stack window used for extra
+/// arguments.
+pub fn read_aapcs64_results<C, W, const M: usize>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &State<W>,
+    zero: &W,
+    one: &W,
+) -> Result<[([W; 64], Option<u64>); M], DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut results: [([W; 64], Option<u64>); M] =
+        core::array::from_fn(|_| (core::array::from_fn(|_| zero.clone()), None));
+    for (index, result) in results.iter_mut().enumerate() {
+        if index < 8 {
+            *result = (state.regs[index].clone(), state.constants[index]);
+            continue;
+        }
+        let stack_pointer = state.sp.ok_or(DecodeError::Unsupported(0))?;
+        let byte_address = stack_pointer.wrapping_add(
+            u64::try_from(index - 8)
+                .ok()
+                .and_then(|n| n.checked_mul(8))
+                .ok_or(DecodeError::Malformed(0))?,
+        );
+        for (bit, slot) in result.0.iter_mut().enumerate() {
+            let bit_index = byte_address
+                .checked_mul(8)
+                .and_then(|index| index.checked_add(bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let address = storage_address(bit_index, zero, one);
+            *slot = context
+                .storage_read(storage, &address)
+                .map_err(|_| DecodeError::Unsupported(0))?;
+        }
+    }
+    Ok(results)
+}
+
+fn storage_address<W: Clone>(address: u64, zero: &W, one: &W) -> [StorageAddressBit<W>; 64] {
+    core::array::from_fn(|bit| {
+        let known = (address >> bit) & 1 != 0;
+        StorageAddressBit {
+            wire: if known { one.clone() } else { zero.clone() },
+            known: Some(known),
+        }
+    })
+}
+
+/// Construct an AAPCS64 argument-carrying state.
+///
+/// Up to eight eight-byte arguments land in `x0` through `x7`; every extra
+/// argument is written into caller-reserved eight-byte stack slots starting
+/// at `stack_pointer`. The stack pointer is required to be 16-byte aligned.
+pub fn initial_state_with_arguments<W: Clone>(
+    zero: W,
+    one: &W,
+    stack_pointer: u64,
+    arguments: &[Option<u64>],
+) -> Result<State<W>, DecodeError> {
+    if stack_pointer & 15 != 0 {
+        return Err(DecodeError::Malformed(0));
+    }
+    let mut state = initial_state(zero.clone());
+    state.sp_word = constant_word(&zero, one, stack_pointer);
+    state.sp = Some(stack_pointer);
+    for (index, value) in arguments.iter().take(8).enumerate() {
+        if let Some(value) = value {
+            state.constants[index] = Some(*value);
+        }
+    }
+    Ok(state)
+}
+
+/// Construct the initial state with all GPRs and done set to `zero`.
+pub fn initial_state<W: Clone>(zero: W) -> State<W> {
+    State {
+        regs: core::array::from_fn(|_| core::array::from_fn(|_| zero.clone())),
+        constants: [None; 31],
+        sp_word: core::array::from_fn(|_| zero.clone()),
+        sp: None,
+        nzcv: core::array::from_fn(|_| zero.clone()),
+        nzcv_constants: [Some(false); 4],
+        done: zero,
+    }
+}
+
+/// Execute the audited Phase 3 subset over a symbolic state.
+///
+/// Direct control uses constant targets; conditional forms emit a 64-bit
+/// virtual-IP select. `CBZ`/`CBNZ` only reads `x0..x30`; `x31` remains XZR.
+/// Unlisted data-processing and every memory form fail closed.
+pub fn step<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    let instruction = decode(pc, raw)?;
+    let next = pc.wrapping_add(4);
+    let constant = |value| constant_word(zero, one, value);
+    match instruction {
+        Instruction::Address { dest, target } => {
+            state.regs[dest as usize] = constant(target);
+            state.constants[dest as usize] = Some(target);
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::MoveStackPointer { source } => {
+            state.sp_word = state.regs[source as usize].clone();
+            state.sp = state.constants[source as usize];
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::NoOperation => Ok(Flow::Next(constant(next))),
+        Instruction::Branch { target } => Ok(Flow::Next(constant(target))),
+        Instruction::BranchLink { target } => {
+            state.regs[30] = constant(next);
+            state.constants[30] = Some(next);
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::ConditionalBranch { condition, target } => {
+            let condition = arm_condition(
+                context,
+                state.nzcv[0].clone(),
+                state.nzcv[1].clone(),
+                state.nzcv[2].clone(),
+                state.nzcv[3].clone(),
+                condition,
+                one,
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?
+            .ok_or(DecodeError::Malformed(raw))?;
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
+        }
+        Instruction::CompareBranch {
+            register,
+            nonzero,
+            target,
+            ..
+        } => {
+            if register == 31 {
+                // x31 is XZR for CBZ/CBNZ, never SP: CBZ is therefore
+                // always taken and CBNZ always falls through.
+                return Ok(Flow::Next(constant(if nonzero { next } else { target })));
+            }
+            let word = &state.regs[register as usize];
+            let is_zero = cirrus_ert_core::zero_word(context, word, one)
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+            let condition = if nonzero {
+                context
+                    .bitxor(is_zero, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            } else {
+                is_zero
+            };
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
+        }
+        Instruction::MoveWide {
+            dest,
+            immediate,
+            shift,
+            keep,
+            inverted,
+            width64,
+        } => {
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let field_mask = 0xffffu64 << shift;
+            let shifted = immediate << shift;
+            let inserted = if inverted {
+                !shifted & mask
+            } else {
+                shifted & mask
+            };
+            let result = if keep {
+                let previous = &state.regs[dest as usize];
+                let mut output = core::array::from_fn(|_| zero.clone());
+                for bit in 0..64 {
+                    let retained = if (field_mask >> bit) & 1 == 0 {
+                        previous[bit].clone()
+                    } else {
+                        zero.clone()
+                    };
+                    output[bit] = if (inserted >> bit) & 1 != 0 {
+                        one.clone()
+                    } else {
+                        retained
+                    };
+                }
+                output
+            } else {
+                constant(inserted & mask)
+            };
+            state.regs[dest as usize] = result;
+            state.constants[dest as usize] = if keep {
+                state.constants[dest as usize]
+                    .map(|previous| ((previous & !field_mask) | inserted) & mask)
+            } else {
+                Some(inserted & mask)
+            };
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::AddImmediate {
+            dest,
+            source,
+            immediate,
+            subtract,
+            set_flags,
+            width64,
+        } => {
+            let source_word = state.regs[source as usize].clone();
+            let immediate_word = constant(immediate);
+            let (result, carry_out) = arithmetic(
+                context,
+                &source_word,
+                &immediate_word,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
+            let source_constant = state.constants[source as usize];
+            let result_constant = source_constant.map(|source| {
+                let result = if subtract {
+                    source.wrapping_sub(immediate)
+                } else {
+                    source.wrapping_add(immediate)
+                };
+                if width64 {
+                    result
+                } else {
+                    result & u64::from(u32::MAX)
+                }
+            });
+            if set_flags {
+                update_nzcv(
+                    context,
+                    state,
+                    &source_word,
+                    &immediate_word,
+                    &result,
+                    carry_out,
+                    subtract,
+                    width64,
+                    source_constant,
+                    result_constant,
+                    one,
+                )?;
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::MultiplyHigh {
+            dest,
+            left,
+            right,
+            signed,
+            width64,
+        } => {
+            let result = multiply_high(
+                context,
+                &register_word(state, left, zero),
+                &register_word(state, right, zero),
+                signed,
+                width64,
+                zero,
+                one,
+            )?;
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = register_constant(state, left)
+                    .zip(register_constant(state, right))
+                    .map(|(left, right)| multiply_high_constant(left, right, signed, width64));
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::MultiplyAdd {
+            dest,
+            left,
+            right,
+            addend,
+            subtract,
+            width64,
+        } => {
+            let product = multiply_low(
+                context,
+                &register_word(state, left, zero),
+                &register_word(state, right, zero),
+                width64,
+                zero,
+            )?;
+            let addend_word = register_word(state, addend, zero);
+            let (result, _) = arithmetic(
+                context,
+                &addend_word,
+                &product,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let result_constant = register_constant(state, left)
+                .zip(register_constant(state, right))
+                .zip(register_constant(state, addend))
+                .map(|((left, right), addend)| {
+                    let product = left.wrapping_mul(right) & mask;
+                    (if subtract {
+                        addend.wrapping_sub(product)
+                    } else {
+                        addend.wrapping_add(product)
+                    }) & mask
+                });
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::ConditionalSelect {
+            dest,
+            when_true,
+            when_false,
+            condition,
+            width64,
+        } => {
+            let condition_wire = arm_condition(
+                context,
+                state.nzcv[0].clone(),
+                state.nzcv[1].clone(),
+                state.nzcv[2].clone(),
+                state.nzcv[3].clone(),
+                condition,
+                one,
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?
+            .ok_or(DecodeError::Malformed(raw))?;
+            let selected = select_word(
+                context,
+                condition_wire,
+                &register_word(state, when_true, zero),
+                &register_word(state, when_false, zero),
+            )
+            .map_err(|_| DecodeError::Unsupported(raw))?;
+            let selected = if width64 {
+                selected
+            } else {
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        selected[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            if dest != 31 {
+                state.regs[dest as usize] = selected;
+                state.constants[dest as usize] = arm_condition_value(
+                    state.nzcv_constants[0],
+                    state.nzcv_constants[1],
+                    state.nzcv_constants[2],
+                    state.nzcv_constants[3],
+                    condition,
+                )
+                .ok_or(DecodeError::Malformed(raw))?
+                .and_then(|condition| {
+                    register_constant(state, if condition { when_true } else { when_false })
+                })
+                .map(|value| {
+                    if width64 {
+                        value
+                    } else {
+                        value & u64::from(u32::MAX)
+                    }
+                });
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::LogicalRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            operation,
+            set_flags,
+            width64,
+        } => {
+            let left_word = register_word(state, left, zero);
+            let right_word = shift_register(state, right, amount, shift, width64, zero);
+            let result = bitwise_word(context, &left_word, &right_word, operation)
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+            let result = if width64 {
+                result
+            } else {
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        result[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            let left_constant = register_constant(state, left);
+            let right_constant = register_constant(state, right)
+                .map(|value| shift_constant(value, amount, shift, width64));
+            let mask = if width64 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let result_constant = left_constant.zip(right_constant).map(|(left, right)| match operation {
+                BitOp::And => left & right,
+                BitOp::Or => left | right,
+                BitOp::Xor => left ^ right,
+            } & mask);
+            if set_flags {
+                let z = if width64 {
+                    zero_word(context, &result, one)
+                } else {
+                    let result32: [W; 32] = core::array::from_fn(|bit| result[bit].clone());
+                    zero_word(context, &result32, one)
+                }
+                .map_err(|_| DecodeError::Unsupported(raw))?;
+                state.nzcv = [
+                    result[if width64 { 63 } else { 31 }].clone(),
+                    z,
+                    zero.clone(),
+                    zero.clone(),
+                ];
+                state.nzcv_constants = result_constant.map_or([None; 4], |result| {
+                    [
+                        Some((result >> if width64 { 63 } else { 31 }) & 1 != 0),
+                        Some(result == 0),
+                        Some(false),
+                        Some(false),
+                    ]
+                });
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::AddRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            subtract,
+            set_flags,
+            width64,
+        } => {
+            let left_word = state.regs[left as usize].clone();
+            let right_word = if width64 {
+                fixed_shift(&state.regs[right as usize], amount, shift, zero)
+            } else {
+                let right32: [W; 32] =
+                    core::array::from_fn(|bit| state.regs[right as usize][bit].clone());
+                let shifted = fixed_shift(&right32, amount, shift, zero);
+                core::array::from_fn(|bit| {
+                    if bit < 32 {
+                        shifted[bit].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+            };
+            let (result, carry_out) = arithmetic(
+                context,
+                &left_word,
+                &right_word,
+                subtract,
+                width64,
+                zero,
+                one,
+            )?;
+            let left_constant = state.constants[left as usize];
+            let right_constant = state.constants[right as usize]
+                .map(|value| shift_constant(value, amount, shift, width64));
+            let result_constant = left_constant.zip(right_constant).map(|(left, right)| {
+                let result = if subtract {
+                    left.wrapping_sub(right)
+                } else {
+                    left.wrapping_add(right)
+                };
+                if width64 {
+                    result
+                } else {
+                    result & u64::from(u32::MAX)
+                }
+            });
+            if set_flags {
+                update_nzcv(
+                    context,
+                    state,
+                    &left_word,
+                    &right_word,
+                    &result,
+                    carry_out,
+                    subtract,
+                    width64,
+                    left_constant,
+                    result_constant,
+                    one,
+                )?;
+            }
+            if dest != 31 {
+                state.regs[dest as usize] = result;
+                state.constants[dest as usize] = result_constant;
+            }
+            Ok(Flow::Next(constant(next)))
+        }
+        Instruction::TestBranch {
+            register,
+            bit,
+            nonzero,
+            target,
+        } => {
+            let tested = if register == 31 {
+                zero.clone()
+            } else {
+                state.regs[register as usize][bit as usize].clone()
+            };
+            let condition = if nonzero {
+                tested
+            } else {
+                context
+                    .bitxor(tested, one.clone())
+                    .map_err(|_| DecodeError::Unsupported(raw))?
+            };
+            let target_word = constant(target);
+            let fallthrough_word = constant(next);
+            Ok(Flow::Next(
+                select_word(context, condition, &target_word, &fallthrough_word)
+                    .map_err(|_| DecodeError::Unsupported(raw))?,
+            ))
+        }
+        Instruction::BranchRegister { register } => {
+            let target = state.constants[register as usize].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::BranchLinkRegister { register } => {
+            let target = state.constants[register as usize].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            state.regs[30] = constant(next);
+            state.constants[30] = Some(next);
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::Return => {
+            let target = state.constants[30].ok_or(DecodeError::Unsupported(raw))?;
+            if target & 3 != 0 {
+                return Err(DecodeError::Malformed(raw));
+            }
+            Ok(Flow::Next(constant(target)))
+        }
+        Instruction::StorePair { .. }
+        | Instruction::LoadPair { .. }
+        | Instruction::LoadLiteral { .. }
+        | Instruction::Load { .. }
+        | Instruction::LoadExtend { .. }
+        | Instruction::Store { .. }
+        | Instruction::StoreUnscaled { .. } => Err(DecodeError::Unsupported(raw)),
+        Instruction::SupervisorCall => supervisor_call(state, raw, one),
+    }
+}
+
+/// Execute an audited literal load, or delegate a non-memory form to [`step`].
+///
+/// Literal loads have a PC-derived concrete address and therefore need no
+/// symbolic storage interface. Other load/store addressing modes remain
+/// rejected until the caller-owned storage seam is introduced.
+/// Execute one instruction with the bare-metal `SVC #0` hash callback.
+///
+/// Selector `x0 = 0` passes the four 64-bit words in `x1` through `x4` to
+/// `hash`, then writes its 32-byte result back over those registers. All-ones
+/// `x0` exits. Other selectors fail closed.
+pub fn step_with_hash<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+    hash: &mut impl FnMut(&mut C, &[[W; 64]]) -> Result<[u8; 32], C::Error>,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    if !matches!(decode(pc, raw)?, Instruction::SupervisorCall) {
+        return step(context, state, pc, raw, zero, one);
+    }
+    supervisor_call_with_hash(context, state, raw, zero, one, hash)
+}
+
+/// Execute an audited memory form against both mapped bytes and caller-owned
+/// symbolic stack storage.
+///
+/// A load/store whose base is architectural SP uses symbolic storage and its
+/// wire value; a concrete non-SP base continues to use the byte mapping.
+/// Concrete values may be unknown when the address is stack-derived; storage
+/// carries the exact symbolic bits.
+pub fn step_with_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    match decode(pc, raw)? {
+        Instruction::Load {
+            dest,
+            base: 31,
+            offset,
+            width,
+            signed,
+        } => load_stack(
+            context, storage, state, dest, offset, width, signed, zero, one,
+        )?,
+        Instruction::Store {
+            source,
+            base: 31,
+            offset,
+            width,
+        } => store_stack(context, storage, state, source, offset, width, zero, one)?,
+        _ => return step(context, state, pc, raw, zero, one),
+    }
+    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &mut State<W>,
+    dest: u8,
+    offset: u64,
+    width: u8,
+    signed: bool,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let base = stack_address(state, offset)?;
+    if dest == 31 {
+        return Ok(());
+    }
+    let bits = usize::from(width) * 8;
+    for bit in 0..64 {
+        let source_bit = bit.min(bits - 1);
+        state.regs[dest as usize][bit] = if bit >= bits && !signed {
+            zero.clone()
+        } else {
+            let index = base
+                .checked_mul(8)
+                .and_then(|base| base.checked_add(source_bit as u64))
+                .ok_or(DecodeError::Malformed(0))?;
+            let address = storage_address(index, zero, one);
+            context
+                .storage_read(storage, &address)
+                .map_err(|_| DecodeError::Unsupported(0))?
+        };
+    }
+    state.constants[dest as usize] = None;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_stack<C, W>(
+    context: &mut C,
+    storage: &mut C::Storage,
+    state: &State<W>,
+    source: u8,
+    offset: u64,
+    width: u8,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithStorage<bool, Wrapped = W>
+        + ContextWithValue<bool, Wrapped = W>
+        + ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let base = stack_address(state, offset)?;
+    let bits = usize::from(width) * 8;
+    for bit in 0..bits {
+        let index = base
+            .checked_mul(8)
+            .and_then(|base| base.checked_add(bit as u64))
+            .ok_or(DecodeError::Malformed(0))?;
+        let address = storage_address(index, zero, one);
+        let value = if source == 31 {
+            zero.clone()
+        } else {
+            state.regs[source as usize][bit].clone()
+        };
+        context
+            .storage_write(storage, &address, value)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+    }
+    Ok(())
+}
+
+fn stack_address<W>(state: &State<W>, offset: u64) -> Result<u64, DecodeError> {
+    state
+        .sp
+        .and_then(|base| base.checked_add(offset))
+        .ok_or(DecodeError::Malformed(0))
+}
+
+/// Execute an audited literal load, or delegate a non-memory form to [`step`].
+///
+/// Literal loads have a PC-derived concrete address and therefore need no
+/// symbolic storage interface. Other load/store addressing modes remain
+/// rejected until the caller-owned storage seam is introduced.
+pub fn step_with_memory<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    pc: u64,
+    raw: u32,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    match decode(pc, raw)? {
+        Instruction::StorePair {
+            first,
+            second,
+            base,
+            offset,
+            width,
+            mode,
+        } => {
+            let old_base = if base == 31 {
+                state.sp
+            } else {
+                register_constant(state, base)
+            }
+            .ok_or(DecodeError::Unsupported(raw))?;
+            let new_base = old_base.wrapping_add_signed(offset);
+            let address = match mode {
+                PairMode::SignedOffset | PairMode::PreIndex => new_base,
+                PairMode::PostIndex => old_base,
+            };
+            if matches!(mode, PairMode::PreIndex) {
+                if base == 31 {
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+            store_value(state, first, address, width, memory, raw)?;
+            let second_address = address.wrapping_add(u64::from(width));
+            store_value(state, second, second_address, width, memory, raw)?;
+            if matches!(mode, PairMode::PostIndex) {
+                if base == 31 {
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+        }
+        Instruction::LoadPair {
+            first,
+            second,
+            base,
+            offset,
+            width,
+            mode,
+        } => {
+            let old_base = if base == 31 {
+                state.sp
+            } else {
+                register_constant(state, base)
+            }
+            .ok_or(DecodeError::Unsupported(raw))?;
+            let new_base = old_base.wrapping_add_signed(offset);
+            let address = match mode {
+                PairMode::SignedOffset | PairMode::PreIndex => new_base,
+                PairMode::PostIndex => old_base,
+            };
+            if matches!(mode, PairMode::PreIndex) {
+                if base == 31 {
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+            load_literal(state, first, width, false, address, memory, zero, one)?;
+            load_literal(
+                state,
+                second,
+                width,
+                false,
+                address.wrapping_add(u64::from(width)),
+                memory,
+                zero,
+                one,
+            )?;
+            if matches!(mode, PairMode::PostIndex) {
+                if base == 31 {
+                    state.sp = Some(new_base);
+                    state.sp_word = constant_word(zero, one, new_base);
+                } else {
+                    state.regs[base as usize] = constant_word(zero, one, new_base);
+                    state.constants[base as usize] = Some(new_base);
+                }
+            }
+        }
+        Instruction::LoadLiteral {
+            dest,
+            width,
+            signed,
+            target,
+        } => load_literal(state, dest, width, signed, target, memory, zero, one)?,
+        Instruction::Load {
+            dest,
+            base,
+            offset,
+            width,
+            signed,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            let target = base.wrapping_add(offset);
+            load_literal(state, dest, width, signed, target, memory, zero, one)?;
+        }
+        Instruction::LoadExtend {
+            dest,
+            base,
+            offset,
+            width,
+            signed,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            let target = base.wrapping_add_signed(offset);
+            load_literal(state, dest, width, signed, target, memory, zero, one)?;
+        }
+        Instruction::Store {
+            source,
+            base,
+            offset,
+            width,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            store_value(state, source, base.wrapping_add(offset), width, memory, raw)?;
+        }
+        Instruction::StoreUnscaled {
+            source,
+            base,
+            offset,
+            width,
+        } => {
+            let base = register_constant(state, base).ok_or(DecodeError::Unsupported(raw))?;
+            store_value(
+                state,
+                source,
+                base.wrapping_add_signed(offset),
+                width,
+                memory,
+                raw,
+            )?;
+        }
+        _ => return step(context, state, pc, raw, zero, one),
+    }
+    Ok(Flow::Next(constant_word(zero, one, pc.wrapping_add(4))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_literal<W: Clone>(
+    state: &mut State<W>,
+    dest: u8,
+    width: u8,
+    signed: bool,
+    target: u64,
+    memory: RawMemory<'_>,
+    zero: &W,
+    one: &W,
+) -> Result<(), DecodeError> {
+    let value = match (width, signed) {
+        (1, false) => memory
+            .read64::<1>(target)
+            .map(|bytes| u64::from(u8::from_le_bytes(bytes))),
+        (2, false) => memory
+            .read64::<2>(target)
+            .map(|bytes| u64::from(u16::from_le_bytes(bytes))),
+        (4, false) => memory
+            .read64::<4>(target)
+            .map(|bytes| u64::from(u32::from_le_bytes(bytes))),
+        (8, false) => memory.read64::<8>(target).map(u64::from_le_bytes),
+        (1, true) => memory
+            .read64::<1>(target)
+            .map(|bytes| i64::from(i8::from_le_bytes(bytes)) as u64),
+        (2, true) => memory
+            .read64::<2>(target)
+            .map(|bytes| i64::from(i16::from_le_bytes(bytes)) as u64),
+        (4, true) => memory
+            .read64::<4>(target)
+            .map(|bytes| i64::from(i32::from_le_bytes(bytes)) as u64),
+        _ => return Err(DecodeError::Unsupported(0)),
+    }
+    .ok_or(DecodeError::Memory(target))?;
+    if dest != 31 {
+        state.regs[dest as usize] = constant_word(zero, one, value);
+        state.constants[dest as usize] = Some(value);
+    }
+    Ok(())
+}
+
+fn store_value<W>(
+    state: &mut State<W>,
+    source: u8,
+    target: u64,
+    width: u8,
+    memory: RawMemory<'_>,
+    raw: u32,
+) -> Result<(), DecodeError> {
+    let value = register_constant(state, source).ok_or(DecodeError::Unsupported(raw))?;
+    match width {
+        1 => memory.write64(target, &[value as u8]),
+        2 => memory.write64(target, &(value as u16).to_le_bytes()),
+        4 => memory.write64(target, &(value as u32).to_le_bytes()),
+        8 => memory.write64(target, &value.to_le_bytes()),
+        _ => return Err(DecodeError::Unsupported(0)),
+    }
+    .ok_or(DecodeError::Memory(target))
+}
+
+fn supervisor_call<W: Clone>(
+    state: &mut State<W>,
+    raw: u32,
+    one: &W,
+) -> Result<Flow<W>, DecodeError> {
+    match state.constants[0] {
+        Some(u64::MAX) => {
+            state.done = one.clone();
+            Ok(Flow::Exit)
+        }
+        _ => Err(DecodeError::Unsupported(raw)),
+    }
+}
+
+fn supervisor_call_with_hash<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    raw: u32,
+    zero: &W,
+    one: &W,
+    hash: &mut impl FnMut(&mut C, &[[W; 64]]) -> Result<[u8; 32], C::Error>,
+) -> Result<Flow<W>, DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W> + ContextWithValue<bool, Wrapped = W>,
+    W: Clone,
+{
+    match state.constants[0] {
+        Some(u64::MAX) => supervisor_call(state, raw, one),
+        Some(0) => {
+            let digest =
+                hash(context, &state.regs[1..5]).map_err(|_| DecodeError::Unsupported(raw))?;
+            for (register, chunk) in digest.chunks_exact(8).enumerate() {
+                let value = u64::from_le_bytes(chunk.try_into().expect("eight-byte digest chunk"));
+                state.regs[register + 1] = constant_word(zero, one, value);
+                state.constants[register + 1] = Some(value);
+            }
+            Ok(Flow::Next(constant_word(zero, one, 0)))
+        }
+        _ => Err(DecodeError::Unsupported(raw)),
+    }
+}
+
+fn arithmetic<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    subtract: bool,
+    width64: bool,
+    zero: &W,
+    one: &W,
+) -> Result<([W; 64], W), DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        let right = if subtract {
+            invert_word(context, right, one.clone()).map_err(|_| DecodeError::Unsupported(0))?
+        } else {
+            right.clone()
+        };
+        add_bits_with_carry_out(
+            context,
+            left,
+            &right,
+            if subtract { one.clone() } else { zero.clone() },
+        )
+        .map_err(|_| DecodeError::Unsupported(0))
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let right32 = if subtract {
+            invert_word(context, &right32, one.clone()).map_err(|_| DecodeError::Unsupported(0))?
+        } else {
+            right32
+        };
+        let (low, carry) = add_bits_with_carry_out(
+            context,
+            &left32,
+            &right32,
+            if subtract { one.clone() } else { zero.clone() },
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        Ok((
+            core::array::from_fn(|bit| {
+                if bit < 32 {
+                    low[bit].clone()
+                } else {
+                    zero.clone()
+                }
+            }),
+            carry,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_nzcv<C, W>(
+    context: &mut C,
+    state: &mut State<W>,
+    left: &[W; 64],
+    right: &[W; 64],
+    result: &[W; 64],
+    carry: W,
+    subtract: bool,
+    width64: bool,
+    left_constant: Option<u64>,
+    result_constant: Option<u64>,
+    one: &W,
+) -> Result<(), DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let bits = if width64 { 64 } else { 32 };
+    let n = result[bits - 1].clone();
+    let z = if width64 {
+        zero_word(context, result, one)
+    } else {
+        let result32: [W; 32] = core::array::from_fn(|bit| result[bit].clone());
+        zero_word(context, &result32, one)
+    }
+    .map_err(|_| DecodeError::Unsupported(0))?;
+    let v = if subtract {
+        subtract_overflow(
+            context,
+            left[bits - 1].clone(),
+            right[bits - 1].clone(),
+            result[bits - 1].clone(),
+        )
+    } else {
+        add_overflow(
+            context,
+            left[bits - 1].clone(),
+            right[bits - 1].clone(),
+            result[bits - 1].clone(),
+        )
+    }
+    .map_err(|_| DecodeError::Unsupported(0))?;
+    state.nzcv = [n, z, carry, v];
+    let mask = if width64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    state.nzcv_constants =
+        left_constant
+            .zip(result_constant)
+            .map_or([None; 4], |(left, result)| {
+                let right = if subtract {
+                    left.wrapping_sub(result)
+                } else {
+                    result.wrapping_sub(left)
+                } & mask;
+                let sign = 1u64 << (bits - 1);
+                let carry = if subtract {
+                    left & mask >= right
+                } else {
+                    (left & mask) > mask - right
+                };
+                let overflow = if subtract {
+                    ((left ^ right) & (left ^ result) & sign) != 0
+                } else {
+                    ((left ^ result) & (right ^ result) & sign) != 0
+                };
+                [
+                    Some(result & sign != 0),
+                    Some(result & mask == 0),
+                    Some(carry),
+                    Some(overflow),
+                ]
+            });
+    Ok(())
+}
+
+fn multiply_low<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    width64: bool,
+    zero: &W,
+) -> Result<[W; 64], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        multiply_low_word(context, left, right, zero)
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let low = multiply_low_word(context, &left32, &right32, zero)?;
+        Ok(core::array::from_fn(|bit| {
+            if bit < 32 {
+                low[bit].clone()
+            } else {
+                zero.clone()
+            }
+        }))
+    }
+}
+
+fn multiply_low_word<C, W, const N: usize>(
+    context: &mut C,
+    left: &[W; N],
+    right: &[W; N],
+    zero: &W,
+) -> Result<[W; N], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut accumulator: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut addend = left.clone();
+    for bit in 0..N {
+        let candidate = add_bits(context, &accumulator, &addend, zero.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        accumulator = select_word(context, right[bit].clone(), &candidate, &accumulator)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        addend = fixed_shift(&addend, 1, Shift::Left, zero);
+    }
+    Ok(accumulator)
+}
+
+fn multiply_high<C, W>(
+    context: &mut C,
+    left: &[W; 64],
+    right: &[W; 64],
+    signed: bool,
+    width64: bool,
+    zero: &W,
+    one: &W,
+) -> Result<[W; 64], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    if width64 {
+        multiply_high_word(context, left, right, signed, zero, one)
+    } else {
+        let left32: [W; 32] = core::array::from_fn(|bit| left[bit].clone());
+        let right32: [W; 32] = core::array::from_fn(|bit| right[bit].clone());
+        let high = multiply_high_word(context, &left32, &right32, signed, zero, one)?;
+        Ok(core::array::from_fn(|bit| {
+            if bit < 32 {
+                high[bit].clone()
+            } else {
+                zero.clone()
+            }
+        }))
+    }
+}
+
+fn multiply_high_word<C, W, const N: usize>(
+    context: &mut C,
+    left: &[W; N],
+    right: &[W; N],
+    signed: bool,
+    zero: &W,
+    one: &W,
+) -> Result<[W; N], DecodeError>
+where
+    C: ContextWithErtOps<bool, Wrapped = W>,
+    W: Clone,
+{
+    let mut low: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut high: [W; N] = core::array::from_fn(|_| zero.clone());
+    let mut addend_low = left.clone();
+    let mut addend_high: [W; N] = core::array::from_fn(|_| zero.clone());
+    for bit in 0..N {
+        let (sum_low, carry) = add_bits_with_carry_out(context, &low, &addend_low, zero.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let sum_high = add_bits(context, &high, &addend_high, carry)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        low = select_word(context, right[bit].clone(), &sum_low, &low)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = select_word(context, right[bit].clone(), &sum_high, &high)
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let top = addend_low[N - 1].clone();
+        addend_low = fixed_shift(&addend_low, 1, Shift::Left, zero);
+        addend_high = fixed_shift(&addend_high, 1, Shift::Left, zero);
+        addend_high[0] = top;
+    }
+    if signed {
+        let correction = select_word(
+            context,
+            left[N - 1].clone(),
+            right,
+            &core::array::from_fn::<_, N, _>(|_| zero.clone()),
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        let inverted = invert_word(context, &correction, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = add_bits(context, &high, &inverted, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        let correction = select_word(
+            context,
+            right[N - 1].clone(),
+            left,
+            &core::array::from_fn::<_, N, _>(|_| zero.clone()),
+        )
+        .map_err(|_| DecodeError::Unsupported(0))?;
+        let inverted = invert_word(context, &correction, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+        high = add_bits(context, &high, &inverted, one.clone())
+            .map_err(|_| DecodeError::Unsupported(0))?;
+    }
+    Ok(high)
+}
+
+fn multiply_high_constant(left: u64, right: u64, signed: bool, width64: bool) -> u64 {
+    if width64 {
+        let product = if signed {
+            ((left as i64 as i128) * (right as i64 as i128)) as u128
+        } else {
+            (left as u128) * (right as u128)
+        };
+        (product >> 64) as u64
+    } else {
+        let left = left as u32;
+        let right = right as u32;
+        let product = if signed {
+            ((left as i32 as i64) * (right as i32 as i64)) as u64
+        } else {
+            u64::from(left) * u64::from(right)
+        };
+        product >> 32
+    }
+}
+
+fn register_word<W: Clone>(state: &State<W>, register: u8, zero: &W) -> [W; 64] {
+    if register == 31 {
+        core::array::from_fn(|_| zero.clone())
+    } else {
+        state.regs[register as usize].clone()
+    }
+}
+
+fn register_constant<W>(state: &State<W>, register: u8) -> Option<u64> {
+    if register == 31 {
+        Some(0)
+    } else {
+        state.constants[register as usize]
+    }
+}
+
+fn shift_register<W: Clone>(
+    state: &State<W>,
+    register: u8,
+    amount: u32,
+    shift: Shift,
+    width64: bool,
+    zero: &W,
+) -> [W; 64] {
+    let source = register_word(state, register, zero);
+    if width64 {
+        fixed_shift(&source, amount, shift, zero)
+    } else {
+        let source32: [W; 32] = core::array::from_fn(|bit| source[bit].clone());
+        let shifted = fixed_shift(&source32, amount, shift, zero);
+        core::array::from_fn(|bit| {
+            if bit < 32 {
+                shifted[bit].clone()
+            } else {
+                zero.clone()
+            }
+        })
+    }
+}
+
+fn shift_constant(value: u64, amount: u32, shift: Shift, width64: bool) -> u64 {
+    let mask = if width64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let value = value & mask;
+    match shift {
+        Shift::Left => value.wrapping_shl(amount) & mask,
+        Shift::LogicalRight => value >> amount,
+        Shift::ArithmeticRight => {
+            let signed = if width64 {
+                value as i64
+            } else {
+                i64::from(value as u32 as i32)
+            };
+            (signed >> amount) as u64 & mask
+        }
+        Shift::RotateRight => unreachable!("A64 add/sub shifted register excludes ROR"),
+    }
+}
+
+/// A supported, audited A64 instruction form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Instruction {
+    /// Unsigned-immediate integer store over a concrete register base.
+    Store {
+        /// Source register; 31 stores zero.
+        source: u8,
+        /// Base register; 31 is rejected until the SP seam exists.
+        base: u8,
+        /// Unsigned immediate byte offset after the size scale.
+        offset: u64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+    },
+    /// Signed 9-bit unscaled integer store over a concrete register base.
+    StoreUnscaled {
+        /// Source register; 31 stores zero.
+        source: u8,
+        /// Base register; 31 is rejected until the SP seam exists.
+        base: u8,
+        /// Sign-extended byte offset.
+        offset: i64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+    },
+    /// Unsigned-immediate integer load over a concrete register base.
+    Load {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Base register; 31 denotes the architectural SP.
+        base: u8,
+        /// Unsigned immediate offset after the size scale.
+        offset: u64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+        /// Whether the loaded value is sign-extended.
+        signed: bool,
+    },
+    /// Signed 9-bit unscaled integer load over a concrete register base.
+    LoadExtend {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Base register; 31 is rejected until the SP seam exists.
+        base: u8,
+        /// Sign-extended byte offset.
+        offset: i64,
+        /// Access width in bytes (one, two, four, or eight).
+        width: u8,
+        /// Whether the loaded value is sign-extended.
+        signed: bool,
+    },
+    /// `LDR`/`LDRSW` literal with a PC-relative concrete address.
+    LoadLiteral {
+        /// Destination `Wt`/`Xt`; 31 discards the loaded result.
+        dest: u8,
+        /// Access width in bytes (four or eight).
+        width: u8,
+        /// Whether a four-byte value is sign-extended to 64 bits.
+        signed: bool,
+        /// Computed literal address.
+        target: u64,
+    },
+    /// Pre/post-indexed register pair load over SP or a concrete register base.
+    LoadPair {
+        /// First destination register; 31 discards the result.
+        first: u8,
+        /// Second destination register; 31 discards the result.
+        second: u8,
+        /// Base register; 31 denotes architectural SP.
+        base: u8,
+        /// Signed immediate byte offset, already size-scaled.
+        offset: i64,
+        /// Element width in bytes (four or eight).
+        width: u8,
+        /// Signed pair index mode.
+        mode: PairMode,
+    },
+    /// Pre/post-indexed register pair store over SP or a concrete register base.
+    StorePair {
+        /// First source register; 31 stores zero.
+        first: u8,
+        /// Second source register; 31 stores zero.
+        second: u8,
+        /// Base register; 31 denotes architectural SP.
+        base: u8,
+        /// Signed immediate byte offset, already size-scaled.
+        offset: i64,
+        /// Element width in bytes (four or eight).
+        width: u8,
+        /// Signed pair index mode.
+        mode: PairMode,
+    },
+    /// `ADR` or `ADRP`; target is the materialized PC-relative address.
+    Address {
+        /// Destination `Xd`, restricted to 0 through 30.
+        dest: u8,
+        /// Computed PC-relative address.
+        target: u64,
+    },
+    /// `MOV SP, Xn` architectural SP assignment.
+    MoveStackPointer {
+        /// Source register, restricted to 0 through 30.
+        source: u8,
+    },
+    /// `NOP` (`HINT #0`) only; other HINT/system encodings remain rejected.
+    NoOperation,
+    /// `B imm26`; target is `pc + sign_extend(imm26 << 2)`.
+    Branch {
+        /// Destination fetch address.
+        target: u64,
+    },
+    /// `BL imm26`; target is `pc + sign_extend(imm26 << 2)`.
+    BranchLink {
+        /// Destination fetch address.
+        target: u64,
+    },
+    /// `B.cond imm19`; true branches to `target`, false falls through four bytes.
+    ConditionalBranch {
+        /// Arm NZCV condition code.
+        condition: u8,
+        /// Destination fetch address when true.
+        target: u64,
+    },
+    /// `CBZ`/`CBNZ` over a 32- or 64-bit register.
+    CompareBranch {
+        /// Tested register, with 31 meaning the architectural zero register.
+        register: u8,
+        /// Whether this is CBNZ rather than CBZ.
+        nonzero: bool,
+        /// Whether the register is 64-bit (`Xn`) rather than 32-bit (`Wn`).
+        width64: bool,
+        /// Destination fetch address when the condition holds.
+        target: u64,
+    },
+    /// `MOVZ`, `MOVK`, or `MOVN` immediate.
+    MoveWide {
+        /// Destination `Wd`/`Xd`, restricted to 0 through 30.
+        dest: u8,
+        /// 16-bit immediate payload.
+        immediate: u64,
+        /// Bit position of the immediate payload (a multiple of 16).
+        shift: u32,
+        /// Whether this is MOVK (keep other bits) rather than MOVZ/MOVN.
+        keep: bool,
+        /// Whether this is MOVN, bitwise-inverting the immediate field.
+        inverted: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `ADD`/`SUB` immediate. Register-31 sources are rejected in this first
+    /// cut because this encoding treats them as SP rather than XZR.
+    AddImmediate {
+        /// Destination `Wd`/`Xd`; 31 is accepted for flag-setting aliases.
+        dest: u8,
+        /// Source `Wn`/`Xn`, restricted to 0 through 30.
+        source: u8,
+        /// Zero-extended immediate after its optional 12-bit shift.
+        immediate: u64,
+        /// Whether this is subtraction rather than addition.
+        subtract: bool,
+        /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
+        set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `SMULH`/`UMULH` high-half multiply.
+    MultiplyHigh {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// First multiplier, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Second multiplier, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Whether both operands are signed.
+        signed: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `MADD` or `MSUB`, with `MUL` represented by an XZR/WZR addend.
+    MultiplyAdd {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// First multiplier, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Second multiplier, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Addend/minuend, with 31 denoting XZR/WZR.
+        addend: u8,
+        /// Whether this is MSUB rather than MADD.
+        subtract: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `CSEL`, selecting between two registers using NZCV.
+    ConditionalSelect {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// Register selected when the condition holds, with 31 denoting XZR/WZR.
+        when_true: u8,
+        /// Register selected when the condition does not hold, with 31 denoting XZR/WZR.
+        when_false: u8,
+        /// Arm NZCV condition code.
+        condition: u8,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// Logical shifted-register operation, including the flag-setting TST alias.
+    LogicalRegister {
+        /// Destination `Wd`/`Xd`; 31 discards the result.
+        dest: u8,
+        /// Left operand, with 31 denoting XZR/WZR.
+        left: u8,
+        /// Right operand before the fixed shift, with 31 denoting XZR/WZR.
+        right: u8,
+        /// Fixed right-operand shift or rotation.
+        shift: Shift,
+        /// Fixed shift amount.
+        amount: u32,
+        /// Logical operation.
+        operation: BitOp,
+        /// Whether this is the flag-setting ANDS/TST form.
+        set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `ADD`/`SUB` shifted register, including flag-setting aliases.
+    AddRegister {
+        /// Destination `Wd`/`Xd`; 31 is accepted for flag-setting aliases.
+        dest: u8,
+        /// Left operand, restricted to 0 through 30.
+        left: u8,
+        /// Right operand before the fixed shift, restricted to 0 through 30.
+        right: u8,
+        /// Fixed right-operand shift.
+        shift: Shift,
+        /// Fixed shift amount.
+        amount: u32,
+        /// Whether this is subtraction rather than addition.
+        subtract: bool,
+        /// Whether the instruction writes NZCV (`ADDS`/`SUBS`).
+        set_flags: bool,
+        /// Whether this is the 64-bit X-register form.
+        width64: bool,
+    },
+    /// `TBZ`/`TBNZ`.
+    TestBranch {
+        /// Tested register, with 31 meaning the architectural zero register.
+        register: u8,
+        /// Bit number (0 through 63).
+        bit: u8,
+        /// Whether this is TBNZ rather than TBZ.
+        nonzero: bool,
+        /// Destination fetch address when the test holds.
+        target: u64,
+    },
+    /// `BR Xn`.
+    BranchRegister {
+        /// Source register. Register 31 is rejected by the decoder.
+        register: u8,
+    },
+    /// `BLR Xn`.
+    BranchLinkRegister {
+        /// Source register. Register 31 is rejected by the decoder.
+        register: u8,
+    },
+    /// Canonical `RET X30` only.
+    Return,
+    /// `SVC #0`, reserved for the bare-metal ERT ABI.
+    SupervisorCall,
+}
+
+/// Addressing mode for a supported register-pair form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairMode {
+    /// Store at `base + offset` without changing the base.
+    SignedOffset,
+    /// Write `base + offset` back before storing.
+    PreIndex,
+    /// Store at `base`, then write `base + offset` back.
+    PostIndex,
+}
+
+/// A word was not an audited A64 form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    /// `disarm64` rejected the instruction word.
+    Invalid(u32),
+    /// The decoder recognized it, but ERT has no audited semantic support.
+    Unsupported(u32),
+    /// A near-match used a reserved register, immediate, or exception form.
+    Malformed(u32),
+    /// An audited concrete memory access was unmapped.
+    Memory(u64),
+}
+
+/// Decode one A64 instruction at `pc`.
+///
+/// The PC must be four-byte aligned. Every accepted form is independently
+/// masked and decoded after `disarm64` accepts it, so changing the dependency
+/// cannot silently change ERT support.
+pub fn decode(pc: u64, raw: u32) -> Result<Instruction, DecodeError> {
+    if pc & 3 != 0 {
+        return Err(DecodeError::Malformed(raw));
+    }
+    decoder::decode(raw).ok_or(DecodeError::Invalid(raw))?;
+
+    if raw & 0xffff_ffe0 == 0x9100_0000 {
+        let dest = raw & 31;
+        let source = ((raw >> 5) & 31) as u8;
+        if dest != 31 || source == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::MoveStackPointer { source });
+    }
+    if raw == 0xd503_201f {
+        return Ok(Instruction::NoOperation);
+    }
+    if raw & 0x7e00_0000 == 0x2800_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let load = raw & (1 << 22) != 0;
+        let mode = match (raw >> 23) & 3 {
+            1 => PairMode::PostIndex,
+            2 => PairMode::SignedOffset,
+            3 => PairMode::PreIndex,
+            _ => return Err(DecodeError::Malformed(raw)),
+        };
+        let width = match size {
+            0 => 4,
+            2 => 8,
+            _ => return Err(DecodeError::Unsupported(raw)),
+        };
+        if v {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let base = ((raw >> 5) & 31) as u8;
+        let fields = (
+            (raw & 31) as u8,
+            ((raw >> 10) & 31) as u8,
+            base,
+            sign_extend(((raw >> 15) & 0x7f) << if size == 2 { 3 } else { 2 }, 10),
+            width,
+            mode,
+        );
+        return Ok(if load {
+            let (first, second, base, offset, width, mode) = fields;
+            Instruction::LoadPair {
+                first,
+                second,
+                base,
+                offset,
+                width,
+                mode,
+            }
+        } else {
+            let (first, second, base, offset, width, mode) = fields;
+            Instruction::StorePair {
+                first,
+                second,
+                base,
+                offset,
+                width,
+                mode,
+            }
+        });
+    }
+    if raw & 0x3b20_0000 == 0x3900_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let opc = (raw >> 22) & 3;
+        let base = ((raw >> 5) & 31) as u8;
+        let imm12 = u64::from((raw >> 10) & 0xfff);
+        let width = 1u8 << size;
+        let (signed, load) = match opc {
+            0 => (false, false),
+            1 => (false, true),
+            2 if v => return Err(DecodeError::Unsupported(raw)),
+            2 => (true, true),
+            3 if size == 3 => return Err(DecodeError::Unsupported(raw)),
+            3 => (true, true),
+            _ => unreachable!("two-bit opc"),
+        };
+        if !load {
+            if v {
+                return Err(DecodeError::Unsupported(raw));
+            }
+            return Ok(Instruction::Store {
+                source: (raw & 31) as u8,
+                base,
+                offset: imm12 << size,
+                width,
+            });
+        }
+        return Ok(Instruction::Load {
+            dest: (raw & 31) as u8,
+            base,
+            offset: imm12 << size,
+            width,
+            signed,
+        });
+    }
+    if raw & 0x3b20_0000 == 0x3800_0000 {
+        let size = (raw >> 30) & 3;
+        let v = raw & (1 << 26) != 0;
+        let opc = (raw >> 22) & 3;
+        let base = ((raw >> 5) & 31) as u8;
+        let offset = sign_extend((raw >> 12) & 0x1ff, 9);
+        let (signed, load) = match opc {
+            0 => (false, false),
+            1 => (false, true),
+            2 if v => return Err(DecodeError::Unsupported(raw)),
+            2 => (true, true),
+            3 if size == 3 => return Err(DecodeError::Unsupported(raw)),
+            3 => (true, true),
+            _ => unreachable!("two-bit opc"),
+        };
+        if !load {
+            if v {
+                return Err(DecodeError::Unsupported(raw));
+            }
+            return Ok(Instruction::StoreUnscaled {
+                source: (raw & 31) as u8,
+                base,
+                offset,
+                width: 1u8 << size,
+            });
+        }
+        return Ok(Instruction::LoadExtend {
+            dest: (raw & 31) as u8,
+            base,
+            offset,
+            width: 1u8 << size,
+            signed,
+        });
+    }
+    if raw & 0x3f00_0000 == 0x1800_0000 {
+        let (width, signed) = match (raw >> 30) & 3 {
+            0 => (4, false),
+            1 => (8, false),
+            2 => (4, true),
+            _ => return Err(DecodeError::Unsupported(raw)),
+        };
+        let target = pc.wrapping_add_signed(sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2);
+        return Ok(Instruction::LoadLiteral {
+            dest: (raw & 31) as u8,
+            width,
+            signed,
+            target,
+        });
+    }
+    if raw & 0x1f00_0000 == 0x1000_0000 {
+        let dest = (raw & 31) as u8;
+        if dest == 31 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let immediate = ((raw >> 29) & 3) | (((raw >> 5) & 0x7f_ffff) << 2);
+        let page = raw & (1 << 31) != 0;
+        let base = if page { pc & !0xfff } else { pc };
+        let target =
+            base.wrapping_add_signed(sign_extend(immediate, 21) << if page { 12 } else { 0 });
+        return Ok(Instruction::Address { dest, target });
+    }
+    if matches!(raw & 0x7f80_0000, 0x1280_0000 | 0x5280_0000 | 0x7280_0000) {
+        let dest = (raw & 31) as u8;
+        let width64 = raw & (1 << 31) != 0;
+        let shift = ((raw >> 21) & 3) * 16;
+        if dest == 31 || (!width64 && shift >= 32) {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::MoveWide {
+            dest,
+            immediate: u64::from((raw >> 5) & 0xffff),
+            shift,
+            keep: raw & 0x7f80_0000 == 0x7280_0000,
+            inverted: raw & 0x7f80_0000 == 0x1280_0000,
+            width64,
+        });
+    }
+    if raw & 0x1f00_0000 == 0x1100_0000 {
+        let dest = (raw & 31) as u8;
+        let source = ((raw >> 5) & 31) as u8;
+        let set_flags = raw & (1 << 29) != 0;
+        // Source register 31 is SP for this encoding. Destination 31 is XZR
+        // for the flag-setting CMP/CMN aliases; without flags it is the MOV
+        // SP, Xn architectural SP assignment.
+        if source == 31 || (dest == 31 && !set_flags) {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let immediate = u64::from((raw >> 10) & 0xfff) << if raw & (1 << 22) != 0 { 12 } else { 0 };
+        return Ok(Instruction::AddImmediate {
+            dest,
+            source,
+            immediate,
+            subtract: raw & (1 << 30) != 0,
+            set_flags,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_8000 == 0x1b40_0000 || raw & 0x7fe0_8000 == 0x1bc0_0000 {
+        let signed = raw & 0x7fe0_8000 == 0x1b40_0000;
+        return Ok(Instruction::MultiplyHigh {
+            dest: (raw & 31) as u8,
+            left: ((raw >> 5) & 31) as u8,
+            right: ((raw >> 16) & 31) as u8,
+            signed,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_8000 == 0x1b00_0000 || raw & 0x7fe0_8000 == 0x1b00_8000 {
+        return Ok(Instruction::MultiplyAdd {
+            dest: (raw & 31) as u8,
+            left: ((raw >> 5) & 31) as u8,
+            addend: ((raw >> 10) & 31) as u8,
+            right: ((raw >> 16) & 31) as u8,
+            subtract: raw & (1 << 15) != 0,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x7fe0_0c00 == 0x1a80_0000 {
+        let condition = ((raw >> 12) & 15) as u8;
+        if condition >= 14 {
+            return Err(DecodeError::Malformed(raw));
+        }
+        return Ok(Instruction::ConditionalSelect {
+            dest: (raw & 31) as u8,
+            when_true: ((raw >> 5) & 31) as u8,
+            when_false: ((raw >> 16) & 31) as u8,
+            condition,
+            width64: raw & (1 << 31) != 0,
+        });
+    }
+    if raw & 0x1f20_0000 == 0x0a00_0000 {
+        let dest = (raw & 31) as u8;
+        let left = ((raw >> 5) & 31) as u8;
+        let right = ((raw >> 16) & 31) as u8;
+        let width64 = raw & (1 << 31) != 0;
+        let amount = (raw >> 10) & 63;
+        let shift = match (raw >> 22) & 3 {
+            0 => Shift::Left,
+            1 => Shift::LogicalRight,
+            2 => Shift::ArithmeticRight,
+            3 => Shift::RotateRight,
+            _ => unreachable!("two-bit shift field"),
+        };
+        if !width64 && amount >= 32 {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        let (operation, set_flags) = match (raw >> 29) & 3 {
+            0 => (BitOp::And, false),
+            1 => (BitOp::Or, false),
+            2 => (BitOp::Xor, false),
+            3 => (BitOp::And, true),
+            _ => unreachable!("two-bit opcode field"),
+        };
+        return Ok(Instruction::LogicalRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            operation,
+            set_flags,
+            width64,
+        });
+    }
+    if raw & 0x1f20_0000 == 0x0b00_0000 {
+        let dest = (raw & 31) as u8;
+        let left = ((raw >> 5) & 31) as u8;
+        let right = ((raw >> 16) & 31) as u8;
+        let set_flags = raw & (1 << 29) != 0;
+        let width64 = raw & (1 << 31) != 0;
+        let amount = (raw >> 10) & 63;
+        let shift = match (raw >> 22) & 3 {
+            0 => Shift::Left,
+            1 => Shift::LogicalRight,
+            2 => Shift::ArithmeticRight,
+            _ => return Err(DecodeError::Malformed(raw)),
+        };
+        if left == 31 || right == 31 || (dest == 31 && !set_flags) || (!width64 && amount >= 32) {
+            return Err(DecodeError::Unsupported(raw));
+        }
+        return Ok(Instruction::AddRegister {
+            dest,
+            left,
+            right,
+            shift,
+            amount,
+            subtract: raw & (1 << 30) != 0,
+            set_flags,
+            width64,
+        });
+    }
+    if raw & 0x7c00_0000 == 0x1400_0000 {
+        let target = pc.wrapping_add_signed(sign_extend(raw & 0x03ff_ffff, 26) << 2);
+        return Ok(if raw & 0x8000_0000 == 0 {
+            Instruction::Branch { target }
+        } else {
+            Instruction::BranchLink { target }
+        });
+    }
+    if raw & 0xff00_0010 == 0x5400_0000 {
+        let condition = (raw & 15) as u8;
+        if condition >= 14 {
+            return Err(DecodeError::Malformed(raw));
+        }
+        let target = pc.wrapping_add_signed(sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2);
+        return Ok(Instruction::ConditionalBranch { condition, target });
+    }
+    if raw & 0x7e00_0000 == 0x3400_0000 {
+        let target = pc.wrapping_add_signed(sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2);
+        return Ok(Instruction::CompareBranch {
+            register: (raw & 31) as u8,
+            nonzero: raw & (1 << 24) != 0,
+            width64: raw & (1 << 31) != 0,
+            target,
+        });
+    }
+    if raw & 0x7e00_0000 == 0x3600_0000 {
+        let target = pc.wrapping_add_signed(sign_extend((raw >> 5) & 0x3fff, 14) << 2);
+        return Ok(Instruction::TestBranch {
+            register: (raw & 31) as u8,
+            bit: (((raw >> 31) & 1) << 5 | ((raw >> 19) & 31)) as u8,
+            nonzero: raw & (1 << 24) != 0,
+            target,
+        });
+    }
+    if raw & 0xffff_fc1f == 0xd61f_0000 {
+        return register_branch(raw, |register| Instruction::BranchRegister { register });
+    }
+    if raw & 0xffff_fc1f == 0xd63f_0000 {
+        return register_branch(raw, |register| Instruction::BranchLinkRegister { register });
+    }
+    if raw & 0xffff_fc1f == 0xd65f_0000 {
+        return if ((raw >> 5) & 31) == 30 {
+            Ok(Instruction::Return)
+        } else {
+            Err(DecodeError::Unsupported(raw))
+        };
+    }
+    if raw & 0xffe0_001f == 0xd400_0001 {
+        return if (raw >> 5) & 0xffff == 0 {
+            Ok(Instruction::SupervisorCall)
+        } else {
+            Err(DecodeError::Unsupported(raw))
+        };
+    }
+    Err(DecodeError::Unsupported(raw))
+}
+
+/// Return the signed TBZ/TBNZ target offset for the loop adapter.
+#[doc(hidden)]
+pub fn test_branch_offset(raw: u32) -> i64 {
+    sign_extend((raw >> 5) & 0x3fff, 14) << 2
+}
+
+/// Return the signed CBZ/CBNZ target offset for the loop adapter.
+#[doc(hidden)]
+pub fn compare_branch_offset(raw: u32) -> i64 {
+    sign_extend((raw >> 5) & 0x7f_ffff, 19) << 2
+}
+
+fn register_branch(
+    raw: u32,
+    make: impl FnOnce(u8) -> Instruction,
+) -> Result<Instruction, DecodeError> {
+    let register = ((raw >> 5) & 31) as u8;
+    if register == 31 {
+        Err(DecodeError::Malformed(raw))
+    } else {
+        Ok(make(register))
+    }
+}
+
+fn sign_extend(value: u32, width: u32) -> i64 {
+    (i64::from(value) << (64 - width)) >> (64 - width)
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{
+        BitOp, DecodeError, Flow, Instruction, PairMode, RawMemory, Shift, decode, initial_state,
+        initial_state_with_arguments, read_aapcs64_results, step, step_with_hash, step_with_memory,
+        step_with_stack, write_aapcs64_arguments,
+    };
+
+    use cirrus_core::{ContextWithStorage, ContextWithValue, HasError, StorageAddressBit};
+    use core::convert::Infallible;
+
+    struct PlainStorage;
+
+    impl HasError for PlainStorage {
+        type Error = Infallible;
+    }
+
+    impl ContextWithValue<bool> for PlainStorage {
+        type Wrapped = bool;
+    }
+
+    impl cirrus_core::ContextWithBitAnd<bool> for PlainStorage {
+        fn bitand(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left && right)
+        }
+
+        fn bitand_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left &= right;
+            Ok(())
+        }
+    }
+
+    impl cirrus_core::ContextWithBitOr<bool> for PlainStorage {
+        fn bitor(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left || right)
+        }
+
+        fn bitor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left |= right;
+            Ok(())
+        }
+    }
+
+    impl cirrus_core::ContextWithBitXor<bool> for PlainStorage {
+        fn bitxor(&mut self, left: bool, right: bool) -> Result<bool, Infallible> {
+            Ok(left != right)
+        }
+
+        fn bitxor_assign(&mut self, left: &mut bool, right: bool) -> Result<(), Infallible> {
+            *left ^= right;
+            Ok(())
+        }
+    }
+
+    impl ContextWithStorage<bool> for PlainStorage {
+        type Storage = [bool];
+
+        fn storage_read(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+        ) -> Result<bool, Infallible> {
+            let mut index = 0usize;
+            for (bit, lane) in address.iter().enumerate() {
+                index |= usize::from(lane.wire) << bit;
+            }
+            Ok(storage[index])
+        }
+
+        fn storage_write(
+            &mut self,
+            storage: &mut Self::Storage,
+            address: &[StorageAddressBit<bool>],
+            value: bool,
+        ) -> Result<(), Infallible> {
+            let mut index = 0usize;
+            for (bit, lane) in address.iter().enumerate() {
+                index |= usize::from(lane.wire) << bit;
+            }
+            storage[index] = value;
+            Ok(())
+        }
+    }
+
+    fn word(value: u64) -> [bool; 64] {
+        core::array::from_fn(|bit| (value >> bit) & 1 != 0)
+    }
+
+    #[test]
+    fn branch_targets_and_link_bit_are_extracted_from_audited_masks() {
+        assert_eq!(
+            decode(0x1000, 0x1400_0002),
+            Ok(Instruction::Branch { target: 0x1008 })
+        );
+        assert_eq!(
+            decode(0x1000, 0x9400_0002),
+            Ok(Instruction::BranchLink { target: 0x1008 })
+        );
+        assert_eq!(
+            decode(0x1000, 0x17ff_fffe),
+            Ok(Instruction::Branch { target: 0x0ff8 })
+        );
+    }
+
+    #[test]
+    fn conditional_and_test_branches_extract_pc_relative_targets() {
+        assert_eq!(
+            decode(0x2000, 0x5400_0040),
+            Ok(Instruction::ConditionalBranch {
+                condition: 0,
+                target: 0x2008
+            })
+        );
+        assert_eq!(
+            decode(0x2000, 0xb500_0041),
+            Ok(Instruction::CompareBranch {
+                register: 1,
+                nonzero: true,
+                width64: true,
+                target: 0x2008
+            })
+        );
+    }
+
+    #[test]
+    fn register_branches_and_svc_are_narrowly_accepted() {
+        assert_eq!(
+            decode(0, 0xd61f_0060),
+            Ok(Instruction::BranchRegister { register: 3 })
+        );
+        assert_eq!(decode(0, 0xd65f_03c0), Ok(Instruction::Return));
+        assert_eq!(decode(0, 0xd400_0001), Ok(Instruction::SupervisorCall));
+        assert_eq!(
+            decode(0, 0xd400_0021),
+            Err(DecodeError::Unsupported(0xd400_0021))
+        );
+    }
+
+    #[test]
+    fn add_sub_immediate_preserve_x31_xzr_and_w_zero_extension() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(4);
+        state.constants[1] = Some(4);
+        assert_eq!(
+            decode(0x1000, 0x9100_0420),
+            Ok(Instruction::AddImmediate {
+                dest: 0,
+                source: 1,
+                immediate: 1,
+                subtract: false,
+                set_flags: false,
+                width64: true
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(5));
+        assert_eq!(state.constants[0], Some(5));
+        state.regs[1] = word(0x1_0000_0000);
+        state.constants[1] = Some(0x1_0000_0000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x1100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(1));
+        assert_eq!(state.constants[0], Some(1));
+        assert_eq!(
+            decode(0, 0x9100_043f),
+            Err(DecodeError::Unsupported(0x9100_043f))
+        );
+    }
+
+    #[test]
+    fn literal_loads_are_concrete_pc_relative_and_fail_closed_when_unmapped() {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&0xfeed_face_dead_beefu64.to_le_bytes());
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0, 0x5800_0040),
+            Ok(Instruction::LoadLiteral {
+                dest: 0,
+                width: 8,
+                signed: false,
+                target: 8,
+            })
+        );
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x5800_0040, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.regs[0], word(0xfeed_face_dead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x1800_0041, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.constants[1], Some(0xdead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x9800_0042, memory, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.constants[2], Some(0xffff_ffff_dead_beef));
+        assert_eq!(
+            step_with_memory(&mut (), &mut state, 0, 0x5800_0083, memory, &false, &true),
+            Err(DecodeError::Memory(16))
+        );
+    }
+
+    #[test]
+    fn unsigned_immediate_loads_cover_widths_and_fail_closed_addresses() {
+        let mut bytes = [0u8; 64];
+        bytes[32] = 0x80;
+        bytes[34..36].copy_from_slice(&0xbeefu16.to_le_bytes());
+        bytes[36..40].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        bytes[48..56].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        state.constants[1] = Some(32);
+        assert_eq!(
+            decode(0x1000, 0xf940_0020),
+            Ok(Instruction::Load {
+                dest: 0,
+                base: 1,
+                offset: 0,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0x3940_0022,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.constants[2], Some(0x80));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0x7980_0423,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.constants[3], Some(0xffff_ffff_ffff_beef));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1008,
+                0xb940_0424,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.constants[4], Some(0xdead_beef));
+        assert_eq!(state.constants[1], Some(32));
+        assert_eq!(
+            decode(0x100c, 0xf940_0825),
+            Ok(Instruction::Load {
+                dest: 5,
+                base: 1,
+                offset: 16,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x100c,
+                0xf940_0825,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1010)))
+        );
+        assert_eq!(state.constants[5], Some(0x1122_3344_5566_7788));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1010,
+                0xb940_9826,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Memory(184))
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1010,
+                0x3900_0026,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Unsupported(0x3900_0026))
+        );
+    }
+
+    #[test]
+    fn unscaled_loads_use_signed_offsets_and_fail_closed_bases() {
+        let mut bytes = [0u8; 32];
+        bytes[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes[17] = 0x88;
+        let memory = RawMemory::from_slice(&bytes);
+        let mut state = initial_state(false);
+        state.constants[1] = Some(12);
+        assert_eq!(
+            decode(0x1000, 0xf85f_e820),
+            Ok(Instruction::LoadExtend {
+                dest: 0,
+                base: 1,
+                offset: -2,
+                width: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xf85f_c820,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.constants[0], Some(0x1122_3344_5566_7788));
+        state.constants[1] = Some(8);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0x3840_9021,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.constants[1], Some(0x88));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1008,
+                0xf840_905f,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Unsupported(0xf840_905f))
+        );
+    }
+
+    #[test]
+    fn unsigned_and_unscaled_stores_update_only_mapped_bytes() {
+        let mut bytes = [0u8; 64];
+        let memory = RawMemory::from_mut_slice(&mut bytes);
+        let mut state = initial_state(false);
+        state.constants[1] = Some(32);
+        state.constants[2] = Some(0x1122_3344_5566_7788);
+        assert_eq!(
+            decode(0x1000, 0xf900_0022),
+            Ok(Instruction::Store {
+                source: 2,
+                base: 1,
+                offset: 0,
+                width: 8,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xf900_0022,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(
+            memory.read64::<8>(32),
+            Some(0x1122_3344_5566_7788u64.to_le_bytes())
+        );
+        state.constants[2] = Some(0xa5);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0x3900_0822,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(memory.read64::<1>(34), Some([0xa5]));
+        assert_eq!(memory.read64::<1>(33), Some([0x77]));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1008,
+                0x3800_8822,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(memory.read64::<1>(34), Some([0xa5]));
+        state.constants[2] = None;
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x100c,
+                0x3900_0822,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Unsupported(0x3900_0822))
+        );
+        state.constants[2] = Some(1);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1010,
+                0xf901_0022,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Memory(544))
+        );
+    }
+
+    #[test]
+    fn store_pair_updates_frames_and_sp_under_the_indexing_rules() {
+        let mut bytes = [0u8; 160];
+        let memory = RawMemory::from_mut_slice(&mut bytes);
+        let mut state = initial_state_with_arguments(false, &true, 144, &[Some(1)]).unwrap();
+        state.constants[1] = Some(1);
+        state.constants[5] = Some(0xdead_beef);
+        state.constants[30] = Some(0x2000);
+        assert_eq!(
+            decode(0x1000, 0xa9bf_87e5),
+            Ok(Instruction::StorePair {
+                first: 5,
+                second: 1,
+                base: 31,
+                offset: -8,
+                width: 8,
+                mode: PairMode::PreIndex,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xa9bf_87e5,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.sp, Some(136));
+        assert_eq!(memory.read64::<8>(136), Some(0xdead_beefu64.to_le_bytes()));
+        assert_eq!(memory.read64::<8>(144), Some(1u64.to_le_bytes()));
+        state.constants[29] = Some(0x1122_3344_5566_7788);
+        state.constants[30] = Some(0x99aa_bbcc_ddee_ff00);
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xa9bf_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.sp, Some(120));
+        assert_eq!(
+            memory.read64::<8>(120),
+            Some(0x1122_3344_5566_7788u64.to_le_bytes())
+        );
+        assert_eq!(
+            memory.read64::<8>(128),
+            Some(0x99aa_bbcc_ddee_ff00u64.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn load_pair_restores_pair_and_applies_writeback() {
+        let mut bytes = [0u8; 160];
+        bytes[112..120].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes[120..128].copy_from_slice(&0x99aa_bbcc_ddee_ff00u64.to_le_bytes());
+        let memory = RawMemory::from_mut_slice(&mut bytes);
+        let mut state = initial_state_with_arguments(false, &true, 112, &[]).unwrap();
+        assert_eq!(
+            decode(0x1000, 0xa8c2_7bfd),
+            Ok(Instruction::LoadPair {
+                first: 29,
+                second: 30,
+                base: 31,
+                offset: 32,
+                width: 8,
+                mode: PairMode::PostIndex,
+            })
+        );
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xa8c2_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.sp, Some(144));
+        assert_eq!(state.constants[29], Some(0x1122_3344_5566_7788));
+        assert_eq!(state.constants[30], Some(0x99aa_bbcc_ddee_ff00));
+        assert_eq!(
+            step_with_memory(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xa941_7bfd,
+                memory,
+                &false,
+                &true
+            ),
+            Err(DecodeError::Memory(160))
+        );
+    }
+
+    #[test]
+    fn aapcs64_extra_arguments_use_eight_byte_storage_slots() {
+        let mut context = PlainStorage;
+        let mut storage = [false; 1024];
+        let mut state = initial_state_with_arguments(false, &true, 64, &[]).unwrap();
+        let arguments =
+            core::array::from_fn::<_, 10, _>(|index| (word(index as u64), Some(index as u64)));
+        write_aapcs64_arguments(
+            &mut context,
+            &mut storage,
+            &mut state,
+            &false,
+            &true,
+            &arguments,
+        )
+        .unwrap();
+        assert_eq!(state.constants[7], Some(7));
+        let results: [([bool; 64], Option<u64>); 10] =
+            read_aapcs64_results(&mut context, &mut storage, &state, &false, &true).unwrap();
+        assert_eq!(results[7].0, word(7));
+        assert_eq!(results[7].1, Some(7));
+        assert_eq!(results[8].0, word(8));
+        assert_eq!(results[8].1, None);
+        assert_eq!(results[9].0, word(9));
+        for (index, value) in [8u64, 9].iter().enumerate() {
+            let slot = u64::from_le_bytes(core::array::from_fn(|byte| {
+                (0..8).fold(0u8, |value_bits, bit| {
+                    value_bits | u8::from(storage[512 + index * 64 + byte * 8 + bit]) << bit
+                })
+            }));
+            assert_eq!(slot, *value);
+        }
+    }
+
+    #[test]
+    fn stack_relative_memory_moves_symbolic_storage_bits() {
+        let mut context = PlainStorage;
+        let mut storage = [false; 2048];
+        let mut state = initial_state_with_arguments(false, &true, 128, &[]).unwrap();
+        state.constants[1] = Some(0x1122_3344);
+        state.regs[1] = word(0x1122_3344);
+        assert_eq!(
+            step_with_stack(
+                &mut context,
+                &mut storage,
+                &mut state,
+                0x1000,
+                0xb900_13e1,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(
+            step_with_stack(
+                &mut context,
+                &mut storage,
+                &mut state,
+                0x1004,
+                0xb940_13e2,
+                &false,
+                &true
+            ),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[2][..32], word(0x1122_3344)[..32]);
+        assert!(state.regs[2][32..].iter().all(|bit| !*bit));
+        assert_eq!(state.constants[2], None);
+    }
+
+    #[test]
+    fn svc_exit_requires_the_bare_metal_all_ones_selector() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xd400_0001, &false, &true),
+            Err(DecodeError::Unsupported(0xd400_0001))
+        );
+        state.regs[0] = word(u64::MAX);
+        state.constants[0] = Some(u64::MAX);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xd400_0001, &false, &true),
+            Ok(Flow::Exit)
+        );
+        assert!(state.done);
+    }
+
+    #[test]
+    fn high_multiplies_handle_signed_and_unsigned_halves() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(u64::MAX);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(u64::MAX);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            decode(0x1000, 0x9bc2_7c20),
+            Ok(Instruction::MultiplyHigh {
+                dest: 0,
+                left: 1,
+                right: 2,
+                signed: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9bc2_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(1));
+        assert_eq!(state.constants[0], Some(1));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9b42_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(u64::MAX));
+        assert_eq!(state.constants[0], Some(u64::MAX));
+    }
+
+    #[test]
+    fn svc_hash_rewrites_x1_through_x4_and_rejects_unknown_selectors() {
+        let mut state = initial_state(false);
+        for (register, value) in state.regs[1..5].iter_mut().enumerate() {
+            *value = word((register as u64 + 1) << 56);
+            state.constants[register + 1] = Some((register as u64 + 1) << 56);
+        }
+        state.constants[0] = Some(0);
+        let mut calls = 0u32;
+        let digest = core::array::from_fn::<_, 32, _>(|index| 0xa5u8 ^ index as u8);
+        assert_eq!(
+            step_with_hash(
+                &mut (),
+                &mut state,
+                0x1000,
+                0xd400_0001,
+                &false,
+                &true,
+                &mut |_, _| {
+                    calls += 1;
+                    Ok(digest)
+                }
+            ),
+            Ok(Flow::Next(word(0)))
+        );
+        assert_eq!(calls, 1);
+        for register in 1..5 {
+            let value = u64::from_le_bytes(core::array::from_fn(|index| {
+                digest[(register - 1) * 8 + index]
+            }));
+            assert_eq!(state.constants[register], Some(value));
+        }
+        state.constants[0] = Some(1);
+        assert_eq!(
+            step_with_hash(
+                &mut (),
+                &mut state,
+                0x1004,
+                0xd400_0001,
+                &false,
+                &true,
+                &mut |_, _| { Ok([0; 32]) }
+            ),
+            Err(DecodeError::Unsupported(0xd400_0001))
+        );
+    }
+
+    #[test]
+    fn madd_msub_and_mul_aliases_use_low_width_products() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(3);
+        state.regs[2] = word(4);
+        state.regs[3] = word(5);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(4);
+        state.constants[3] = Some(5);
+        assert_eq!(
+            decode(0x1000, 0x9b02_0c20),
+            Ok(Instruction::MultiplyAdd {
+                dest: 0,
+                left: 1,
+                right: 2,
+                addend: 3,
+                subtract: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9b02_0c20, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(17));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9b02_7c20, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(12));
+        state.regs[1] = word(0x1_0000_0002);
+        state.constants[1] = Some(0x1_0000_0002);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0x1b02_7c20, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(8));
+        assert_eq!(state.constants[0], Some(8));
+        state.regs[1] = word(3);
+        state.constants[1] = Some(3);
+        assert_eq!(
+            step(&mut (), &mut state, 0x100c, 0x9b02_8c20, &false, &true),
+            Ok(Flow::Next(word(0x1010)))
+        );
+        assert_eq!(state.regs[0], word(u64::MAX - 6));
+        assert_eq!(state.constants[0], Some(u64::MAX - 6));
+    }
+
+    #[test]
+    fn csel_selects_from_nzcv_and_preserves_xzr() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(0x11);
+        state.regs[2] = word(0x22);
+        state.constants[1] = Some(0x11);
+        state.constants[2] = Some(0x22);
+        assert_eq!(
+            decode(0x1000, 0x9a82_0020),
+            Ok(Instruction::ConditionalSelect {
+                dest: 0,
+                when_true: 1,
+                when_false: 2,
+                condition: 0,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x9a82_0020, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0x22));
+        state.nzcv = [false, true, false, false];
+        state.nzcv_constants = [Some(false), Some(true), Some(false), Some(false)];
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x9a82_0020, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(0x11));
+        assert_eq!(state.constants[0], Some(0x11));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0x9a9f_03e0, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(0));
+    }
+
+    #[test]
+    fn adr_and_adrp_materialize_audited_pc_relative_addresses() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0x1000, 0x1000_0040),
+            Ok(Instruction::Address {
+                dest: 0,
+                target: 0x1008,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x1000_0040, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0x1008));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1234, 0xb000_0000, &false, &true),
+            Ok(Flow::Next(word(0x1238)))
+        );
+        assert_eq!(state.regs[0], word(0x2000));
+        assert_eq!(state.constants[0], Some(0x2000));
+        assert_eq!(
+            decode(0, 0x1000_001f),
+            Err(DecodeError::Unsupported(0x1000_001f))
+        );
+    }
+
+    #[test]
+    fn logical_register_operations_support_xzr_shifts_and_tst() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(0xf0);
+        state.regs[2] = word(0x0f);
+        state.constants[1] = Some(0xf0);
+        state.constants[2] = Some(0x0f);
+        assert_eq!(
+            decode(0x1000, 0x8a02_0020),
+            Ok(Instruction::LogicalRegister {
+                dest: 0,
+                left: 1,
+                right: 2,
+                shift: Shift::Left,
+                amount: 0,
+                operation: BitOp::And,
+                set_flags: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x8a02_0020, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0));
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0xea02_003f, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(
+            state.nzcv_constants,
+            [Some(false), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0xaa02_03e0, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.regs[0], word(0x0f));
+    }
+
+    #[test]
+    fn shifted_register_arithmetic_handles_shift_and_cmp_aliases() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(3);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            decode(0x1000, 0x8b02_0820),
+            Ok(Instruction::AddRegister {
+                dest: 0,
+                left: 1,
+                right: 2,
+                shift: Shift::Left,
+                amount: 2,
+                subtract: false,
+                set_flags: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0x8b02_0820, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(11));
+        assert_eq!(state.constants[0], Some(11));
+        state.regs[1] = word(0);
+        state.regs[2] = word(0x8000_0000);
+        state.constants[1] = Some(0);
+        state.constants[2] = Some(0x8000_0000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x0b82_0420, &false, &true),
+            Ok(Flow::Next(word(0x1008)))
+        );
+        assert_eq!(state.regs[0], word(0xc000_0000));
+        assert_eq!(state.constants[0], Some(0xc000_0000));
+        state.regs[1] = word(3);
+        state.regs[2] = word(2);
+        state.constants[1] = Some(3);
+        state.constants[2] = Some(2);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1008, 0xeb02_003f, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        assert_eq!(state.nzcv_constants[1], Some(false));
+        assert_eq!(state.nzcv_constants[2], Some(true));
+    }
+
+    #[test]
+    fn flag_setting_arithmetic_drives_conditional_branches_and_cmp_aliases() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(u64::MAX);
+        state.constants[1] = Some(u64::MAX);
+        assert_eq!(
+            step(&mut (), &mut state, 0x1000, 0xb100_0420, &false, &true),
+            Ok(Flow::Next(word(0x1004)))
+        );
+        assert_eq!(state.regs[0], word(0));
+        assert_eq!(
+            state.nzcv_constants,
+            [Some(false), Some(true), Some(true), Some(false)]
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x1004, 0x5400_0040, &false, &true),
+            Ok(Flow::Next(word(0x100c)))
+        );
+        state.regs[1] = word(1);
+        state.constants[1] = Some(1);
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xf100_043f, &false, &true),
+            Ok(Flow::Next(word(0x2004)))
+        );
+        assert_eq!(state.constants[0], Some(0));
+        assert_eq!(state.nzcv_constants[1], Some(true));
+    }
+
+    #[test]
+    fn movz_movk_decode_and_update_only_the_selected_halfword() {
+        let mut state = initial_state(false);
+        assert_eq!(
+            decode(0, 0xd282_4680),
+            Ok(Instruction::MoveWide {
+                dest: 0,
+                immediate: 0x1234,
+                shift: 0,
+                keep: false,
+                inverted: false,
+                width64: true,
+            })
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0, 0xd282_4680, &false, &true),
+            Ok(Flow::Next(word(4)))
+        );
+        assert_eq!(state.regs[0], word(0x1234));
+        assert_eq!(
+            step(&mut (), &mut state, 4, 0xf2a2_4680, &false, &true),
+            Ok(Flow::Next(word(8)))
+        );
+        assert_eq!(state.regs[0], word(0x1234_1234));
+        assert_eq!(
+            decode(0, 0x5280_001f),
+            Err(DecodeError::Unsupported(0x5280_001f))
+        );
+    }
+
+    #[test]
+    fn test_and_register_branches_preserve_x31_and_require_concrete_targets() {
+        let mut state = initial_state(false);
+        state.regs[1] = word(1 << 5);
+        let taken = step(&mut (), &mut state, 0x2000, 0x3728_0041, &false, &true).unwrap();
+        assert_eq!(taken, Flow::Next(word(0x2008)));
+        let xzr = step(&mut (), &mut state, 0x2000, 0x3628_005f, &false, &true).unwrap();
+        assert_eq!(xzr, Flow::Next(word(0x2008)));
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd61f_0020, &false, &true),
+            Err(DecodeError::Unsupported(0xd61f_0020))
+        );
+        state.constants[1] = Some(0x3000);
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd61f_0020, &false, &true),
+            Ok(Flow::Next(word(0x3000)))
+        );
+        assert_eq!(
+            step(&mut (), &mut state, 0x2000, 0xd63f_0020, &false, &true),
+            Ok(Flow::Next(word(0x3000)))
+        );
+        assert_eq!(state.constants[30], Some(0x2004));
+        assert_eq!(
+            step(&mut (), &mut state, 0x3000, 0xd65f_03c0, &false, &true),
+            Ok(Flow::Next(word(0x2004)))
+        );
+    }
+
+    #[test]
+    fn symbolic_cbz_selects_the_audited_target_and_x31_is_xzr() {
+        let mut state = initial_state(false);
+        state.regs[1] = core::array::from_fn(|bit| bit == 0);
+        let flow = step(&mut (), &mut state, 0x2000, 0xb500_0041, &false, &true).unwrap();
+        assert_eq!(flow, Flow::Next(word(0x2008)));
+        let zero_register = step(&mut (), &mut state, 0x2000, 0xb400_005f, &false, &true).unwrap();
+        assert_eq!(zero_register, Flow::Next(word(0x2008)));
+        let zero_register_nonzero =
+            step(&mut (), &mut state, 0x2000, 0xb500_005f, &false, &true).unwrap();
+        assert_eq!(zero_register_nonzero, Flow::Next(word(0x2004)));
+    }
+
+    #[test]
+    fn alignment_and_recognized_but_unaudited_forms_fail_closed() {
+        assert_eq!(
+            decode(2, 0x1400_0000),
+            Err(DecodeError::Malformed(0x1400_0000))
+        );
+        assert_eq!(decode(0, 0xd503_201f), Ok(Instruction::NoOperation));
+        assert_eq!(
+            decode(0, 0xd503_203f),
+            Err(DecodeError::Unsupported(0xd503_203f))
+        );
+    }
+}

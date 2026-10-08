@@ -820,6 +820,9 @@ mod tests {
             inputs: Vec::new(),
             outputs: alloc::vec![Idx(2)],
             externals: Vec::new(),
+            storage_ops: Vec::new(),
+            storage_banks: Vec::new(),
+            storage_init: Vec::new(),
         };
         let pinned = PinnedAddresses {
             create: 0x1000,
@@ -844,6 +847,9 @@ mod tests {
             inputs: Vec::new(),
             outputs: alloc::vec![Idx(32)],
             externals: Vec::new(),
+            storage_ops: Vec::new(),
+            storage_banks: Vec::new(),
+            storage_init: Vec::new(),
         };
         let pinned = PinnedAddresses {
             create: 0x1000,

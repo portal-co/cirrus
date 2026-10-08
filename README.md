@@ -9,14 +9,19 @@ their Boolean-word circuits, symbolic-stack model, concrete-value tracking,
 raw-memory mapping, and host-call convention through the internal
 `cirrus-ert-core` crate.
 
-- [`cirrus-ert`](crates/ert/cirrus-ert/src/lib.rs) is the compatible RV32 RISC-V
-  facade.
+- [`cirrus-ert`](crates/ert/cirrus-ert/src/lib.rs) is the compatible RV32/RV64 RISC-V
+  facade (both word widths, normal and compressed encodings).
+- [`cirrus-ert-loop`](crates/ert/cirrus-ert-loop/src/lib.rs) is the alloc-free
+  looped RISC-V executor: it carries a virtual IP across symbolic conditional
+  branches and folds a caller-sized set of live targets rather than rejecting
+  symbolic control flow.
 - [`cirrus-armv8m-ert`](crates/ert/cirrus-armv8m-ert/src/lib.rs) is the non-secure,
   Thumb-only Armv8-M Mainline/Cortex-M33 facade. Its ABI wrapper follows
   AAPCS32; it accepts an odd Thumb entry address and sixteen core registers.
 
 Both interpret a deliberately well-behaved compiler-oriented subset, not an
 entire machine: control flow and non-stack addresses must stay concrete;
+RISC-V compressed encodings of the supported subset are accepted.
 stacks and return stacks are caller supplied; unsupported encodings and
 violations report `Unexpected`. RV32 `slt`/`slti` signed and unsigned forms
 may materialize symbolic Boolean data. Arm retains symbolic NZCVQ status,
@@ -27,7 +32,8 @@ rejected. ARM additionally excludes exception and interrupt entry, TrustZone
 transitions, MPU state, floating point, DSP/MVE, atomics, and semihosting.
 
 Each facade has a bare-metal QEMU SHA-256 compression compatibility gate. The
-same no-std workload is compiled for RV32IM and `thumbv8m.main-none-eabi`; the
+same no-std workload is compiled for RV32IM, RV64 (compressed, via the stock
+`riscv64gc` target), and `thumbv8m.main-none-eabi`; the
 ARM image uses the `mps2-an505` Cortex-M33 board, with its workload linked at
 `0x2000_0000` to exercise unbounded raw guest addresses. These are bare-metal
 tests, not Linux VMs. QEMU's AN505 model boots from its remapped flash vector
@@ -62,7 +68,7 @@ iterate independently.
 ## `cirrus-ert`
 
 `cirrus-ert` is a symbolic interpreter for a deliberately well-behaved subset
-of RV32 RISC-V. It executes register values as Boolean wires while retaining
+of RV32/RV64 RISC-V (compressed forms included). It executes register values as Boolean wires while retaining
 concrete metadata for the control flow and addresses that must remain known.
 It supports immediate and register shifts plus low and high RV32 multiplication.
 An unknown shift amount emits five symbolic selection stages and an unknown
@@ -75,12 +81,16 @@ instruction bytes in `RawMemory::from_slice`). Bare-metal QEMU is a
 compatibility gate for the same firmware, not the only supported venue.
 
 It is intended for circuit-oriented execution, not as a general RISC-V
-emulator. Programs must use the documented supported instruction subset,
-aligned non-compressed control flow, concrete branch decisions, conventional
+emulator. Programs must use the documented supported instruction subset
+(compressed encodings of it included), concrete branch decisions, conventional
 calls and returns, and caller-provided stacks with sufficient capacity. The
 [crate documentation](crates/ert/cirrus-ert/src/lib.rs) describes the supported
-instructions, buffers, ECALLs, and public entry points. WASM and LLVM ingest (LLVM-direct and LLVM→VAFFLE) are sibling paths; this
-repo does not rank them: [frontend-choice.md](crates/ert/frontend-choice.md).
+instructions, buffers, ECALLs, and public entry points. For secret-dependent
+conditional branches, use [`cirrus-ert-loop`](crates/ert/cirrus-ert-loop/src/lib.rs):
+it uses the same instruction data paths, caller-owned virtual stack and return
+stack, but requires a caller-sized live-target table and a host step budget.
+WASM and LLVM ingest (LLVM-direct and LLVM→VAFFLE) are sibling paths; this repo
+does not rank them: [frontend-choice.md](crates/ert/frontend-choice.md).
 
 Instruction images are supplied through `RawMemory`. `RawMemory::from(&slice)`
 safely creates a bounded mapping for a host buffer; its lifetime keeps the

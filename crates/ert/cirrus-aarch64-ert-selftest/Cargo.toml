@@ -1,0 +1,19 @@
+[package]
+name = "cirrus-aarch64-ert-selftest"
+edition = "2024"
+version.workspace = true
+description = "Bare-metal AArch64 cirrus-aarch64-ert self-test"
+autobins = false
+
+[features]
+bare-metal = []
+
+[[bin]]
+name = "cirrus-aarch64-ert-selftest"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["bare-metal"]
+
+[dependencies]
+cirrus-ert-rt = { path = "../cirrus-ert-rt" }

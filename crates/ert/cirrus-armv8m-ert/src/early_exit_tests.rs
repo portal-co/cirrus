@@ -196,8 +196,8 @@ impl Handler<bool> for TestHandler {
     fn ecall(
         &mut self,
         _regs: &mut [[bool; 32]],
-        reg_consts: &mut [Option<u32>],
-        _offsets: &mut [Option<i32>],
+        reg_consts: &mut [Option<u64>],
+        _offsets: &mut [Option<i64>],
         _zero: &bool,
         _one: &bool,
     ) -> Result<EcallOutcome, Infallible> {

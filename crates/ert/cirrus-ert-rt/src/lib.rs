@@ -71,6 +71,19 @@ macro_rules! exit_with {
         }
     };
 }
+#[cfg(target_arch = "aarch64")]
+#[macro_export]
+/// Exit the program through the AArch64 bare-metal ERT `SVC #0` convention.
+macro_rules! exit_with {
+    ($($a:tt)*) => {
+        loop {
+            unsafe {
+                $crate::asm!("svc #0", in("x0") u64::MAX, $($a)*)
+            }
+        }
+    };
+}
+
 #[cfg(target_arch = "arm")]
 #[macro_export]
 /// Exit the program through the Armv8-M ERT `SVC #0` convention.
@@ -83,7 +96,12 @@ macro_rules! exit_with {
         }
     };
 }
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
+#[cfg(not(any(
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "arm",
+    target_arch = "aarch64"
+)))]
 #[macro_export]
 /// Exit the program, with extra register arguments
 macro_rules! exit_with {
@@ -95,6 +113,8 @@ macro_rules! exit_with {
 ///
 /// On Armv8-M this sends the eight little-endian words through the ERT
 /// `SVC #0` hash convention (`r0 = 0`, payload/result in `r1` through `r8`).
+/// On RV32 the payload moves through eight 32-bit registers starting at `a1`;
+/// on RV64 the same 32 bytes move through four 64-bit registers.
 pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
     v = sha2::Sha256::digest(&v).0;
     #[cfg(target_arch = "riscv32")]
@@ -105,6 +125,24 @@ pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
             asm!("ecall", in("a0") 0, a = inout("a1") a, b = inout("x12") b, c = inout("x13") c, d = input("x14") d, e = inout("x15") e, f = inout("x16") f, g = input("x17") g, h = input("x18") h);
         }
         for (i, b) in [a, b, c, d, e, f, g, h]
+            .into_iter()
+            .flat_map(|a| a.to_le_bytes())
+            .enumerate()
+        {
+            v[i] = b
+        }
+        return v;
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        // The RV64 ERT hash `ECALL` moves the same 32-byte payload through
+        // four 64-bit registers starting at `a1`.
+        let [mut a, mut b, mut c, mut d] =
+            array::from_fn(|i| u64::from_le_bytes(array::from_fn(|j| v[j + i * 8])));
+        unsafe {
+            asm!("ecall", in("a0") 0, a = inout("a1") a, b = inout("a2") b, c = inout("a3") c, d = inout("a4") d);
+        }
+        for (i, b) in [a, b, c, d]
             .into_iter()
             .flat_map(|a| a.to_le_bytes())
             .enumerate()
@@ -129,7 +167,7 @@ pub fn hash(mut v: [u8; 32]) -> [u8; 32] {
         }
         return v;
     }
-    #[cfg(not(any(target_arch = "riscv32", target_arch = "arm")))]
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "arm")))]
     unreachable!()
 }
 /// Sponge construction/XOF of [`hash`]

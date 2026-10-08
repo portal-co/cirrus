@@ -139,6 +139,7 @@ fn sample_program() -> Program {
         inputs: vec![Idx(0), Idx(1)],
         outputs: vec![Idx(2), Idx(3), Idx(4)],
         externals: vec![],
+        ..Default::default()
     }
 }
 

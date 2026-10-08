@@ -1,7 +1,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
-//! Symbolically execute a deliberately small, well-behaved RV32 program subset.
+//! Symbolically execute a deliberately small, well-behaved RV32 or RV64 program subset.
 //!
 //! `cirrus-ert` evaluates registers as 32 Boolean wires while keeping a parallel,
 //! optional concrete value for each register. The concrete values let the
@@ -31,8 +31,10 @@
 //! native base by adjusting the pointer. The caller must ensure every
 //! instruction-fetch and concrete-load byte that the program reaches is readable.
 //!
-//! This is not a general RISC-V emulator. Programs must use aligned,
-//! non-compressed instructions; branch only on concrete values; use the
+//! This is not a general RISC-V emulator. Programs must use instructions
+//! whose compressed or normal encoding expands to the supported subset
+//! (compressed forms are decoded and handled identically); branch only on
+//! concrete values; use the
 //! supported stack-address form for symbolic memory; provide sufficiently large
 //! stacks; and follow the supported direct-call/return convention. Unsupported
 //! instructions, dynamic control flow or addresses, and invalid environment
@@ -43,12 +45,27 @@
 //! and `MUL`, `MULH`, `MULHSU`, and `MULHU`; `LB`, `LBU`, `LH`, `LHU`, `LW`,
 //! `SB`, `SH`, `SW`; `JAL`, concrete-target `JALR` calls, the conventional
 //! `jalr x0, 0(ra)` return, and the six integer branches; plus the hash and exit
-//! `ECALL`s.
+//! `ECALL`s. Call and return boundaries (`JAL`, `JALR`, and the conventional
+//! return form) can additionally be observed and replaced through
+//! [`RvHandler::call_hook`]: a handler may count calls, divert a call to a
+//! host-chosen concrete target, resolve an otherwise-rejected indirect call,
+//! or replace the callee entirely (`ReturnNow`) after writing result
+//! registers. The default hook does nothing and preserves historical
+//! behavior. The `call-hooks` feature adds an optional allocation-using
+//! [`hooks::CallRegistry`] of canned per-target replacements.
+//! `ECALL`s. RV64 (`ert64_emit`/`ert64_func`) additionally supports the `*W`
+//! word forms (`ADDIW`, `ADDW`, `SUBW`, the `*W` shifts), `LW` sign-extension,
+//! `LWU`, `LD`, and `SD`, with `LD`/`SD` and 64-bit shifts operating on the
+//! full width.
 //!
-//! Symbolic register shifts use a five-stage barrel shifter over `rs2[4:0]`.
+//! Symbolic register shifts use a five-stage barrel shifter over `rs2[4:0]`
+//! (six stages over `rs2[5:0]` on RV64).
 //! Symbolic multiplication uses fixed long-multiplication rounds. A concrete
 //! shift amount or multiplicand selects a smaller fixed-shift or constant-product
 //! path, so callers should retain concrete metadata whenever it is known.
+
+#[cfg(feature = "call-hooks")]
+extern crate alloc;
 
 use core::{array, error::Error};
 
@@ -68,19 +85,32 @@ use rv_asm::{DecodeError, Reg};
 
 #[cfg(feature = "early-exit-loops")]
 mod early_exit;
-mod handlers;
-mod machine;
+/// Instruction execution shared with the looped-circuit emulator.
+#[doc(hidden)]
+pub mod handlers;
+/// The machine state the looped-circuit emulator drives and snapshots.
+#[doc(hidden)]
+pub mod machine;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests64;
+
+#[cfg(test)]
+mod tests_hooks;
+
 #[cfg(all(test, feature = "early-exit-loops"))]
 mod early_exit_tests;
+
+#[cfg(feature = "call-hooks")]
+pub mod hooks;
 
 #[cfg(feature = "early-exit-loops")]
 pub use cirrus_ert_core::EarlyExitLoopOptions;
 
-use machine::{Machine, Runtime, add_bits, read_abi_results, write_abi_args};
+use machine::{Machine, RstackWord, Runtime, add_bits, read_abi_results, write_abi_args};
 
 /// The Boolean operations required to execute the supported RISC-V subset.
 pub trait ContextWithRvOps<Val>:
@@ -94,6 +124,7 @@ impl<Val, T: cirrus_ert_core::ContextWithErtOps<Val> + ContextWithStorage<Val>>
 }
 
 /// An error while decoding or symbolically executing a program.
+#[derive(Debug)]
 pub enum ErtError<E> {
     /// The caller-supplied Boolean context or hash callback returned this error.
     Emitted(E),
@@ -176,28 +207,36 @@ where
     }
 }
 
-impl<C, F, W: Clone, E: Error> Handler<bool> for DefaultHandler<C, F>
+impl<C, F, W: Clone, E: Error, const BITS: usize> Handler<bool, BITS> for DefaultHandler<C, F>
 where
     C: ContextWithRvOps<bool, Wrapped = W, Error = E>,
-    F: FnMut(&mut C, &[[W; 32]]) -> Result<[u8; 32], E>,
+    F: FnMut(&mut C, &[[W; BITS]]) -> Result<[u8; 32], E>,
 {
     fn ecall(
         &mut self,
-        regs: &mut [[W; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        regs: &mut [[W; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
         match reg_consts[Reg::A0.0 as usize] {
             Some(0) => {
-                let hash = (self.hash)(&mut self.context, &regs[Reg::A1.0 as usize..][..8])?;
-                for (index, chunk) in hash.chunks_exact(4).enumerate() {
+                // The hash payload is 32 bytes: eight 32-bit registers on
+                // RV32, four 64-bit registers on RV64.
+                let hash_registers = if BITS == 64 { 4 } else { 8 };
+                let hash = (self.hash)(
+                    &mut self.context,
+                    &regs[Reg::A1.0 as usize..][..hash_registers],
+                )?;
+                for (index, chunk) in hash.chunks_exact(BITS / 8).enumerate() {
                     let register = Reg::A1.0 as usize + index;
-                    let value = u32::from_le_bytes(array::from_fn(|i| chunk[i]));
+                    let value = u64::from_le_bytes(array::from_fn(|i| {
+                        if i < BITS / 8 { chunk[i] } else { 0 }
+                    }));
                     reg_consts[register] = Some(value);
                     offsets[register] = None;
-                    for bit in 0..32 {
+                    for bit in 0..BITS {
                         regs[register][bit] = if (value >> bit) & 1 == 0 {
                             zero.clone()
                         } else {
@@ -207,21 +246,109 @@ where
                 }
                 Ok(EcallOutcome::Continue)
             }
-            Some(0xffff_ffff) => Ok(EcallOutcome::Exit),
+            // RV64 accepts either encoding of the historical selector:
+            // zero-extended `0x0000_0000_ffff_ffff` (the RT macro's literal)
+            // or sign-extended `-1` (`li a0, -1`).
+            Some(value) if value == 0xffff_ffff || (BITS == 64 && value == u64::MAX) => {
+                Ok(EcallOutcome::Exit)
+            }
             _ => Ok(EcallOutcome::Unexpected),
         }
     }
 }
 
-/// An RV32-specific [`Handler`] extension point, currently without
-/// additional requirements beyond [`Handler`] itself. Reserved so a future
-/// RV32 capability can be added here later without changing the shared
-/// [`Handler`] trait.
-pub trait RvHandler<Val>: Handler<Val> + ContextWithStorage<Val> {}
+/// A call/return boundary observed by [`RvHandler::call_hook`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallEvent {
+    /// A `JAL` call: `link` receives the return address and control continues
+    /// at `target`.
+    Jal {
+        /// Address of the call instruction.
+        caller_pc: u64,
+        /// The call target.
+        target: u64,
+        /// The link register (`x0` for a plain jump).
+        link: Reg,
+    },
+    /// A `JALR` call whose target resolved concretely.
+    Jalr {
+        /// Address of the call instruction.
+        caller_pc: u64,
+        /// The resolved call target.
+        target: u64,
+        /// The base register the target was resolved from.
+        base: Reg,
+        /// The instruction's immediate offset.
+        offset: i64,
+        /// The link register.
+        link: Reg,
+    },
+    /// The conventional `jalr x0, 0(ra)` return, which will continue at
+    /// `target` (the private return stack's top).
+    Return {
+        /// Address of the return instruction.
+        from_pc: u64,
+        /// The return target.
+        target: u64,
+    },
+    /// A `JALR` whose base register was not concretely known. The default
+    /// [`CallAction::Proceed`] response fails closed with
+    /// [`ErtError::Unexpected`], preserving historical behavior; a hook may
+    /// resolve the target with [`CallAction::Divert`] or replace the call
+    /// with [`CallAction::ReturnNow`].
+    UnresolvedJalr {
+        /// Address of the `JALR` instruction.
+        caller_pc: u64,
+        /// The unresolved base register.
+        base: Reg,
+        /// The instruction's immediate offset.
+        offset: i64,
+        /// The link register.
+        link: Reg,
+    },
+}
 
-/// Tunnels any [`Handler`] through as an [`RvHandler`], with no added
-/// behavior today — the RV32 half of the extension pattern Arm's
-/// `ArmDefaultHandler` establishes for real.
+/// The hook's decision at a call/return boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAction {
+    /// Execute the call or return normally.
+    Proceed,
+    /// Replace a call without executing the callee: the handler has already
+    /// written any result registers; execution continues at the instruction
+    /// following the call and the private return stack is not pushed.
+    /// Meaningless on a return, where it fails closed with
+    /// [`ErtError::Unexpected`].
+    ReturnNow,
+    /// Continue execution at a different concrete target.
+    Divert(u64),
+}
+
+/// An RV32/RV64-specific [`Handler`] extension point: call/return
+/// interception. The default implementation preserves historical behavior
+/// exactly — no interception, and unresolved indirect calls keep failing
+/// closed — so unaffected callers pay nothing.
+pub trait RvHandler<Val, const BITS: usize = 32>: Handler<Val, BITS> + ContextWithStorage<Val> {
+    /// Observe or replace a call/return boundary. The register-file views
+    /// match [`Handler::ecall`]'s: a `ReturnNow` response is expected to have
+    /// written any result registers already. Returning `Err` aborts execution
+    /// with a caller-emitted error.
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<CallAction, Self::Error> {
+        let _ = (event, regs, reg_consts, offsets, zero, one);
+        Ok(CallAction::Proceed)
+    }
+}
+
+/// Tunnels any [`RvHandler`] through, delegating the environment call and
+/// the call hook to the wrapped handler — the RV half of the extension
+/// pattern Arm's `ArmDefaultHandler` establishes for real.
 pub struct RvDefaultHandler<H> {
     /// The wrapped handler.
     pub inner: H,
@@ -286,12 +413,12 @@ where
     }
 }
 
-impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
+impl<H: Handler<bool, BITS>, const BITS: usize> Handler<bool, BITS> for RvDefaultHandler<H> {
     fn ecall(
         &mut self,
-        regs: &mut [[H::Wrapped; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        regs: &mut [[H::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &H::Wrapped,
         one: &H::Wrapped,
     ) -> Result<EcallOutcome, H::Error> {
@@ -303,10 +430,34 @@ impl<H: Handler<bool>> Handler<bool> for RvDefaultHandler<H> {
     }
 }
 
-impl<T, Val> RvHandler<Val> for T where T: Handler<Val> + ContextWithStorage<Val> {}
+impl<C, F, W: Clone, E: Error, const BITS: usize> RvHandler<bool, BITS> for DefaultHandler<C, F>
+where
+    C: ContextWithRvOps<bool, Wrapped = W, Error = E>,
+    F: FnMut(&mut C, &[[W; BITS]]) -> Result<[u8; 32], E>,
+{
+    // The default `call_hook` (no interception) fires; nothing to add.
+}
 
-/// The RV32 handler shape used by [`ert_func_prepared`] and
-/// [`ert_emit_prepared`].
+impl<H, const BITS: usize> RvHandler<bool, BITS> for RvDefaultHandler<H>
+where
+    H: RvHandler<bool, BITS>,
+{
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<CallAction, Self::Error> {
+        self.inner.call_hook(event, regs, reg_consts, offsets, zero, one)
+    }
+}
+
+/// The handler shape used by [`ert_func_prepared`]/[`ert_emit_prepared`] and
+/// their RV64 counterparts [`ert64_func_prepared`]/[`ert64_emit_prepared`].
+/// The hash callback's register-slice width follows the executed width.
 ///
 /// After execution, consume `handler.inner.context` with
 /// [`MuxTreeContext::into_inner`] and then [`PreparedRecorder::finish`] to
@@ -373,19 +524,31 @@ where
     }
 }
 
-impl<H, W: Clone, E: Error> Runtime<W> for StorageRuntime<'_, H>
+impl<H, W: Clone, E: Error, const BITS: usize> Runtime<W, BITS> for StorageRuntime<'_, H>
 where
-    H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
 {
     fn ecall(
         &mut self,
-        regs: &mut [[W; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        regs: &mut [[W; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
         self.handler.ecall(regs, reg_consts, offsets, zero, one)
+    }
+
+    fn call_hook(
+        &mut self,
+        event: CallEvent,
+        regs: &mut [[W; BITS]],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
+        zero: &W,
+        one: &W,
+    ) -> Result<CallAction, E> {
+        self.handler.call_hook(event, regs, reg_consts, offsets, zero, one)
     }
 
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {
@@ -448,6 +611,11 @@ pub fn simple_add<W: Clone, E: Error>(
 /// are placed in or read from caller-owned symbolic storage. `storage_bits` is
 /// the capacity of that storage in bits. `args` carries both the symbolic word
 /// and, when known, its concrete value.
+///
+/// This is the RV32 spelling of the ABI; [`ert64_func`] is the RV64 one. The
+/// two share the interpreter: this wrapper converts the caller's `u32`
+/// concrete metadata and return stack, runs the width-generic machine, and
+/// converts the results back.
 pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize, H>(
     t: &mut H,
     storage: &mut H::Storage,
@@ -464,7 +632,88 @@ pub fn ert_func<W: Clone, E: Error, const N: usize, const M: usize, H>(
 where
     H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
 {
-    let stack_pointer = abi_stack_pointer(storage_bits, N.max(M)).ok_or(ErtError::Unexpected)?;
+    let mut consts64: [Option<u64>; 32] =
+        array::from_fn(|index| reg_consts[index].map(u64::from));
+    let args64: [([W; 32], Option<u64>); N] =
+        args.map(|(word, constant)| (word, constant.map(u64::from)));
+    let result = ert_func_impl(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        u64::from(pc),
+        regs,
+        &mut consts64,
+        zero,
+        one,
+        args64,
+    );
+    for (slot, value) in reg_consts.iter_mut().zip(consts64) {
+        *slot = value.map(|value| value as u32);
+    }
+    let results = result?;
+    Ok(results.map(|(word, constant)| (word, constant.map(|value| value as u32))))
+}
+
+/// Invoke a symbolic RV64 function using the RISC-V argument and result ABI.
+///
+/// The RV64 counterpart of [`ert_func`]: registers are 64 Boolean wires,
+/// concrete metadata and return-stack entries are `u64`, and ABI overflow
+/// words occupy 64-bit stack slots. The hash `ECALL` passes its 32-byte
+/// payload through four 64-bit registers starting at `a1`; the exit `ECALL`
+/// keeps the historical concrete `a0 = 0xffff_ffff` convention.
+#[allow(clippy::too_many_arguments)]
+pub fn ert64_func<W: Clone, E: Error, const N: usize, const M: usize, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [u64],
+    pc: u64,
+    regs: &mut [[W; 64]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: W,
+    one: W,
+    args: [([W; 64], Option<u64>); N],
+) -> Result<[([W; 64], Option<u64>); M], ErtError<E>>
+where
+    H: RvHandler<bool, 64, Wrapped = W, Error = E> + ?Sized,
+{
+    ert_func_impl(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+        args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ert_func_impl<W: Clone, E: Error, const N: usize, const M: usize, const BITS: usize, R: RstackWord, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [R],
+    pc: u64,
+    regs: &mut [[W; BITS]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: W,
+    one: W,
+    args: [([W; BITS], Option<u64>); N],
+) -> Result<[([W; BITS], Option<u64>); M], ErtError<E>>
+where
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
+{
+    let stack_pointer =
+        abi_stack_pointer(storage_bits, N.max(M), BITS).ok_or(ErtError::Unexpected)?;
     let mut runtime = StorageRuntime {
         handler: t,
         storage,
@@ -535,12 +784,52 @@ where
     )
 }
 
+/// Execute RV64 through an opt-in [`PreparedRecorder`].
+///
+/// The RV64 counterpart of [`ert_func_prepared`]; the hash callback receives
+/// four 64-bit registers instead of eight 32-bit ones.
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert64_func_prepared<F, const N: usize, const M: usize>(
+    t: &mut PreparedRvHandler<F>,
+    storage: &mut [Idx],
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [u64],
+    pc: u64,
+    regs: &mut [[Idx; 64]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: Idx,
+    one: Idx,
+    args: [([Idx; 64], Option<u64>); N],
+) -> Result<[([Idx; 64], Option<u64>); M], ErtError<Infallible>>
+where
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 64]]) -> Result<[u8; 32], Infallible>,
+{
+    ert64_func(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+        args,
+    )
+}
+
 /// Execute a symbolic RV32 instruction image until the supported exit `ECALL`.
 ///
 /// The interpreter resets `x0` and initializes `sp` to the byte length of the
 /// supplied storage capacity. It accepts only the subset described in the [crate
 /// documentation](self); an exit is `ECALL` with concrete `a0 = 0xffff_ffff`,
 /// and a hash call is `ECALL` with concrete `a0 = 0`.
+///
+/// This is the RV32 spelling; [`ert64_emit`] is the RV64 one.
+#[allow(clippy::too_many_arguments)]
 pub fn ert_emit<W: Clone, E: Error, H>(
     t: &mut H,
     storage: &mut H::Storage,
@@ -556,10 +845,80 @@ pub fn ert_emit<W: Clone, E: Error, H>(
 where
     H: RvHandler<bool, Wrapped = W, Error = E> + ?Sized,
 {
+    let mut consts64: [Option<u64>; 32] =
+        array::from_fn(|index| reg_consts[index].map(u64::from));
+    let result = ert_emit_impl(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        u64::from(pc),
+        regs,
+        &mut consts64,
+        zero,
+        one,
+    );
+    for (slot, value) in reg_consts.iter_mut().zip(consts64) {
+        *slot = value.map(|value| value as u32);
+    }
+    result
+}
+
+/// Execute a symbolic RV64 instruction image until the supported exit `ECALL`.
+///
+/// The RV64 counterpart of [`ert_emit`]: the image decodes as RV64, registers
+/// are 64 wires, and the exit/hash `ECALL` conventions match [`ert64_func`].
+#[allow(clippy::too_many_arguments)]
+pub fn ert64_emit<W: Clone, E: Error, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [u64],
+    pc: u64,
+    regs: &mut [[W; 64]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: W,
+    one: W,
+) -> Result<(), ErtError<E>>
+where
+    H: RvHandler<bool, 64, Wrapped = W, Error = E> + ?Sized,
+{
+    ert_emit_impl(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ert_emit_impl<W: Clone, E: Error, const BITS: usize, R: RstackWord, H>(
+    t: &mut H,
+    storage: &mut H::Storage,
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [R],
+    pc: u64,
+    regs: &mut [[W; BITS]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: W,
+    one: W,
+) -> Result<(), ErtError<E>>
+where
+    H: RvHandler<bool, BITS, Wrapped = W, Error = E> + ?Sized,
+{
     if storage_bits % 8 != 0 {
         return Err(ErtError::Unexpected);
     }
-    let stack_pointer = u32::try_from(storage_bits / 8).map_err(|_| ErtError::Unexpected)?;
+    let stack_pointer = u64::try_from(storage_bits / 8).map_err(|_| ErtError::Unexpected)?;
     let mut runtime = StorageRuntime {
         handler: t,
         storage,
@@ -616,9 +975,43 @@ where
     )
 }
 
-fn abi_stack_pointer(storage_bits: usize, values: usize) -> Option<u32> {
+/// Execute RV64 until `ECALL` through an opt-in [`PreparedRecorder`].
+///
+/// The RV64 counterpart of [`ert_emit_prepared`].
+#[cfg(feature = "prepared-recording")]
+#[allow(clippy::too_many_arguments)]
+pub fn ert64_emit_prepared<F>(
+    t: &mut PreparedRvHandler<F>,
+    storage: &mut [Idx],
+    storage_bits: usize,
+    mem: RawMemory<'_>,
+    rstack: &mut [u64],
+    pc: u64,
+    regs: &mut [[Idx; 64]; 32],
+    reg_consts: &mut [Option<u64>; 32],
+    zero: Idx,
+    one: Idx,
+) -> Result<(), ErtError<Infallible>>
+where
+    F: FnMut(&mut MuxTreeContext<PreparedRecorder>, &[[Idx; 64]]) -> Result<[u8; 32], Infallible>,
+{
+    ert64_emit(
+        t,
+        storage,
+        storage_bits,
+        mem,
+        rstack,
+        pc,
+        regs,
+        reg_consts,
+        zero,
+        one,
+    )
+}
+
+fn abi_stack_pointer(storage_bits: usize, values: usize, value_bits: usize) -> Option<u64> {
     (storage_bits % 8 == 0).then_some(())?;
     let extra_values = values.saturating_sub(machine::ABI_REGS.len());
-    let stack_bytes = u32::try_from(storage_bits / 8).ok()?;
-    stack_bytes.checked_sub(u32::try_from(extra_values.checked_mul(4)?).ok()?)
+    let stack_bytes = u64::try_from(storage_bits / 8).ok()?;
+    stack_bytes.checked_sub(u64::try_from(extra_values.checked_mul(value_bits / 8)?).ok()?)
 }

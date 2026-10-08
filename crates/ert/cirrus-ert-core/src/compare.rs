@@ -144,10 +144,10 @@ pub fn arm_condition_value(
 ///
 /// Built entirely from [`ContextWithErtOps`]'s AND/OR/XOR gates, matching
 /// every other primitive in this crate — no mux capability is required.
-pub fn compare_word<W: Clone, E>(
+pub fn compare_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    left: &[W; 32],
-    right: &[W; 32],
+    left: &[W; N],
+    right: &[W; N],
     predicate: ComparePredicate,
     one: &W,
 ) -> Result<W, E> {
@@ -170,9 +170,9 @@ pub fn compare_word<W: Clone, E>(
         }
         ComparePredicate::GeS | ComparePredicate::LtS => {
             let (diff, _) = subtract_word_with_carry_out(t, left, right, one)?;
-            let sign_l = left[31].clone();
-            let sign_r = right[31].clone();
-            let sign_d = diff[31].clone();
+            let sign_l = left[N - 1].clone();
+            let sign_r = right[N - 1].clone();
+            let sign_d = diff[N - 1].clone();
             let operands_differ = t.bitxor(sign_l.clone(), sign_r)?;
             let result_differs_from_left = t.bitxor(sign_l, sign_d.clone())?;
             let overflow = t.bitand(operands_differ, result_differs_from_left)?;
@@ -189,20 +189,20 @@ pub fn compare_word<W: Clone, E>(
 /// (unsigned "no borrow occurred" flag) that [`crate::add_bits_with`] doesn't
 /// expose. Mirrors each facade's own subtract handler, just also keeping the
 /// carry rather than discarding it.
-pub fn subtract_word_with_carry_out<W: Clone, E>(
+pub fn subtract_word_with_carry_out<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    left: &[W; 32],
-    right: &[W; 32],
+    left: &[W; N],
+    right: &[W; N],
     one: &W,
-) -> Result<([W; 32], W), E> {
+) -> Result<([W; N], W), E> {
     let inverted_right = invert_word(t, right, one.clone())?;
     add_bits_with_carry_out(t, left, &inverted_right, one.clone())
 }
 
 /// Return a Boolean wire that is one exactly when `word` is zero.
-pub fn zero_word<W: Clone, E>(
+pub fn zero_word<W: Clone, E, const N: usize>(
     t: &mut (impl ContextWithErtOps<bool, Wrapped = W, Error = E> + ?Sized),
-    word: &[W; 32],
+    word: &[W; N],
     one: &W,
 ) -> Result<W, E> {
     let mut acc = word[0].clone();

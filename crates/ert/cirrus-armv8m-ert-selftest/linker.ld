@@ -24,12 +24,12 @@ SECTIONS
   {
     KEEP(*(.text.ert_workload))
     *(.text.sha256_compress)
-    *(.text._ZN25cirrus_ert_sha256_fixture*)
+    *(.text.*cirrus_ert_sha256_fixture*)
   } > WORKLOAD
 
   .rodata.ert_workload : ALIGN(4)
   {
-    *(.rodata._ZN25cirrus_ert_sha256_fixture*)
+    *(.rodata.*cirrus_ert_sha256_fixture*)
   } > WORKLOAD
 
   . = ORIGIN(RAM);

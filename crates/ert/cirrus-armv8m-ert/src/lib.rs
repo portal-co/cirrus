@@ -1,6 +1,5 @@
 #![no_std]
 #![warn(missing_docs)]
-
 //! Symbolically execute a deliberately small Armv8-M Thumb-2 subset,
 //! including virtual Secure/Non-secure TrustZone-M interworking.
 //!
@@ -60,6 +59,9 @@
 
 use core::{array, error::Error, mem::MaybeUninit, ops::Range};
 
+#[cfg(feature = "call-hooks")]
+extern crate alloc;
+
 #[cfg(feature = "prepared-recording")]
 use core::convert::Infallible;
 
@@ -80,11 +82,17 @@ use cirrus_volar_boolar::MuxTreeContext;
 
 pub use cirrus_ert_core::{EcallOutcome, Handler, RawMemory};
 
+#[cfg(feature = "call-hooks")]
+pub mod hooks;
+
 #[cfg(feature = "early-exit-loops")]
 mod early_exit;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_hooks;
 
 #[cfg(all(test, feature = "early-exit-loops"))]
 mod early_exit_tests;
@@ -92,8 +100,10 @@ mod early_exit_tests;
 #[cfg(feature = "early-exit-loops")]
 pub use cirrus_ert_core::EarlyExitLoopOptions;
 
-const REG_COUNT: usize = 16;
-const SP: u8 = 13;
+#[doc(hidden)]
+pub const REG_COUNT: usize = 16;
+#[doc(hidden)]
+pub const SP: u8 = 13;
 const LR: u8 = 14;
 const PC: u8 = 15;
 const ABI_REGS: [u8; 4] = [0, 1, 2, 3];
@@ -211,8 +221,8 @@ where
     fn ecall(
         &mut self,
         regs: &mut [[W; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
@@ -223,12 +233,12 @@ where
                     let register = index + 1;
                     let value = u32::from_le_bytes(array::from_fn(|byte| bytes[byte]));
                     offsets[register] = None;
-                    reg_consts[register] = Some(value);
-                    regs[register] = constant_word(zero, one, value);
+                    reg_consts[register] = Some(u64::from(value));
+                    regs[register] = constant_word(zero, one, u64::from(value));
                 }
                 Ok(EcallOutcome::Continue)
             }
-            Some(u32::MAX) => Ok(EcallOutcome::Exit),
+            Some(0xffff_ffff) => Ok(EcallOutcome::Exit),
             _ => Ok(EcallOutcome::Unexpected),
         }
     }
@@ -261,9 +271,67 @@ pub enum SecurityAttribute {
     Secure,
 }
 
-/// An Arm-specific [`Handler`] extension gating `SVC #0` and Secure/Non-secure
-/// state transitions on the interpreter's tracked virtual security state
-/// (see [`SecurityState`]) and a caller-supplied address attribution.
+/// A call or return boundary observed by [`ArmHandler::call_hook`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArmCallEvent {
+    /// A direct Thumb `BL` call.
+    DirectCall {
+        /// Address of the call instruction.
+        caller_pc: u32,
+        /// Normalized (even) fetch address of the callee.
+        target: u32,
+        /// Normalized return fetch address.
+        return_pc: u32,
+    },
+    /// A register call. A symbolic target is represented by `None`.
+    RegisterCall {
+        /// Address of the call instruction.
+        caller_pc: u32,
+        /// Source register containing the target.
+        register: u8,
+        /// Normalized target when concretely known.
+        target: Option<u32>,
+        /// Normalized return fetch address.
+        return_pc: u32,
+    },
+    /// A conventional return through the private return stack.
+    Return {
+        /// Address of the return instruction.
+        from_pc: u32,
+        /// Normalized return target at the top of the private return stack.
+        target: u32,
+    },
+    /// `BXNS` or `BLXNS`, before its virtual-security transition.
+    NonSecureBranch {
+        /// Address of the branch instruction.
+        caller_pc: u32,
+        /// Register containing the raw (low-bit-bearing) target.
+        register: u8,
+        /// Raw target when concretely known.
+        target: Option<u32>,
+        /// Whether this is the linking `BLXNS` form.
+        link: bool,
+        /// Virtual state before the transfer.
+        state_before: SecurityState,
+    },
+}
+
+/// The Arm call hook's decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArmCallAction {
+    /// Execute the transfer normally.
+    Proceed,
+    /// Replace a linking call without entering the callee. The hook has
+    /// already written its result registers; no private return frame is made.
+    ReturnNow,
+    /// Use another concrete target. For ordinary calls/returns it is a
+    /// normalized even Thumb fetch address; for `BXNS`/`BLXNS` it is the raw
+    /// target whose low bit drives the existing security-state transition.
+    Divert(u32),
+}
+
+/// An Arm-specific [`Handler`] extension that gates `SVC #0`, controls
+/// virtual Secure/Non-secure attribution, and may intercept call boundaries.
 pub trait ArmHandler<Val>: Handler<Val> + ContextWithStorage<Val> {
     /// Whether an `SVC #0` reached while the CPU is in `state` may proceed
     /// to [`Handler::ecall`]. Called by the interpreter before dispatch;
@@ -277,6 +345,22 @@ pub trait ArmHandler<Val>: Handler<Val> + ContextWithStorage<Val> {
     /// policy, or supply an entirely synthetic map when there is no real
     /// hardware backing (e.g. a desktop/user-mode test).
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
+
+    /// Observe or replace a call/return transfer. The default preserves the
+    /// historical interpreter exactly: unresolved register transfers remain
+    /// rejected and every ordinary transfer proceeds unchanged.
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[<Self as ContextWithValue<bool>>::Wrapped; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &<Self as ContextWithValue<bool>>::Wrapped,
+        one: &<Self as ContextWithValue<bool>>::Wrapped,
+    ) -> Result<ArmCallAction, Self::Error> {
+        let _ = (event, regs, constants, offsets, zero, one);
+        Ok(ArmCallAction::Proceed)
+    }
 }
 
 /// Tunnels any [`Handler`] through as an [`ArmHandler`], adding both policy
@@ -356,8 +440,8 @@ impl<H: Handler<bool>, G, A> Handler<bool> for ArmDefaultHandler<H, G, A> {
     fn ecall(
         &mut self,
         regs: &mut [[H::Wrapped; 32]],
-        reg_consts: &mut [Option<u32>],
-        offsets: &mut [Option<i32>],
+        reg_consts: &mut [Option<u64>],
+        offsets: &mut [Option<i64>],
         zero: &H::Wrapped,
         one: &H::Wrapped,
     ) -> Result<EcallOutcome, H::Error> {
@@ -396,7 +480,9 @@ pub type PreparedArmHandler<F, G, A> =
 
 /// Object-safe facade used by the Arm machine while its public caller keeps
 /// the storage type in `ContextWithStorage<bool>`.
-trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
     fn ecall(
         &mut self,
         regs: &mut [[W; 32]],
@@ -412,18 +498,47 @@ trait Runtime<W>: cirrus_ert_core::ContextWithErtOps<bool, Wrapped = W> {
 
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute;
 
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[W; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<ArmCallAction, Self::Error>;
+
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, Self::Error>;
 
     fn storage_write_bit(&mut self, bit: usize, value: W) -> Result<(), Self::Error>;
 }
 
-struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct StorageRuntime<'a, H: ContextWithStorage<bool> + ?Sized> {
     handler: &'a mut H,
     storage: &'a mut H::Storage,
     zero: H::Wrapped,
     one: H::Wrapped,
 }
 
+impl<'a, H: ContextWithStorage<bool> + ?Sized> StorageRuntime<'a, H> {
+    /// Construct the storage-backed runtime used by loop adapters.
+    #[doc(hidden)]
+    pub fn new(
+        handler: &'a mut H,
+        storage: &'a mut H::Storage,
+        zero: H::Wrapped,
+        one: H::Wrapped,
+    ) -> Self {
+        Self {
+            handler,
+            storage,
+            zero,
+            one,
+        }
+    }
+}
 impl<H: ContextWithStorage<bool> + ?Sized> HasError for StorageRuntime<'_, H> {
     type Error = H::Error;
 }
@@ -483,7 +598,31 @@ where
         zero: &W,
         one: &W,
     ) -> Result<EcallOutcome, E> {
-        self.handler.ecall(regs, reg_consts, offsets, zero, one)
+        // The shared `Handler` trait carries `u64`/`i64` metadata for RV64;
+        // this facade's machine keeps its historical 32-bit metadata, so the
+        // boundary converts through a fixed register-file-sized scratch.
+        let mut consts64: [Option<u64>; REG_COUNT] = [None; REG_COUNT];
+        let mut offsets64: [Option<i64>; REG_COUNT] = [None; REG_COUNT];
+        for (slot, converted) in reg_consts.iter().zip(consts64.iter_mut()) {
+            *converted = slot.map(u64::from);
+        }
+        for (slot, converted) in offsets.iter().zip(offsets64.iter_mut()) {
+            *converted = slot.map(i64::from);
+        }
+        let outcome = self.handler.ecall(
+            regs,
+            &mut consts64[..reg_consts.len()],
+            &mut offsets64[..offsets.len()],
+            zero,
+            one,
+        )?;
+        for (slot, converted) in reg_consts.iter_mut().zip(consts64) {
+            *slot = converted.map(|value| value as u32);
+        }
+        for (slot, converted) in offsets.iter_mut().zip(offsets64) {
+            *slot = converted.map(|value| value as i32);
+        }
+        Ok(outcome)
     }
 
     fn early_exit_loop_options(&self) -> cirrus_ert_core::EarlyExitLoopOptions {
@@ -496,6 +635,19 @@ where
 
     fn security_attribute(&mut self, address: u32) -> SecurityAttribute {
         self.handler.security_attribute(address)
+    }
+
+    fn call_hook(
+        &mut self,
+        event: ArmCallEvent,
+        regs: &mut [[W; 32]],
+        constants: &mut [Option<u32>],
+        offsets: &mut [Option<i32>],
+        zero: &W,
+        one: &W,
+    ) -> Result<ArmCallAction, E> {
+        self.handler
+            .call_hook(event, regs, constants, offsets, zero, one)
     }
 
     fn storage_read_bit(&mut self, bit: usize) -> Result<W, E> {
@@ -790,13 +942,17 @@ fn read_abi_results<W: Clone, E: Error, const M: usize>(
 }
 
 #[derive(Clone, Copy)]
-enum Flow {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Flow {
     Next(u32),
     Exit,
 }
 
 #[derive(Clone, Copy)]
-enum LoadKind {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum LoadKind {
     ByteSigned,
     HalfSigned,
     ByteUnsigned,
@@ -805,7 +961,9 @@ enum LoadKind {
 }
 
 #[derive(Clone, Copy)]
-enum Arithmetic {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Arithmetic {
     Add,
     AddCarry,
     Sub,
@@ -814,7 +972,9 @@ enum Arithmetic {
 }
 
 #[derive(Clone, Copy)]
-enum Operand {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Operand {
     Register(u8),
     Immediate(u32),
     Shifted {
@@ -825,13 +985,17 @@ enum Operand {
 }
 
 #[derive(Clone, Copy)]
-enum ShiftAmount {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum ShiftAmount {
     Immediate(u32),
     Register(u8),
 }
 
 #[derive(Clone, Copy)]
-enum Op {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum Op {
     Nop,
     It {
         condition: u8,
@@ -984,10 +1148,36 @@ enum Op {
     Svc(u8),
 }
 
+impl Op {
+    /// Return a conditional/unconditional branch's target and condition.
+    #[doc(hidden)]
+    pub fn branch_info(self) -> Option<(u32, Option<u8>)> {
+        match self {
+            Self::Branch { target, condition } => Some((target, condition)),
+            _ => None,
+        }
+    }
+
+    /// Return a compare-and-branch's register, polarity, and target.
+    #[doc(hidden)]
+    pub fn compare_branch_info(self) -> Option<(u8, bool, u32)> {
+        match self {
+            Self::CompareBranch {
+                register,
+                nonzero,
+                target,
+            } => Some((register, nonzero, target)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
-struct Flag<W> {
-    wire: FlagWire<W>,
-    value: Option<bool>,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Flag<W> {
+    pub wire: FlagWire<W>,
+    pub value: Option<bool>,
 }
 
 /// A symbolic status bit which is lowered only when an instruction observes it.
@@ -996,7 +1186,9 @@ struct Flag<W> {
 /// reduction or a small Boolean circuit.  Keeping their inputs here means
 /// ordinary flag-setting data instructions retain their previous gate shape.
 #[derive(Clone)]
-enum FlagWire<W> {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum FlagWire<W> {
     Direct(W),
     Zero([W; 32]),
     AddOverflow {
@@ -1026,41 +1218,50 @@ impl<W: Clone> Flag<W> {
     }
 }
 
-const FLAG_N: usize = 0;
-const FLAG_Z: usize = 1;
-const FLAG_C: usize = 2;
-const FLAG_V: usize = 3;
-const FLAG_Q: usize = 4;
+#[doc(hidden)]
+pub const FLAG_N: usize = 0;
+#[doc(hidden)]
+pub const FLAG_Z: usize = 1;
+#[doc(hidden)]
+pub const FLAG_C: usize = 2;
+#[doc(hidden)]
+pub const FLAG_V: usize = 3;
+#[doc(hidden)]
+pub const FLAG_Q: usize = 4;
 
-struct Decoded {
-    operation: Op,
-    len: u32,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Decoded {
+    pub operation: Op,
+    pub len: u32,
 }
 
-struct Machine<'a, W, E> {
-    t: &'a mut (dyn Runtime<W, Error = E> + 'a),
-    mem: RawMemory<'a>,
-    rstack: &'a mut [u32],
-    storage_bits: usize,
-    pc: u32,
-    regs: &'a mut [[W; 32]; REG_COUNT],
-    constants: &'a mut [Option<u32>; REG_COUNT],
-    zero: W,
-    one: W,
-    sp: u32,
-    stack_top: u32,
-    rsp: usize,
-    offsets: [Option<i32>; REG_COUNT],
-    flags: [Flag<W>; 5],
-    itstate: u8,
-    security_state: SecurityState,
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub struct Machine<'a, W, E> {
+    pub t: &'a mut (dyn Runtime<W, Error = E> + 'a),
+    pub mem: RawMemory<'a>,
+    pub rstack: &'a mut [u32],
+    pub storage_bits: usize,
+    pub pc: u32,
+    pub regs: &'a mut [[W; 32]; REG_COUNT],
+    pub constants: &'a mut [Option<u32>; REG_COUNT],
+    pub zero: W,
+    pub one: W,
+    pub sp: u32,
+    pub stack_top: u32,
+    pub rsp: usize,
+    pub offsets: [Option<i32>; REG_COUNT],
+    pub flags: [Flag<W>; 5],
+    pub itstate: u8,
+    pub security_state: SecurityState,
     #[cfg(feature = "early-exit-loops")]
-    loop_sites: [Option<early_exit::RecognizedSite>; 8],
+    pub loop_sites: [Option<early_exit::RecognizedSite>; 8],
 }
 
 impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         t: &'a mut (dyn Runtime<W, Error = E> + 'a),
         mem: RawMemory<'a>,
         rstack: &'a mut [u32],
@@ -1098,29 +1299,38 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         machine
     }
 
+    /// Execute exactly one decoded instruction using the interpreter's normal
+    /// IT-state and predication rules. The returned flow does not mutate `pc`.
+    ///
+    /// This is the loop-adapter seam: an adapter can snapshot state, call this
+    /// method, and then decide whether a control-flow result is a boundary.
+    #[doc(hidden)]
+    pub fn execute_decoded(&mut self, decoded: Decoded) -> Result<Flow, ErtError<E>> {
+        let is_it = matches!(decoded.operation, Op::It { .. });
+        if is_it && self.itstate != 0 {
+            return Err(ErtError::Unexpected);
+        }
+        let flow = if is_it || self.itstate == 0 {
+            self.execute(decoded.operation, decoded.len)?
+        } else if let Some(execute) = self.condition_value((self.itstate >> 4) & 15)? {
+            if execute {
+                self.execute(decoded.operation, decoded.len)?
+            } else {
+                Flow::Next(self.pc.wrapping_add(decoded.len))
+            }
+        } else {
+            self.execute_symbolic_it(decoded.operation, decoded.len)?
+        };
+        if !is_it && self.itstate != 0 {
+            self.advance_it();
+        }
+        Ok(flow)
+    }
+
     fn run(mut self) -> Result<(), ErtError<E>> {
         loop {
             let decoded = self.decode()?;
-            let is_it = matches!(decoded.operation, Op::It { .. });
-            if is_it && self.itstate != 0 {
-                return Err(ErtError::Unexpected);
-            }
-            let flow = if is_it {
-                self.execute(decoded.operation, decoded.len)?
-            } else if self.itstate == 0 {
-                self.execute(decoded.operation, decoded.len)?
-            } else if let Some(execute) = self.condition_value((self.itstate >> 4) & 15)? {
-                if execute {
-                    self.execute(decoded.operation, decoded.len)?
-                } else {
-                    Flow::Next(self.pc.wrapping_add(decoded.len))
-                }
-            } else {
-                self.execute_symbolic_it(decoded.operation, decoded.len)?
-            };
-            if !is_it && self.itstate != 0 {
-                self.advance_it();
-            }
+            let flow = self.execute_decoded(decoded)?;
             match flow {
                 Flow::Next(next) => self.pc = next,
                 Flow::Exit => return Ok(()),
@@ -1128,7 +1338,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn decode(&self) -> Result<Decoded, ErtError<E>> {
+    pub fn decode(&self) -> Result<Decoded, ErtError<E>> {
         let first = u16::from_le_bytes(self.mem.read::<2>(self.pc).ok_or(ErtError::Unexpected)?);
         let wide = first & 0xe000 == 0xe000 && first & 0x1800 != 0;
         if wide {
@@ -1143,7 +1353,9 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
+    /// Return a concrete condition value when every required NZCV bit is
+    /// known; `None` means the condition is symbolic.
+    pub fn condition_value(&self, condition: u8) -> Result<Option<bool>, ErtError<E>> {
         let n = self.flags[FLAG_N].value;
         let z = self.flags[FLAG_Z].value;
         let c = self.flags[FLAG_C].value;
@@ -1151,7 +1363,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         arm_condition_value(n, z, c, v, condition).ok_or(ErtError::Unexpected)
     }
 
-    fn condition_wire(&mut self, condition: u8) -> Result<W, ErtError<E>> {
+    pub fn condition_wire(&mut self, condition: u8) -> Result<W, ErtError<E>> {
         let n = self.materialize_flag(FLAG_N)?;
         let z = self.materialize_flag(FLAG_Z)?;
         let c = self.materialize_flag(FLAG_C)?;
@@ -1161,7 +1373,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             .ok_or(ErtError::Unexpected)
     }
 
-    fn advance_it(&mut self) {
+    pub fn advance_it(&mut self) {
         if self.itstate & 7 == 0 {
             self.itstate = 0;
         } else {
@@ -1169,7 +1381,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn execute_symbolic_it(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+    pub fn execute_symbolic_it(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
         // A symbolic condition may only materialize a value. Multi-instruction
         // IT blocks and every non-register effect would otherwise require
         // symbolic control flow.
@@ -1229,7 +1441,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         self.next(len)
     }
 
-    fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
+    pub fn execute(&mut self, operation: Op, len: u32) -> Result<Flow, ErtError<E>> {
         if self.security_state == SecurityState::NonSecure
             && !matches!(operation, Op::SecureGateway)
             && self.t.security_attribute(self.pc) != SecurityAttribute::NonSecure
@@ -1323,7 +1535,12 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                     } else {
                         (
                             partial_bitwise_word(
-                                self.t, constant, symbolic, &self.zero, &self.one, kind,
+                                self.t,
+                                u64::from(constant),
+                                symbolic,
+                                &self.zero,
+                                &self.one,
+                                kind,
                             )
                             .map_err(ErtError::Emitted)?,
                             None,
@@ -1361,7 +1578,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         (
                             partial_bitwise_word(
                                 self.t,
-                                !right,
+                                u64::from(!right),
                                 &left_word,
                                 &self.zero,
                                 &self.one,
@@ -1376,8 +1593,14 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
                         (self.word_from_constant(0), Some(0))
                     } else {
                         (
-                            partial_and_not_word(self.t, left, &right_word, &self.zero, &self.one)
-                                .map_err(ErtError::Emitted)?,
+                            partial_and_not_word(
+                                self.t,
+                                u64::from(left),
+                                &right_word,
+                                &self.zero,
+                                &self.one,
+                            )
+                            .map_err(ErtError::Emitted)?,
                             None,
                         )
                     }
@@ -1533,13 +1756,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
             Op::ReadApsr { dest } => self.read_apsr(dest, len),
             Op::WriteApsr { source } => self.write_apsr(source, len),
             Op::Call { target } => self.call(target, len),
-            Op::CallRegister { register } => {
-                let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
-                if target & 1 == 0 {
-                    return Err(ErtError::Unexpected);
-                }
-                self.call(target & !1, len)
-            }
+            Op::CallRegister { register } => self.call_register(register, len),
             Op::BranchRegister { register } => self.branch_register(register),
             Op::SecureGateway => self.secure_gateway(len),
             Op::BranchExchangeNonSecure { register, link } => {
@@ -1573,7 +1790,7 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     fn word_from_constant(&self, value: u32) -> [W; 32] {
-        constant_word(&self.zero, &self.one, value)
+        constant_word(&self.zero, &self.one, u64::from(value))
     }
 
     fn write(&mut self, register: u8, word: [W; 32], value: Option<u32>) {
@@ -1732,7 +1949,10 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         }
     }
 
-    fn materialize_flag(&mut self, index: usize) -> Result<W, ErtError<E>> {
+    /// Materialize one lazy NZCVQ flag as a direct wire and retain it in the
+    /// machine state. This is the loop-adapter flag-folding seam.
+    #[doc(hidden)]
+    pub fn materialize_flag(&mut self, index: usize) -> Result<W, ErtError<E>> {
         let wire = self.materialize_wire(self.flags[index].wire.clone())?;
         self.flags[index].wire = FlagWire::Direct(wire.clone());
         Ok(wire)
@@ -2542,6 +2762,66 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
 
     fn call(&mut self, target: u32, len: u32) -> Result<Flow, ErtError<E>> {
         let return_pc = self.pc.wrapping_add(len);
+        let target = match self
+            .t
+            .call_hook(
+                ArmCallEvent::DirectCall {
+                    caller_pc: self.pc,
+                    target,
+                    return_pc,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => target,
+            ArmCallAction::ReturnNow => return self.next(len),
+            ArmCallAction::Divert(target) => target,
+        };
+        if target & 1 != 0 {
+            return Err(ErtError::Unexpected);
+        }
+        *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
+        self.rsp += 1;
+        self.write_constant(LR, return_pc | 1);
+        Ok(Flow::Next(target))
+    }
+
+    fn call_register(&mut self, register: u8, len: u32) -> Result<Flow, ErtError<E>> {
+        let return_pc = self.pc.wrapping_add(len);
+        let known_target = self.constants[register as usize];
+        let action = self
+            .t
+            .call_hook(
+                ArmCallEvent::RegisterCall {
+                    caller_pc: self.pc,
+                    register,
+                    target: known_target.map(|target| target & !1),
+                    return_pc,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?;
+        let target = match action {
+            ArmCallAction::Proceed => {
+                let target = known_target.ok_or(ErtError::Unexpected)?;
+                if target & 1 == 0 {
+                    return Err(ErtError::Unexpected);
+                }
+                target & !1
+            }
+            ArmCallAction::ReturnNow => return self.next(len),
+            ArmCallAction::Divert(target) if target & 1 == 0 => target,
+            ArmCallAction::Divert(_) => return Err(ErtError::Unexpected),
+        };
         *self.rstack.get_mut(self.rsp).ok_or(ErtError::Unexpected)? = return_pc;
         self.rsp += 1;
         self.write_constant(LR, return_pc | 1);
@@ -2560,8 +2840,33 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
     }
 
     fn return_from_call(&mut self) -> Result<Flow, ErtError<E>> {
-        self.rsp = self.rsp.checked_sub(1).ok_or(ErtError::Unexpected)?;
-        Ok(Flow::Next(self.rstack[self.rsp]))
+        let rsp = self.rsp.checked_sub(1).ok_or(ErtError::Unexpected)?;
+        let target = self.rstack[rsp];
+        match self
+            .t
+            .call_hook(
+                ArmCallEvent::Return {
+                    from_pc: self.pc,
+                    target,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => {
+                self.rsp = rsp;
+                Ok(Flow::Next(target))
+            }
+            ArmCallAction::Divert(target) if target & 1 == 0 => {
+                self.rsp = rsp;
+                Ok(Flow::Next(target))
+            }
+            ArmCallAction::Divert(_) | ArmCallAction::ReturnNow => Err(ErtError::Unexpected),
+        }
     }
 
     fn secure_gateway(&mut self, len: u32) -> Result<Flow, ErtError<E>> {
@@ -2585,7 +2890,30 @@ impl<'a, W: Clone, E: Error> Machine<'a, W, E> {
         if self.security_state == SecurityState::NonSecure {
             return Err(ErtError::Unexpected);
         }
-        let target = self.constants[register as usize].ok_or(ErtError::Unexpected)?;
+        let known_target = self.constants[register as usize];
+        let target = match self
+            .t
+            .call_hook(
+                ArmCallEvent::NonSecureBranch {
+                    caller_pc: self.pc,
+                    register,
+                    target: known_target,
+                    link,
+                    state_before: self.security_state,
+                },
+                &mut self.regs[..],
+                &mut self.constants[..],
+                &mut self.offsets[..],
+                &self.zero,
+                &self.one,
+            )
+            .map_err(ErtError::Emitted)?
+        {
+            ArmCallAction::Proceed => known_target.ok_or(ErtError::Unexpected)?,
+            ArmCallAction::Divert(target) => target,
+            ArmCallAction::ReturnNow if link => return self.next(len),
+            ArmCallAction::ReturnNow => return Err(ErtError::Unexpected),
+        };
         if target & 1 == 0 {
             self.security_state = SecurityState::NonSecure;
         }
@@ -2706,7 +3034,7 @@ fn multiply_word<W: Clone, E>(
         return Ok(constant_word(
             zero,
             one,
-            concrete_product(product, left, right),
+            u64::from(concrete_product(product, left, right)),
         ));
     }
     if left_constant == Some(0) || right_constant == Some(0) {

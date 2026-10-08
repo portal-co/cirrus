@@ -225,7 +225,7 @@ fn run_qemu(image: &Path) -> MeasuredQemuRun {
 
 fn run_host_image(image: &Path) {
     let elf = fs::read(image).expect("built RV32 ELF must be readable");
-    let mapping = mapped_image(&elf, &[".text.ert_workload", ".rodata.ert_workload"]);
+    let mapping = mapped_image(&elf, &[".text.ert_workload", ".rodata.ert_workload", ".rodata"]);
     let entry = symbol_address(&elf, "__ert_workload_entry");
     let memory = unsafe { RawMemory::new(mapping.as_ptr().wrapping_sub(BASE as usize), None) };
     let mut registers = [[false; 32]; 32];
@@ -350,25 +350,25 @@ fn section_name<'a>(image: &'a [u8], header: usize) -> &'a str {
     core::str::from_utf8(&bytes[..length]).expect("ELF section name is UTF-8")
 }
 
-fn selected_section(image: &[u8], wanted: &str) -> (usize, usize, usize) {
+fn selected_section(image: &[u8], wanted: &str) -> Option<(usize, usize, usize)> {
     let (_, _, count, _) = elf_header(image);
     for index in 0..count {
         let header = section_header(image, index);
         if section_name(image, header) == wanted {
-            return (
+            return Some((
                 elf_u32(image, header + 12),
                 elf_u32(image, header + 16),
                 elf_u32(image, header + 20),
-            );
+            ));
         }
     }
-    panic!("ELF image lacks required section {wanted}");
+    None
 }
 
 fn mapped_image(image: &[u8], names: &[&str]) -> Vec<u8> {
     let selected: Vec<_> = names
         .iter()
-        .map(|name| selected_section(image, name))
+        .filter_map(|name| selected_section(image, name))
         .collect();
     let base = BASE as usize;
     assert!(selected.iter().all(|(address, _, _)| *address >= base));
