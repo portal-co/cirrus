@@ -67,24 +67,37 @@ fn run(equation: ReferenceEquation, inputs: [bool; 3]) -> bool {
     let circuit = circuit();
     let p = ctx.parameters().plaintext_modulus;
     let delta = GlobalDelta::new(5, p).unwrap();
-    let prg = ReferencePrg::new(2);
+    let prg = ReferencePrg::new(1); // slot-0 discipline: one bit per seed (matches volar-side tests)
     let mut random = TestRandom(0x1234_5678_9abc_def0);
 
     // Offline setup + expansion stream.
-    let garbler =
-        offline_setup(&ctx, circuit.wires(), &prg, 1 << 10, 7, 2, &mut random, &mut ZeroNoise)
-            .unwrap();
-    let steps =
-        stream_expansion(&ctx, circuit.wires(), &prg, &garbler, &mut random, &mut ZeroNoise)
-            .unwrap();
+    let garbler = offline_setup(
+        &ctx,
+        circuit.wires(),
+        &prg,
+        1 << 10,
+        7,
+        2,
+        &mut random,
+        &mut ZeroNoise,
+    )
+    .unwrap();
+    let steps = stream_expansion(
+        &ctx,
+        circuit.wires(),
+        &prg,
+        &garbler,
+        &mut random,
+        &mut ZeroNoise,
+    )
+    .unwrap();
     let states: Vec<WireState> = steps.iter().map(|s| s.wire_state).collect();
     let evaluator_wires: Vec<_> = steps.iter().map(|s| s.eval.clone()).collect();
 
     // Garbler side: stream records into a sink.
     let mut sink = VecPusher(Vec::new());
     {
-        let mut backend =
-            BitGcGarbleBackend::new(&mut sink, &garbler, delta, equation, p);
+        let mut backend = BitGcGarbleBackend::new(&mut sink, &garbler, delta, equation, p);
         backend.garble_circuit(&circuit, &states).unwrap();
     }
     let records = sink.0;
@@ -125,7 +138,11 @@ fn small_variant_truth_table() {
     for bits in 0..8u8 {
         let inputs = [bits & 1 == 1, bits & 2 == 2, bits & 4 == 4];
         let expect = (inputs[0] & inputs[1]) ^ inputs[2];
-        assert_eq!(run(ReferenceEquation::SMALL, inputs), expect, "inputs {inputs:?}");
+        assert_eq!(
+            run(ReferenceEquation::SMALL, inputs),
+            expect,
+            "inputs {inputs:?}"
+        );
     }
 }
 
@@ -134,6 +151,10 @@ fn fast_variant_truth_table() {
     for bits in 0..8u8 {
         let inputs = [bits & 1 == 1, bits & 2 == 2, bits & 4 == 4];
         let expect = (inputs[0] & inputs[1]) ^ inputs[2];
-        assert_eq!(run(ReferenceEquation::FAST, inputs), expect, "inputs {inputs:?}");
+        assert_eq!(
+            run(ReferenceEquation::FAST, inputs),
+            expect,
+            "inputs {inputs:?}"
+        );
     }
 }

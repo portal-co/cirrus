@@ -33,7 +33,9 @@ use cirrus_core::{
     HasError, Pusher,
 };
 use volar_spec::bitgc::Variant;
-use volar_spec::bitgc::common::{Circuit, ExpandedGate, GateEquation, GlobalDelta, Stitch, WireState};
+use volar_spec::bitgc::common::{
+    Circuit, ExpandedGate, GateEquation, GlobalDelta, Stitch, WireState,
+};
 use volar_spec::bitgc::seed::{ExpansionStep, OfflineEvaluator, OfflineGarbler};
 use volar_spec::bitgc::swhe::{Ciphertext, Context as SwheContext, KeySwitchKeySet, SecretKey};
 
@@ -152,7 +154,8 @@ impl<'a, 'b, E: GateEquation> BitGcGarbleBackend<'a, 'b, E> {
                         }
                     };
                     if let Some(stitch) =
-                        self.equation.garble_xor(self.plaintext_modulus, &a, &b, &out)
+                        self.equation
+                            .garble_xor(self.plaintext_modulus, &a, &b, &out)
                     {
                         self.queue.push(stitch);
                     }
@@ -324,7 +327,11 @@ where
         let top = self.expanded.wires[0].ct_a0.level();
         let mut wires: Vec<Ciphertext> = Vec::with_capacity(circuit.wires());
         for label in input_labels {
-            wires.push(self.ctx.switch_to(label, top).map_err(|_| BitGcError::Crypto)?);
+            wires.push(
+                self.ctx
+                    .switch_to(label, top)
+                    .map_err(|_| BitGcError::Crypto)?,
+            );
         }
         for (index, gate) in circuit.gates.iter().enumerate() {
             let out_wire = circuit.inputs + index;
@@ -340,7 +347,15 @@ where
                 volar_spec::bitgc::common::Gate::And { .. } => {
                     let stitch = self.records.next().ok_or(BitGcError::Exhausted)?;
                     self.equation
-                        .eval_and(&self.ctx, la, lb, &expanded, &self.delta, &self.ksks, &stitch)
+                        .eval_and(
+                            &self.ctx,
+                            la,
+                            lb,
+                            &expanded,
+                            &self.delta,
+                            &self.ksks,
+                            &stitch,
+                        )
                         .map_err(|_| BitGcError::Crypto)?
                 }
                 volar_spec::bitgc::common::Gate::Xor { .. } => {
@@ -376,7 +391,10 @@ where
                 .ctx
                 .switch_to(&expanded.ct_a0, label.level())
                 .map_err(|_| BitGcError::Crypto)?;
-            let diff = self.ctx.sub(label, &ct_a0).map_err(|_| BitGcError::Crypto)?;
+            let diff = self
+                .ctx
+                .sub(label, &ct_a0)
+                .map_err(|_| BitGcError::Crypto)?;
             let payload = self
                 .ctx
                 .mul_plain(&diff, &self.ctx.constant_slots(inv_delta))
@@ -400,4 +418,3 @@ where
         Ok(outputs)
     }
 }
-
