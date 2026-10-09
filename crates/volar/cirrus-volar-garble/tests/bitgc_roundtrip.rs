@@ -3,7 +3,7 @@
 //!
 //! Correctness-only profile (small NTT-friendly parameters); no security
 //! claim. Mirrors the reference-adapter status in `volar_spec::bitgc`.
-#![cfg(test)]
+#![cfg(all(test, feature = "bitgc-reference"))]
 
 use cirrus_core::Pusher;
 use cirrus_volar_garble::bitgc::{BitGcEvalBackend, BitGcGarbleBackend};

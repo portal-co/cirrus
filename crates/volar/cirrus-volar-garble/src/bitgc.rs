@@ -4,9 +4,13 @@
 //! Mirrors [`crate::VolarGarbleBackend`]/[`crate::VolarEvalBackend`]'s
 //! streaming/pull shape (one record per charged gate, XOR free for the
 //! fast variant), but delegates the offline expansion and gate arithmetic
-//! to `volar_spec::bitgc`. This is the **server-class optional substitute**
-//! for the half-gate baseline: the ERT/MCU profiles reject it (see
-//! `docs/bitgc-variants-plan.md` §3 and the TinyLabels deployment split).
+//! to `volar_spec::bitgc`. This is an **in-process reference adapter**,
+//! available only with the explicit `bitgc-reference` feature. It uses
+//! reference equations and evaluator-side garbler secret material; it is
+//! not a secure session or a substitute for protected data.
+//!
+//! TODO(provider-ledger: BITGC-LEDGER-07): replace this adapter with the
+//! shared role-separated session protocol before enabling a production path.
 //!
 //! # Structure
 //!
@@ -17,11 +21,11 @@
 //! - Evaluator side: [`BitGcEvalBackend`] consumes ordered [`Stitch`]
 //!   records plus the online-level expanded material and evaluates.
 //!
-//! # Pinning status
+//! # Status
 //!
-//! The gate equations are the reference adapter behind `GateEquation`
-//! (BITGC-LEDGER-04). Do not use for protected data; see
-//! `volar_spec::bitgc`'s module docs.
+//! The equations and output opening are reference-only. `BitGcEvalBackend`
+//! takes the garbler's `SecretKey`; the explicit feature prevents accidental
+//! default use but does not make this adapter secure.
 
 extern crate alloc;
 

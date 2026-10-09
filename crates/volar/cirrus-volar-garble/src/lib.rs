@@ -29,6 +29,9 @@ use volar_spec::{
     vole::VoleArray,
 };
 
+/// Reference-only BitGC adapter. Requires the explicit `bitgc-reference`
+/// feature and is not safe for protected data.
+#[cfg(feature = "bitgc-reference")]
 pub mod bitgc;
 pub mod cut_and_choose;
 
