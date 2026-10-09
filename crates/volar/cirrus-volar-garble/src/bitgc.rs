@@ -161,6 +161,13 @@ impl<'a, 'b, E: GateEquation> BitGcGarbleBackend<'a, 'b, E> {
                     }
                     out
                 }
+                volar_spec::bitgc::common::Gate::Not { .. } => {
+                    // Free NOT: copy the label, flip π, no record.
+                    WireState {
+                        a0: a.a0,
+                        pi: !a.pi,
+                    }
+                }
             };
         }
         Ok(())
@@ -375,6 +382,10 @@ where
                             stitch.as_ref(),
                         )
                         .map_err(|_| BitGcError::Crypto)?
+                }
+                volar_spec::bitgc::common::Gate::Not { .. } => {
+                    // Free NOT: pass the label through, no record.
+                    la.clone()
                 }
             };
             wires.push(out);
