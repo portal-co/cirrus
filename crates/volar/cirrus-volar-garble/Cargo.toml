@@ -26,4 +26,4 @@ volar-lir-test-corpus = { version = "0.1.0", git = "https://github.com/portal-co
 default = []
 # In-process/reference BitGC adapter only. Not a secure session protocol.
 # TODO(provider-ledger: BITGC-LEDGER-07): remove after shared session lands.
-bitgc-reference = []
+bitgc-reference = ["volar-spec/bitgc-reference"]
