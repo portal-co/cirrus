@@ -593,6 +593,68 @@ mod tests {
     }
 
     #[test]
+    fn fragment_merge_rejects_duplicate_digest_and_overlapping_ranges() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 2);
+        manifest.epochs[0].iterations[1].correlation_range = OrdinalRange::new(6, 1);
+        let first =
+            VoleScheduleTicket::from_manifest(&manifest, [9; 32], EpochId(0), IterationId(0))
+                .unwrap();
+        let second =
+            VoleScheduleTicket::from_manifest(&manifest, [9; 32], EpochId(0), IterationId(1))
+                .unwrap();
+        assert!(matches!(
+            merge_hat_fragments(vec![
+                VoleScheduleHatFragment {
+                    ticket: first,
+                    hats: vec![10u8, 11],
+                },
+                VoleScheduleHatFragment {
+                    ticket: first,
+                    hats: vec![12, 13],
+                },
+            ]),
+            Err(VoleScheduleError::DuplicateIteration { .. })
+        ));
+
+        let wrong_digest = VoleScheduleTicket {
+            schedule_digest: [8; 32],
+            ..second
+        };
+        assert!(matches!(
+            merge_hat_fragments(vec![
+                VoleScheduleHatFragment {
+                    ticket: first,
+                    hats: vec![10u8, 11],
+                },
+                VoleScheduleHatFragment {
+                    ticket: wrong_digest,
+                    hats: vec![12],
+                },
+            ]),
+            Err(VoleScheduleError::ScheduleDigestMismatch)
+        ));
+
+        let overlapping = VoleScheduleTicket {
+            correlation_range: OrdinalRange::new(5, 1),
+            ..second
+        };
+        assert!(matches!(
+            merge_hat_fragments(vec![
+                VoleScheduleHatFragment {
+                    ticket: first,
+                    hats: vec![10u8, 11],
+                },
+                VoleScheduleHatFragment {
+                    ticket: overlapping,
+                    hats: vec![12],
+                },
+            ]),
+            Err(VoleScheduleError::CorrelationRangeOverlap { .. })
+        ));
+    }
+
+    #[test]
     fn hat_source_requires_complete_consumption() {
         let mut manifest = manifest();
         manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 2);
