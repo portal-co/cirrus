@@ -5,9 +5,10 @@ use std::{
     time::Duration,
 };
 
+use cirrus_core::ContextWithBitAnd;
 use cirrus_volar_vole::{
-    VoleScheduleCursor, VoleScheduleTicket, mlkem_ferret_prover_with_params,
-    mlkem_ferret_verifier_with_params,
+    VoleScheduleCursor, VoleScheduleHatSink, VoleScheduleHatSource, VoleScheduleTicket,
+    mlkem_ferret_prover_with_params, mlkem_ferret_verifier_with_params,
 };
 use miniot::{TryCryptoRng, TryRng};
 use sha3::{Digest, Sha3_256};
@@ -15,6 +16,7 @@ use volar_ir_common::{
     EpochId, IterationId, IterationManifest, OrdinalRange, ScheduleHasher, ScheduleLimits,
     ScheduleManifest, WorkerLane,
 };
+use volar_spec::field::Galois128;
 use volar_spec::ot::{
     ferret::{FERRET_REG_TOY, FerretParams},
     two_party::StackIo,
@@ -215,4 +217,114 @@ fn direct_mlkem_bootstrap_runs_separate_roles_through_ferret_refill() {
             volar_spec::field::Galois128(u128::from(*bit))
         );
     }
+}
+
+#[test]
+fn scheduled_mlkem_ferret_contexts_replay_one_and_gate() {
+    let setup_params = FerretParams {
+        n: 512,
+        k: 32,
+        t: 7,
+    };
+    let main_params = FERRET_REG_TOY;
+    let schedule = toy_schedule(1);
+    let schedule_digest = schedule
+        .digest_with(ScheduleLimits::default(), &Sha3ScheduleHasher)
+        .expect("toy schedule digest must be canonical");
+    let (prover_tx, verifier_rx) = sync_channel(1);
+    let (verifier_tx, prover_rx) = sync_channel(1);
+    let mut prover_io = MessageIo {
+        tx: prover_tx,
+        rx: prover_rx,
+    };
+    let mut verifier_io = MessageIo {
+        tx: verifier_tx,
+        rx: verifier_rx,
+    };
+    let (hat_tx, hat_rx) = sync_channel(1);
+
+    let prover_schedule = schedule.clone();
+    let prover = thread::spawn(move || {
+        let mut rng = TestRng(0x5052_4F56_4552);
+        let mut session =
+            mlkem_ferret_prover_with_params(&mut rng, setup_params, main_params, &mut prover_io)
+                .expect("prover direct ML-KEM/Ferret setup failed");
+        let left = session.commit_input(&mut rng, &mut prover_io, true);
+        let right = session.commit_input(&mut rng, &mut prover_io, true);
+        let mut cursor = VoleScheduleCursor::new(&prover_schedule, schedule_digest)
+            .expect("prover schedule must validate");
+        let ticket = VoleScheduleTicket::from_manifest(
+            &prover_schedule,
+            schedule_digest,
+            EpochId(0),
+            IterationId(0),
+        )
+        .expect("prover ticket must resolve");
+        cursor
+            .accept(ticket)
+            .expect("prover ticket must be canonical");
+        let sink = VoleScheduleHatSink::new(ticket).expect("prover hat sink");
+        let output = {
+            let mut context = sink.locked_prover_context(|bit| Galois128(u128::from(bit)));
+            context
+                .bitand(left, right)
+                .expect("prover AND must produce a VOLE share")
+        };
+        let fragment = sink.finish().expect("prover hat range must be complete");
+        hat_tx
+            .send(fragment.hats)
+            .expect("verifier still connected");
+        cursor.finish().expect("prover schedule must be complete");
+        output
+    });
+
+    let verifier_schedule = schedule;
+    let verifier = thread::spawn(move || {
+        let mut rng = TestRng(0x5645_5249_4649_4552);
+        let mut session = mlkem_ferret_verifier_with_params(
+            &mut rng,
+            setup_params,
+            main_params,
+            &mut verifier_io,
+        )
+        .expect("verifier direct ML-KEM/Ferret setup failed");
+        let left = session.commit_input(&mut rng, &mut verifier_io);
+        let right = session.commit_input(&mut rng, &mut verifier_io);
+        let hats = hat_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("prover hats");
+        let mut cursor = VoleScheduleCursor::new(&verifier_schedule, schedule_digest)
+            .expect("verifier schedule must validate");
+        let ticket = VoleScheduleTicket::from_manifest(
+            &verifier_schedule,
+            schedule_digest,
+            EpochId(0),
+            IterationId(0),
+        )
+        .expect("verifier ticket must resolve");
+        cursor
+            .accept(ticket)
+            .expect("verifier ticket must be canonical");
+        let source = VoleScheduleHatSource::new(ticket, hats).expect("verifier hat source");
+        let delta = session.delta().clone();
+        let output = {
+            let mut context = source.locked_verifier_context(delta);
+            context
+                .bitand(left, right)
+                .expect("verifier AND must consume the scheduled hat")
+        };
+        source
+            .finish()
+            .expect("verifier must consume the complete hat range");
+        cursor.finish().expect("verifier schedule must be complete");
+        (output, session.delta().delta[0])
+    });
+
+    let prover_output = prover.join().expect("prover thread panicked");
+    let (verifier_output, delta) = verifier.join().expect("verifier thread panicked");
+    assert_eq!(
+        verifier_output.q[0],
+        prover_output.v[0] + prover_output.u[0][0] * delta
+    );
+    assert_eq!(prover_output.u[0][0], Galois128(1));
 }
