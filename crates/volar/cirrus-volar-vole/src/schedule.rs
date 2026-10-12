@@ -78,6 +78,23 @@ impl VoleScheduleTicket {
         let digest = manifest.digest_with(limits, hasher)?;
         Self::from_manifest(manifest, digest, epoch, iteration)
     }
+
+    /// Verify that public ticket fields still match the canonical manifest.
+    ///
+    /// Ticket fields are public so they can cross an adapter boundary, but a
+    /// caller must not be able to relabel a ticket by changing its lane,
+    /// group, or reserved ranges after construction.
+    pub fn validate_against(&self, manifest: &ScheduleManifest) -> Result<(), VoleScheduleError> {
+        let expected =
+            Self::from_manifest(manifest, self.schedule_digest, self.epoch, self.iteration)?;
+        if expected != *self {
+            return Err(VoleScheduleError::TicketMismatch {
+                epoch: self.epoch,
+                iteration: self.iteration,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Fail-closed errors for ticket construction and replay.
@@ -101,6 +118,13 @@ pub enum VoleScheduleError {
         expected: IterationId,
         /// Ticket supplied by the caller.
         found: IterationId,
+    },
+    /// A ticket identity exists, but its public fields do not match the manifest.
+    TicketMismatch {
+        /// Epoch named by the malformed ticket.
+        epoch: EpochId,
+        /// Iteration named by the malformed ticket.
+        iteration: IterationId,
     },
     /// Replay ended before all manifest items were consumed.
     Incomplete {
@@ -155,6 +179,10 @@ impl fmt::Display for VoleScheduleError {
             Self::OutOfOrder { expected, found } => write!(
                 f,
                 "VOLE schedule replay expected {expected:?}, found {found:?}"
+            ),
+            Self::TicketMismatch { epoch, iteration } => write!(
+                f,
+                "VOLE schedule ticket {epoch:?}/{iteration:?} does not match its manifest"
             ),
             Self::Incomplete { expected } => {
                 write!(f, "VOLE schedule replay ended before {expected:?}")
@@ -326,6 +354,26 @@ pub fn merge_hat_fragments<H>(
         output.extend(fragment.hats);
     }
     Ok(output)
+}
+
+/// Validate ticket labels against a manifest before merging worker buffers.
+///
+/// [`merge_hat_fragments`] checks the internal consistency of a fragment set;
+/// this entry point additionally prevents a caller from mutating a public
+/// ticket's lane, group, or reserved ranges while retaining the same digest.
+pub fn merge_hat_fragments_for_manifest<H>(
+    manifest: &ScheduleManifest,
+    schedule_digest: [u8; 32],
+    fragments: Vec<VoleScheduleHatFragment<H>>,
+) -> Result<Vec<H>, VoleScheduleError> {
+    manifest.validate(ScheduleLimits::default())?;
+    for fragment in &fragments {
+        if fragment.ticket.schedule_digest != schedule_digest {
+            return Err(VoleScheduleError::ScheduleDigestMismatch);
+        }
+        fragment.ticket.validate_against(manifest)?;
+    }
+    merge_hat_fragments(fragments)
 }
 
 impl<H> cirrus_core::Pusher<H> for VoleScheduleHatSink<H> {
@@ -652,6 +700,46 @@ mod tests {
             ]),
             Err(VoleScheduleError::CorrelationRangeOverlap { .. })
         ));
+    }
+
+    #[test]
+    fn checked_merge_rejects_relabelled_ticket() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 1);
+        let digest = [9; 32];
+        let ticket =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
+                .unwrap();
+        let relabelled = VoleScheduleTicket {
+            worker_lane: WorkerLane(99),
+            ..ticket
+        };
+        assert!(matches!(
+            merge_hat_fragments_for_manifest(
+                &manifest,
+                digest,
+                vec![VoleScheduleHatFragment {
+                    ticket: relabelled,
+                    hats: vec![10u8],
+                }]
+            ),
+            Err(VoleScheduleError::TicketMismatch {
+                epoch: EpochId(0),
+                iteration: IterationId(0),
+            })
+        ));
+        assert_eq!(
+            merge_hat_fragments_for_manifest(
+                &manifest,
+                digest,
+                vec![VoleScheduleHatFragment {
+                    ticket,
+                    hats: vec![10u8],
+                }]
+            )
+            .unwrap(),
+            vec![10]
+        );
     }
 
     #[test]
