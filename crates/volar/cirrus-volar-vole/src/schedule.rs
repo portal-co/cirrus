@@ -595,9 +595,14 @@ impl VoleScheduleCursor {
         Ok(Self { tickets, next: 0 })
     }
 
+    /// Return the next canonical ticket required by this cursor.
+    pub fn next_ticket(&self) -> Option<VoleScheduleTicket> {
+        self.tickets.get(self.next).copied()
+    }
+
     /// Accept exactly the next canonical ticket.
     pub fn accept(&mut self, ticket: VoleScheduleTicket) -> Result<(), VoleScheduleError> {
-        let Some(expected) = self.tickets.get(self.next).copied() else {
+        let Some(expected) = self.next_ticket() else {
             return Err(VoleScheduleError::Complete);
         };
         if expected != ticket {
@@ -669,6 +674,10 @@ mod tests {
         let manifest = manifest();
         let digest = [9; 32];
         let mut cursor = VoleScheduleCursor::new(&manifest, digest).unwrap();
+        let first =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
+                .unwrap();
+        assert_eq!(cursor.next_ticket(), Some(first));
         let second =
             VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(1))
                 .unwrap();
@@ -676,13 +685,12 @@ mod tests {
             cursor.accept(second),
             Err(VoleScheduleError::OutOfOrder { .. })
         ));
-        let first =
-            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
-                .unwrap();
         cursor.accept(first).unwrap();
+        assert_eq!(cursor.next_ticket(), Some(second));
         cursor.accept(second).unwrap();
         assert!(cursor.finish().is_ok());
         assert!(cursor.is_complete());
+        assert_eq!(cursor.next_ticket(), None);
     }
 
     #[test]
