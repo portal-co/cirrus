@@ -10,12 +10,14 @@ use alloc::{collections::BTreeSet, vec::Vec};
 use core::fmt;
 
 use cirrus_core::PusherByRef;
+use hybrid_array::{Array, ArraySize};
 use volar_ir_common::{
     CommunicationGroup, EpochId, IterationId, ManifestError, OrdinalRange, ScheduleHasher,
     ScheduleLimits, ScheduleManifest, StorageId, TypeId, WorkerLane,
 };
 
 use crate::locked::PullerByRef;
+use volar_spec::vole::{Delta, VoleArray};
 
 /// One manifest-bound VOLE work item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -704,6 +706,50 @@ impl<H: Clone> PullerByRef<H> for VoleScheduleHatSource<H> {
     }
 }
 
+impl<H: Clone> Iterator for VoleScheduleHatSource<H> {
+    type Item = H;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.try_next_by_ref().ok()
+    }
+}
+
+/// Bind one ticket's prover hat sink directly to the existing Cirrus VOLE
+/// context. The sink still enforces the ticket's reserved correlation count;
+/// callers must call [`VoleScheduleHatSink::finish`] after the circuit run.
+impl<N: VoleArray<T>, T> VoleScheduleHatSink<Array<T, N>> {
+    /// Create a prover context whose AND hats are recorded in this ticket sink.
+    pub fn prover_context<'a>(
+        &'a mut self,
+        bit_to_t: fn(bool) -> T,
+    ) -> crate::VoleProverContext<'a, 'a, N, T> {
+        crate::VoleProverContext {
+            hats: self,
+            bit_to_t,
+        }
+    }
+}
+
+/// Bind one ticket's verifier hat source directly to the existing Cirrus VOLE
+/// context. The returned context owns the source iterator; after execution,
+/// move out `context.hats` and call [`VoleScheduleHatSource::finish`] to
+/// enforce complete consumption.
+impl<N: ArraySize, T: Clone> VoleScheduleHatSource<Array<T, N>> {
+    /// Create a verifier context that consumes this ticket's hats in order.
+    pub fn verifier_context<H>(
+        self,
+        delta: Delta<N, T>,
+        hook: H,
+    ) -> crate::VoleVerifierContext<N, T, Self, H> {
+        crate::VoleVerifierContext {
+            delta,
+            hats: self,
+            hook,
+            gate_index: 0,
+        }
+    }
+}
+
 /// Canonical verifier-side replay cursor.
 #[derive(Clone, Debug)]
 pub struct VoleScheduleCursor {
@@ -1091,6 +1137,34 @@ mod tests {
             source.finish(),
             Err(VoleScheduleError::CorrelationOverConsumed { expected: 2, .. })
         ));
+    }
+
+    #[test]
+    fn ticket_hat_buffers_wire_into_role_contexts() {
+        use cipher::consts::U1;
+        use volar_spec::{field::Galois128, vole::Delta};
+
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(0, 2);
+        let ticket =
+            VoleScheduleTicket::from_manifest(&manifest, [9; 32], EpochId(0), IterationId(0))
+                .unwrap();
+        let mut sink = VoleScheduleHatSink::new(ticket).unwrap();
+        let _prover = sink.prover_context(|bit| Galois128(u128::from(bit)));
+        drop(_prover);
+        sink.push_by_ref(Array::from_fn(|_| Galois128(1)));
+        sink.push_by_ref(Array::from_fn(|_| Galois128(2)));
+        let fragment = sink.finish().unwrap();
+
+        let source = VoleScheduleHatSource::new(ticket, fragment.hats).unwrap();
+        let delta = Delta {
+            delta: Array::<Galois128, U1>::from_fn(|_| Galois128(3)),
+        };
+        let context = source.verifier_context(delta, crate::NoopVoleVerifierHook);
+        let mut source = context.hats;
+        assert!(source.next().is_some());
+        assert!(source.next().is_some());
+        assert!(source.finish().is_ok());
     }
 
     #[test]
