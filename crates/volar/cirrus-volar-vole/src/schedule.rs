@@ -12,7 +12,7 @@ use core::fmt;
 use cirrus_core::PusherByRef;
 use volar_ir_common::{
     CommunicationGroup, EpochId, IterationId, ManifestError, OrdinalRange, ScheduleHasher,
-    ScheduleLimits, ScheduleManifest, WorkerLane,
+    ScheduleLimits, ScheduleManifest, StorageId, TypeId, WorkerLane,
 };
 
 use crate::locked::PullerByRef;
@@ -204,6 +204,15 @@ pub enum VoleScheduleError {
         /// Number of hats reserved by the manifest.
         expected: u64,
     },
+    /// A trace fragment did not preserve strictly increasing logical time.
+    TraceOrderMismatch {
+        /// Iteration whose trace was malformed.
+        iteration: IterationId,
+        /// Previous logical-time ordinal.
+        previous: u64,
+        /// Current logical-time ordinal.
+        found: u64,
+    },
 }
 
 impl fmt::Display for VoleScheduleError {
@@ -259,6 +268,14 @@ impl fmt::Display for VoleScheduleError {
                 f,
                 "VOLE iteration {iteration:?} consumed more than its {expected} reserved hats"
             ),
+            Self::TraceOrderMismatch {
+                iteration,
+                previous,
+                found,
+            } => write!(
+                f,
+                "VOLE iteration {iteration:?} trace time {found} follows {previous}"
+            ),
         }
     }
 }
@@ -299,6 +316,138 @@ pub struct VoleScheduleHatFragment<H> {
     pub ticket: VoleScheduleTicket,
     /// Hats emitted by the worker in intra-iteration order.
     pub hats: Vec<H>,
+}
+
+/// Kind of authenticated storage operation in a schedule-bound trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoleScheduleStorageAccessKind {
+    /// Read the authenticated value at an address.
+    Read,
+    /// Write an authenticated value at an address.
+    Write,
+}
+
+/// One schedule-bound storage trace entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoleScheduleStorageAccess {
+    /// Epoch containing the logical operation.
+    pub epoch: EpochId,
+    /// Iteration containing the logical operation.
+    pub iteration: IterationId,
+    /// Strictly increasing logical time within the iteration.
+    pub logical_time: u64,
+    /// Typed storage namespace.
+    pub storage: StorageId,
+    /// Typed lane within the namespace.
+    pub type_id: TypeId,
+    /// Public address identity supplied by the storage adapter.
+    pub address: u64,
+    /// Operation kind.
+    pub kind: VoleScheduleStorageAccessKind,
+}
+
+/// Completed, ticket-bound storage trace emitted by one VOLE worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoleScheduleTraceFragment {
+    /// Manifest ticket governing the entries.
+    pub ticket: VoleScheduleTicket,
+    /// Entries in logical execution order, never host completion order.
+    pub entries: Vec<VoleScheduleStorageAccess>,
+}
+
+impl VoleScheduleTraceFragment {
+    /// Bind a worker trace to a ticket and validate its logical order.
+    pub fn new(
+        ticket: VoleScheduleTicket,
+        entries: Vec<VoleScheduleStorageAccess>,
+    ) -> Result<Self, VoleScheduleError> {
+        validate_trace_entries(ticket, &entries)?;
+        Ok(Self { ticket, entries })
+    }
+}
+
+fn validate_trace_entries(
+    ticket: VoleScheduleTicket,
+    entries: &[VoleScheduleStorageAccess],
+) -> Result<(), VoleScheduleError> {
+    let mut previous = None;
+    for entry in entries {
+        if entry.epoch != ticket.epoch || entry.iteration != ticket.iteration {
+            return Err(VoleScheduleError::TicketMismatch {
+                epoch: ticket.epoch,
+                iteration: ticket.iteration,
+            });
+        }
+        if let Some(previous) = previous
+            && entry.logical_time <= previous
+        {
+            return Err(VoleScheduleError::TraceOrderMismatch {
+                iteration: ticket.iteration,
+                previous,
+                found: entry.logical_time,
+            });
+        }
+        previous = Some(entry.logical_time);
+    }
+    Ok(())
+}
+
+/// Merge completed storage traces by manifest ordinal.
+///
+/// The returned entries carry structured logical time and typed storage
+/// identity. The merge rejects wrong-digest, relabelled, duplicate, missing,
+/// and locally out-of-order fragments before exposing a trace to a verifier.
+pub fn merge_trace_fragments_for_manifest(
+    manifest: &ScheduleManifest,
+    schedule_digest: [u8; 32],
+    fragments: Vec<VoleScheduleTraceFragment>,
+) -> Result<Vec<VoleScheduleStorageAccess>, VoleScheduleError> {
+    merge_trace_fragments_for_manifest_with_limits(
+        manifest,
+        ScheduleLimits::default(),
+        schedule_digest,
+        fragments,
+    )
+}
+
+/// Merge storage traces with explicit manifest resource limits.
+pub fn merge_trace_fragments_for_manifest_with_limits(
+    manifest: &ScheduleManifest,
+    limits: ScheduleLimits,
+    schedule_digest: [u8; 32],
+    mut fragments: Vec<VoleScheduleTraceFragment>,
+) -> Result<Vec<VoleScheduleStorageAccess>, VoleScheduleError> {
+    manifest.validate(limits)?;
+    let mut seen = BTreeSet::new();
+    for fragment in &fragments {
+        if fragment.ticket.schedule_digest != schedule_digest {
+            return Err(VoleScheduleError::ScheduleDigestMismatch);
+        }
+        fragment
+            .ticket
+            .validate_against_with_limits(manifest, limits)?;
+        validate_trace_entries(fragment.ticket, &fragment.entries)?;
+        if !seen.insert((fragment.ticket.epoch, fragment.ticket.iteration)) {
+            return Err(VoleScheduleError::DuplicateIteration {
+                iteration: fragment.ticket.iteration,
+            });
+        }
+    }
+    for epoch in &manifest.epochs {
+        for iteration in &epoch.iterations {
+            if !seen.contains(&(epoch.ordinal, iteration.ordinal)) {
+                return Err(VoleScheduleError::Incomplete {
+                    expected: iteration.ordinal,
+                });
+            }
+        }
+    }
+    fragments.sort_unstable_by_key(|fragment| (fragment.ticket.epoch, fragment.ticket.iteration));
+    let mut output = Vec::new();
+    for fragment in fragments {
+        output.extend(fragment.entries);
+    }
+    Ok(output)
 }
 
 /// Thread-safe per-iteration hat buffer.
@@ -941,6 +1090,74 @@ mod tests {
         assert!(matches!(
             source.finish(),
             Err(VoleScheduleError::CorrelationOverConsumed { expected: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn trace_fragments_merge_by_ticket_and_preserve_typed_time() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations.truncate(2);
+        let digest = [9; 32];
+        let first =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
+                .unwrap();
+        let second =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(1))
+                .unwrap();
+        let first_entry = VoleScheduleStorageAccess {
+            epoch: EpochId(0),
+            iteration: IterationId(0),
+            logical_time: 3,
+            storage: StorageId(4),
+            type_id: TypeId(7),
+            address: 11,
+            kind: VoleScheduleStorageAccessKind::Read,
+        };
+        let second_entry = VoleScheduleStorageAccess {
+            epoch: EpochId(0),
+            iteration: IterationId(1),
+            logical_time: 1,
+            storage: StorageId(4),
+            type_id: TypeId(8),
+            address: 12,
+            kind: VoleScheduleStorageAccessKind::Write,
+        };
+        let merged = merge_trace_fragments_for_manifest(
+            &manifest,
+            digest,
+            vec![
+                VoleScheduleTraceFragment::new(second, vec![second_entry]).unwrap(),
+                VoleScheduleTraceFragment::new(first, vec![first_entry]).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged, vec![first_entry, second_entry]);
+    }
+
+    #[test]
+    fn trace_fragment_rejects_noncanonical_time_and_missing_iteration() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations.truncate(1);
+        let digest = [9; 32];
+        let ticket =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
+                .unwrap();
+        let entry = |logical_time| VoleScheduleStorageAccess {
+            epoch: EpochId(0),
+            iteration: IterationId(0),
+            logical_time,
+            storage: StorageId(1),
+            type_id: TypeId(2),
+            address: 0,
+            kind: VoleScheduleStorageAccessKind::Read,
+        };
+        assert!(matches!(
+            VoleScheduleTraceFragment::new(ticket, vec![entry(2), entry(2)]),
+            Err(VoleScheduleError::TraceOrderMismatch { .. })
+        ));
+        assert!(matches!(
+            merge_trace_fragments_for_manifest(&manifest, [8; 32], vec![]),
+            Err(VoleScheduleError::Incomplete { .. })
         ));
     }
 }
