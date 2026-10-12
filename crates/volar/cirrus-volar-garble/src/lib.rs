@@ -33,6 +33,11 @@ use volar_spec::{
 /// feature and is not safe for protected data.
 #[cfg(feature = "bitgc-reference")]
 pub mod bitgc;
+/// Explicit preview adapter over the shared Volar BitGC session protocol.
+/// It is not protected-session admission or a replacement for the legacy
+/// reference backend.
+#[cfg(feature = "bitgc-session")]
+pub mod session;
 pub mod cut_and_choose;
 
 /// The garbler-side context: streams one [`GarbleTable`] per AND gate to

@@ -1,0 +1,8 @@
+# The optional bitgc-session adapter consumes the isolated shared session
+# branch. Keep this narrow local override out of the normal Cirrus feature
+# paths; the parent portal workspace config otherwise selects Volar main.
+[patch."https://github.com/portal-co/volar.git"]
+volar-spec = { path = "../volar-bitgc-session/crates/spec/volar-spec" }
+volar-common = { path = "../volar-bitgc-session/crates/spec/volar-common" }
+volar-primitives = { path = "../volar-bitgc-session/crates/spec/volar-primitives" }
+volar-mpc = { path = "../volar-bitgc-session/crates/mpc/volar-mpc" }

@@ -11,6 +11,9 @@ volar-oram.workspace = true
 digest.workspace = true
 hybrid-array.workspace = true
 cipher.workspace = true
+# Shared BitGC session framing/transport adapter. Explicitly opt-in; it does
+# not enable the legacy reference backend or protected-session admission.
+volar-mpc = { path = "../../../../volar-bitgc-session/crates/mpc/volar-mpc", default-features = false, optional = true }
 
 [dev-dependencies]
 cirrus-recompile-core = { version = "0.1.0", path = "../../recompile/cirrus-recompile-core" }
@@ -27,3 +30,6 @@ default = []
 # In-process/reference BitGC adapter only. Not a secure session protocol.
 # TODO(provider-ledger: BITGC-LEDGER-07): remove after shared session lands.
 bitgc-reference = ["volar-spec/bitgc-reference"]
+# Thin Cirrus transport adapter over volar_mpc::bitgc_session. Correctness and
+# bounded-channel integration only; no security/deployment claim.
+bitgc-session = ["dep:volar-mpc"]
