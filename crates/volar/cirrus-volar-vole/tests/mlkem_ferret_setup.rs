@@ -249,8 +249,6 @@ fn scheduled_mlkem_ferret_contexts_replay_one_and_gate() {
         let mut session =
             mlkem_ferret_prover_with_params(&mut rng, setup_params, main_params, &mut prover_io)
                 .expect("prover direct ML-KEM/Ferret setup failed");
-        let left = session.commit_input(&mut rng, &mut prover_io, true);
-        let right = session.commit_input(&mut rng, &mut prover_io, true);
         let mut cursor = VoleScheduleCursor::new(&prover_schedule, schedule_digest)
             .expect("prover schedule must validate");
         let ticket = VoleScheduleTicket::from_manifest(
@@ -264,6 +262,10 @@ fn scheduled_mlkem_ferret_contexts_replay_one_and_gate() {
             .accept(ticket)
             .expect("prover ticket must be canonical");
         let sink = VoleScheduleHatSink::new(ticket).expect("prover hat sink");
+        // The schedule ticket covers input COT consumption as well as the
+        // context's AND-hat stream; no protocol work may precede admission.
+        let left = session.commit_input(&mut rng, &mut prover_io, true);
+        let right = session.commit_input(&mut rng, &mut prover_io, true);
         let output = {
             let mut context = sink.locked_prover_context(|bit| Galois128(u128::from(bit)));
             context
@@ -288,11 +290,6 @@ fn scheduled_mlkem_ferret_contexts_replay_one_and_gate() {
             &mut verifier_io,
         )
         .expect("verifier direct ML-KEM/Ferret setup failed");
-        let left = session.commit_input(&mut rng, &mut verifier_io);
-        let right = session.commit_input(&mut rng, &mut verifier_io);
-        let hats = hat_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("prover hats");
         let mut cursor = VoleScheduleCursor::new(&verifier_schedule, schedule_digest)
             .expect("verifier schedule must validate");
         let ticket = VoleScheduleTicket::from_manifest(
@@ -305,6 +302,12 @@ fn scheduled_mlkem_ferret_contexts_replay_one_and_gate() {
         cursor
             .accept(ticket)
             .expect("verifier ticket must be canonical");
+        // Match the prover's ticket admission before consuming input COTs.
+        let left = session.commit_input(&mut rng, &mut verifier_io);
+        let right = session.commit_input(&mut rng, &mut verifier_io);
+        let hats = hat_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("prover hats");
         let source = VoleScheduleHatSource::new(ticket, hats).expect("verifier hat source");
         let delta = session.delta().clone();
         let output = {
