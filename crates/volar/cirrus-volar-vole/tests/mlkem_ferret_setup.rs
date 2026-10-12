@@ -10,8 +10,10 @@ use cirrus_volar_vole::{
     mlkem_ferret_verifier_with_params,
 };
 use miniot::{TryCryptoRng, TryRng};
+use sha3::{Digest, Sha3_256};
 use volar_ir_common::{
-    EpochId, IterationId, IterationManifest, OrdinalRange, ScheduleManifest, WorkerLane,
+    EpochId, IterationId, IterationManifest, OrdinalRange, ScheduleHasher, ScheduleLimits,
+    ScheduleManifest, WorkerLane,
 };
 use volar_spec::ot::{
     ferret::{FERRET_REG_TOY, FerretParams},
@@ -46,6 +48,14 @@ impl TryRng for TestRng {
 }
 
 impl TryCryptoRng for TestRng {}
+
+struct Sha3ScheduleHasher;
+
+impl ScheduleHasher for Sha3ScheduleHasher {
+    fn digest(&self, bytes: &[u8]) -> [u8; 32] {
+        Sha3_256::digest(bytes).into()
+    }
+}
 
 struct MessageIo {
     tx: SyncSender<(u8, Vec<u8>)>,
@@ -99,7 +109,9 @@ fn direct_mlkem_bootstrap_runs_separate_roles_through_ferret_refill() {
     let main_params = FERRET_REG_TOY;
     let commit_count = setup_params.n - main_params.seed_cot_count(false) + 1;
     let schedule = toy_schedule(commit_count);
-    let schedule_digest = [9; 32];
+    let schedule_digest = schedule
+        .digest_with(ScheduleLimits::default(), &Sha3ScheduleHasher)
+        .expect("toy schedule digest must be canonical");
     let (prover_tx, verifier_rx) = sync_channel(1);
     let (verifier_tx, prover_rx) = sync_channel(1);
     let mut prover_io = MessageIo {
