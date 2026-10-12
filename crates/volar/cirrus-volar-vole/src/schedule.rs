@@ -45,7 +45,24 @@ impl VoleScheduleTicket {
         epoch: EpochId,
         iteration: IterationId,
     ) -> Result<Self, VoleScheduleError> {
-        manifest.validate(ScheduleLimits::default())?;
+        Self::from_manifest_with_limits(
+            manifest,
+            ScheduleLimits::default(),
+            schedule_digest,
+            epoch,
+            iteration,
+        )
+    }
+
+    /// Resolve a ticket with explicit validation limits and digest.
+    pub fn from_manifest_with_limits(
+        manifest: &ScheduleManifest,
+        limits: ScheduleLimits,
+        schedule_digest: [u8; 32],
+        epoch: EpochId,
+        iteration: IterationId,
+    ) -> Result<Self, VoleScheduleError> {
+        manifest.validate(limits)?;
         let epoch_manifest = manifest
             .epochs
             .iter()
@@ -76,7 +93,7 @@ impl VoleScheduleTicket {
         iteration: IterationId,
     ) -> Result<Self, VoleScheduleError> {
         let digest = manifest.digest_with(limits, hasher)?;
-        Self::from_manifest(manifest, digest, epoch, iteration)
+        Self::from_manifest_with_limits(manifest, limits, digest, epoch, iteration)
     }
 
     /// Verify that public ticket fields still match the canonical manifest.
@@ -85,8 +102,22 @@ impl VoleScheduleTicket {
     /// caller must not be able to relabel a ticket by changing its lane,
     /// group, or reserved ranges after construction.
     pub fn validate_against(&self, manifest: &ScheduleManifest) -> Result<(), VoleScheduleError> {
-        let expected =
-            Self::from_manifest(manifest, self.schedule_digest, self.epoch, self.iteration)?;
+        self.validate_against_with_limits(manifest, ScheduleLimits::default())
+    }
+
+    /// Verify a ticket against a manifest using explicit resource limits.
+    pub fn validate_against_with_limits(
+        &self,
+        manifest: &ScheduleManifest,
+        limits: ScheduleLimits,
+    ) -> Result<(), VoleScheduleError> {
+        let expected = Self::from_manifest_with_limits(
+            manifest,
+            limits,
+            self.schedule_digest,
+            self.epoch,
+            self.iteration,
+        )?;
         if expected != *self {
             return Err(VoleScheduleError::TicketMismatch {
                 epoch: self.epoch,
@@ -366,12 +397,29 @@ pub fn merge_hat_fragments_for_manifest<H>(
     schedule_digest: [u8; 32],
     fragments: Vec<VoleScheduleHatFragment<H>>,
 ) -> Result<Vec<H>, VoleScheduleError> {
-    manifest.validate(ScheduleLimits::default())?;
+    merge_hat_fragments_for_manifest_with_limits(
+        manifest,
+        ScheduleLimits::default(),
+        schedule_digest,
+        fragments,
+    )
+}
+
+/// Validate and merge worker buffers with explicit manifest resource limits.
+pub fn merge_hat_fragments_for_manifest_with_limits<H>(
+    manifest: &ScheduleManifest,
+    limits: ScheduleLimits,
+    schedule_digest: [u8; 32],
+    fragments: Vec<VoleScheduleHatFragment<H>>,
+) -> Result<Vec<H>, VoleScheduleError> {
+    manifest.validate(limits)?;
     for fragment in &fragments {
         if fragment.ticket.schedule_digest != schedule_digest {
             return Err(VoleScheduleError::ScheduleDigestMismatch);
         }
-        fragment.ticket.validate_against(manifest)?;
+        fragment
+            .ticket
+            .validate_against_with_limits(manifest, limits)?;
     }
     merge_hat_fragments(fragments)
 }
@@ -463,7 +511,16 @@ impl VoleScheduleCursor {
         manifest: &ScheduleManifest,
         schedule_digest: [u8; 32],
     ) -> Result<Self, VoleScheduleError> {
-        manifest.validate(ScheduleLimits::default())?;
+        Self::new_with_limits(manifest, ScheduleLimits::default(), schedule_digest)
+    }
+
+    /// Construct a cursor with explicit manifest resource limits.
+    pub fn new_with_limits(
+        manifest: &ScheduleManifest,
+        limits: ScheduleLimits,
+        schedule_digest: [u8; 32],
+    ) -> Result<Self, VoleScheduleError> {
+        manifest.validate(limits)?;
         let mut tickets = Vec::new();
         for epoch in &manifest.epochs {
             for iteration in &epoch.iterations {
@@ -699,6 +756,33 @@ mod tests {
                 },
             ]),
             Err(VoleScheduleError::CorrelationRangeOverlap { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_limits_apply_to_ticket_cursor_and_merge() {
+        let manifest = manifest();
+        let limits = ScheduleLimits {
+            max_iterations: 1,
+            ..ScheduleLimits::default()
+        };
+        assert!(matches!(
+            VoleScheduleTicket::from_manifest_with_limits(
+                &manifest,
+                limits,
+                [9; 32],
+                EpochId(0),
+                IterationId(0),
+            ),
+            Err(VoleScheduleError::Manifest(
+                ManifestError::TooManyIterations { .. }
+            ))
+        ));
+        assert!(matches!(
+            VoleScheduleCursor::new_with_limits(&manifest, limits, [9; 32]),
+            Err(VoleScheduleError::Manifest(
+                ManifestError::TooManyIterations { .. }
+            ))
         ));
     }
 

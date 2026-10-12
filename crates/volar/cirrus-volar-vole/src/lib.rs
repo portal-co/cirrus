@@ -67,7 +67,7 @@ pub use mode_b_relation::{
 pub use schedule::{
     VoleScheduleCursor, VoleScheduleError, VoleScheduleHatFragment, VoleScheduleHatSink,
     VoleScheduleHatSource, VoleScheduleTicket, merge_hat_fragments,
-    merge_hat_fragments_for_manifest,
+    merge_hat_fragments_for_manifest, merge_hat_fragments_for_manifest_with_limits,
 };
 #[cfg(feature = "spartan-whir-adapter")]
 pub use spartan_whir_adapter::{
