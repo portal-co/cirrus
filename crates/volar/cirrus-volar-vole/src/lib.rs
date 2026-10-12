@@ -65,8 +65,8 @@ pub use mode_b_relation::{
     UnifiedR1cs, UnifiedR1csWitness, schedule_boolar_constraints,
 };
 pub use schedule::{
-    VoleScheduleCursor, VoleScheduleError, VoleScheduleHatSink, VoleScheduleHatSource,
-    VoleScheduleTicket,
+    VoleScheduleCursor, VoleScheduleError, VoleScheduleHatFragment, VoleScheduleHatSink,
+    VoleScheduleHatSource, VoleScheduleTicket, merge_hat_fragments,
 };
 #[cfg(feature = "spartan-whir-adapter")]
 pub use spartan_whir_adapter::{

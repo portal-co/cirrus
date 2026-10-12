@@ -109,6 +109,18 @@ pub enum VoleScheduleError {
     },
     /// A replay cursor was used after completion.
     Complete,
+    /// Two fragments were supplied for one logical iteration.
+    DuplicateIteration {
+        /// Repeated iteration identity.
+        iteration: IterationId,
+    },
+    /// Fragments were created under different schedule digests.
+    ScheduleDigestMismatch,
+    /// Two fragments reserve overlapping correlation ordinals.
+    CorrelationRangeOverlap {
+        /// Iteration whose range overlaps a prior fragment.
+        iteration: IterationId,
+    },
     /// The worker emitted a different number of hats than its reserved range.
     CorrelationCountMismatch {
         /// Iteration whose correlation range was violated.
@@ -143,6 +155,16 @@ impl fmt::Display for VoleScheduleError {
                 write!(f, "VOLE schedule replay ended before {expected:?}")
             }
             Self::Complete => f.write_str("VOLE schedule replay is already complete"),
+            Self::DuplicateIteration { iteration } => {
+                write!(f, "VOLE schedule repeated iteration {iteration:?}")
+            }
+            Self::ScheduleDigestMismatch => {
+                f.write_str("VOLE schedule fragments use different manifest digests")
+            }
+            Self::CorrelationRangeOverlap { iteration } => write!(
+                f,
+                "VOLE iteration {iteration:?} overlaps a prior correlation range"
+            ),
             Self::CorrelationCountMismatch {
                 iteration,
                 expected,
@@ -181,6 +203,15 @@ struct HatSinkState<H> {
     overflowed: bool,
 }
 
+/// A completed, ticket-bound worker hat buffer.
+#[derive(Debug)]
+pub struct VoleScheduleHatFragment<H> {
+    /// Manifest ticket governing the hats.
+    pub ticket: VoleScheduleTicket,
+    /// Hats emitted by the worker in intra-iteration order.
+    pub hats: Vec<H>,
+}
+
 /// Thread-safe per-iteration hat buffer.
 ///
 /// A worker can use this as the `PusherByRef` for an existing locked VOLE
@@ -213,7 +244,7 @@ impl<H> VoleScheduleHatSink<H> {
     }
 
     /// Validate and take the worker's hats for canonical merge.
-    pub fn finish(self) -> Result<Vec<H>, VoleScheduleError> {
+    pub fn finish(self) -> Result<VoleScheduleHatFragment<H>, VoleScheduleError> {
         let state = self.state.into_inner();
         if state.overflowed || state.hats.len() != state.expected {
             return Err(VoleScheduleError::CorrelationCountMismatch {
@@ -222,8 +253,64 @@ impl<H> VoleScheduleHatSink<H> {
                 actual: state.pushed,
             });
         }
-        Ok(state.hats)
+        Ok(VoleScheduleHatFragment {
+            ticket: self.ticket,
+            hats: state.hats,
+        })
     }
+}
+
+/// Merge completed worker buffers in canonical iteration order.
+///
+/// Physical completion order is deliberately ignored. The function validates
+/// digest identity, iteration uniqueness, reserved hat counts, and correlation
+/// range disjointness before exposing one ordered stream to the verifier.
+pub fn merge_hat_fragments<H>(
+    mut fragments: Vec<VoleScheduleHatFragment<H>>,
+) -> Result<Vec<H>, VoleScheduleError> {
+    fragments.sort_unstable_by_key(|fragment| {
+        (
+            fragment.ticket.epoch,
+            fragment.ticket.iteration,
+            fragment.ticket.correlation_range.start,
+        )
+    });
+    let digest = fragments
+        .first()
+        .map(|fragment| fragment.ticket.schedule_digest);
+    let mut previous_iteration = None;
+    let mut previous_range_end = None;
+    let mut output = Vec::new();
+    for fragment in fragments {
+        if Some(fragment.ticket.schedule_digest) != digest {
+            return Err(VoleScheduleError::ScheduleDigestMismatch);
+        }
+        if previous_iteration == Some(fragment.ticket.iteration) {
+            return Err(VoleScheduleError::DuplicateIteration {
+                iteration: fragment.ticket.iteration,
+            });
+        }
+        let expected = correlation_len(fragment.ticket)?;
+        if fragment.hats.len() != expected {
+            return Err(VoleScheduleError::CorrelationCountMismatch {
+                iteration: fragment.ticket.iteration,
+                expected: fragment.ticket.correlation_range.len,
+                actual: fragment.hats.len(),
+            });
+        }
+        let range = fragment.ticket.correlation_range;
+        if let Some(end) = previous_range_end {
+            if range.start < end {
+                return Err(VoleScheduleError::CorrelationRangeOverlap {
+                    iteration: fragment.ticket.iteration,
+                });
+            }
+        }
+        previous_range_end = range.start.checked_add(range.len);
+        previous_iteration = Some(fragment.ticket.iteration);
+        output.extend(fragment.hats);
+    }
+    Ok(output)
 }
 
 impl<H> cirrus_core::Pusher<H> for VoleScheduleHatSink<H> {
@@ -448,7 +535,9 @@ mod tests {
         let sink = VoleScheduleHatSink::new(ticket).unwrap();
         sink.push_by_ref(10u8);
         sink.push_by_ref(11u8);
-        assert_eq!(sink.finish().unwrap(), vec![10, 11]);
+        let fragment = sink.finish().unwrap();
+        assert_eq!(fragment.ticket, ticket);
+        assert_eq!(fragment.hats, vec![10, 11]);
 
         let sink = VoleScheduleHatSink::new(ticket).unwrap();
         sink.push_by_ref(10u8);
@@ -462,6 +551,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fragments_merge_by_manifest_order_not_completion_order() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 2);
+        manifest.epochs[0].iterations[1].correlation_range = OrdinalRange::new(6, 1);
+        let first =
+            VoleScheduleTicket::from_manifest(&manifest, [9; 32], EpochId(0), IterationId(0))
+                .unwrap();
+        let second =
+            VoleScheduleTicket::from_manifest(&manifest, [9; 32], EpochId(0), IterationId(1))
+                .unwrap();
+        let fragments = vec![
+            VoleScheduleHatFragment {
+                ticket: second,
+                hats: vec![20u8],
+            },
+            VoleScheduleHatFragment {
+                ticket: first,
+                hats: vec![10u8, 11],
+            },
+        ];
+        assert_eq!(merge_hat_fragments(fragments).unwrap(), vec![10, 11, 20]);
     }
 
     #[test]
