@@ -6,7 +6,7 @@
 //! worker adapter can use the ticket to select its correlation and trace
 //! ranges without deriving an order from host completion timing.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeSet, vec::Vec};
 use core::fmt;
 
 use cirrus_core::PusherByRef;
@@ -121,6 +121,11 @@ pub enum VoleScheduleError {
         /// Iteration whose range overlaps a prior fragment.
         iteration: IterationId,
     },
+    /// A ticket's correlation range overflows the ordinal space.
+    CorrelationRangeOverflow {
+        /// Iteration whose range is malformed.
+        iteration: IterationId,
+    },
     /// The worker emitted a different number of hats than its reserved range.
     CorrelationCountMismatch {
         /// Iteration whose correlation range was violated.
@@ -165,6 +170,10 @@ impl fmt::Display for VoleScheduleError {
                 f,
                 "VOLE iteration {iteration:?} overlaps a prior correlation range"
             ),
+            Self::CorrelationRangeOverflow { iteration } => write!(
+                f,
+                "VOLE iteration {iteration:?} has an overflowing correlation range"
+            ),
             Self::CorrelationCountMismatch {
                 iteration,
                 expected,
@@ -188,6 +197,13 @@ impl From<ManifestError> for VoleScheduleError {
 }
 
 fn correlation_len(ticket: VoleScheduleTicket) -> Result<usize, VoleScheduleError> {
+    ticket
+        .correlation_range
+        .start
+        .checked_add(ticket.correlation_range.len)
+        .ok_or(VoleScheduleError::CorrelationRangeOverflow {
+            iteration: ticket.iteration,
+        })?;
     usize::try_from(ticket.correlation_range.len).map_err(|_| {
         VoleScheduleError::CorrelationRangeTooLarge {
             iteration: ticket.iteration,
@@ -278,14 +294,14 @@ pub fn merge_hat_fragments<H>(
     let digest = fragments
         .first()
         .map(|fragment| fragment.ticket.schedule_digest);
-    let mut previous_iteration = None;
-    let mut previous_range_end = None;
+    let mut seen_iterations = BTreeSet::new();
+    let mut ranges: Vec<OrdinalRange> = Vec::new();
     let mut output = Vec::new();
     for fragment in fragments {
         if Some(fragment.ticket.schedule_digest) != digest {
             return Err(VoleScheduleError::ScheduleDigestMismatch);
         }
-        if previous_iteration == Some(fragment.ticket.iteration) {
+        if !seen_iterations.insert(fragment.ticket.iteration) {
             return Err(VoleScheduleError::DuplicateIteration {
                 iteration: fragment.ticket.iteration,
             });
@@ -299,15 +315,14 @@ pub fn merge_hat_fragments<H>(
             });
         }
         let range = fragment.ticket.correlation_range;
-        if let Some(end) = previous_range_end {
-            if range.start < end {
-                return Err(VoleScheduleError::CorrelationRangeOverlap {
-                    iteration: fragment.ticket.iteration,
-                });
-            }
+        if ranges.iter().copied().any(|prior| {
+            prior.start < range.start + range.len && range.start < prior.start + prior.len
+        }) {
+            return Err(VoleScheduleError::CorrelationRangeOverlap {
+                iteration: fragment.ticket.iteration,
+            });
         }
-        previous_range_end = range.start.checked_add(range.len);
-        previous_iteration = Some(fragment.ticket.iteration);
+        ranges.push(range);
         output.extend(fragment.hats);
     }
     Ok(output)
