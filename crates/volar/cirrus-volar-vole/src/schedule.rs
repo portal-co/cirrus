@@ -730,6 +730,20 @@ impl<N: VoleArray<T>, T> VoleScheduleHatSink<Array<T, N>> {
     }
 }
 
+impl<N: VoleArray<T>, T: Send + Sync> VoleScheduleHatSink<Array<T, N>> {
+    /// Create the thread-safe locked context used by real role-separated
+    /// VOLE execution.
+    pub fn locked_prover_context<'a>(
+        &'a self,
+        bit_to_t: fn(bool) -> T,
+    ) -> crate::LockedVoleProverContext<'a, 'a, N, T> {
+        crate::LockedVoleProverContext {
+            hats: self,
+            bit_to_t,
+        }
+    }
+}
+
 /// Bind one ticket's verifier hat source directly to the existing Cirrus VOLE
 /// context. The returned context owns the source iterator; after execution,
 /// move out `context.hats` and call [`VoleScheduleHatSource::finish`] to
@@ -747,6 +761,17 @@ impl<N: ArraySize, T: Clone> VoleScheduleHatSource<Array<T, N>> {
             hook,
             gate_index: 0,
         }
+    }
+}
+
+impl<N: ArraySize, T: Clone + Send + Sync> VoleScheduleHatSource<Array<T, N>> {
+    /// Create the thread-safe locked context used by real role-separated
+    /// VOLE execution.
+    pub fn locked_verifier_context<'a>(
+        &'a self,
+        delta: Delta<N, T>,
+    ) -> crate::LockedVoleVerifierContext<'a, 'a, N, T> {
+        crate::LockedVoleVerifierContext { delta, hats: self }
     }
 }
 
@@ -1152,6 +1177,8 @@ mod tests {
         let mut sink = VoleScheduleHatSink::new(ticket).unwrap();
         let _prover = sink.prover_context(|bit| Galois128(u128::from(bit)));
         drop(_prover);
+        let _locked_prover = sink.locked_prover_context(|bit| Galois128(u128::from(bit)));
+        drop(_locked_prover);
         sink.push_by_ref(Array::from_fn(|_| Galois128(1)));
         sink.push_by_ref(Array::from_fn(|_| Galois128(2)));
         let fragment = sink.finish().unwrap();
@@ -1160,11 +1187,22 @@ mod tests {
         let delta = Delta {
             delta: Array::<Galois128, U1>::from_fn(|_| Galois128(3)),
         };
-        let context = source.verifier_context(delta, crate::NoopVoleVerifierHook);
+        let context = source.verifier_context(delta.clone(), crate::NoopVoleVerifierHook);
         let mut source = context.hats;
         assert!(source.next().is_some());
         assert!(source.next().is_some());
         assert!(source.finish().is_ok());
+
+        let source = VoleScheduleHatSource::new(
+            ticket,
+            vec![
+                Array::from_fn(|_| Galois128(1)),
+                Array::from_fn(|_| Galois128(2)),
+            ],
+        )
+        .unwrap();
+        let _locked_verifier = source.locked_verifier_context(delta);
+        drop(_locked_verifier);
     }
 
     #[test]
