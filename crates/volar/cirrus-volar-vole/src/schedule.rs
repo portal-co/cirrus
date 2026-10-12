@@ -197,6 +197,13 @@ pub enum VoleScheduleError {
         /// Number of hats reserved by the manifest.
         len: u64,
     },
+    /// The verifier requested a hat after the ticket's range was exhausted.
+    CorrelationOverConsumed {
+        /// Iteration whose source was over-consumed.
+        iteration: IterationId,
+        /// Number of hats reserved by the manifest.
+        expected: u64,
+    },
 }
 
 impl fmt::Display for VoleScheduleError {
@@ -244,6 +251,13 @@ impl fmt::Display for VoleScheduleError {
             Self::CorrelationRangeTooLarge { iteration, len } => write!(
                 f,
                 "VOLE iteration {iteration:?} reserves {len} hats, which exceeds host capacity"
+            ),
+            Self::CorrelationOverConsumed {
+                iteration,
+                expected,
+            } => write!(
+                f,
+                "VOLE iteration {iteration:?} consumed more than its {expected} reserved hats"
             ),
         }
     }
@@ -413,6 +427,7 @@ pub fn merge_hat_fragments_for_manifest_with_limits<H>(
     fragments: Vec<VoleScheduleHatFragment<H>>,
 ) -> Result<Vec<H>, VoleScheduleError> {
     manifest.validate(limits)?;
+    let mut seen = BTreeSet::new();
     for fragment in &fragments {
         if fragment.ticket.schedule_digest != schedule_digest {
             return Err(VoleScheduleError::ScheduleDigestMismatch);
@@ -420,6 +435,20 @@ pub fn merge_hat_fragments_for_manifest_with_limits<H>(
         fragment
             .ticket
             .validate_against_with_limits(manifest, limits)?;
+        if !seen.insert((fragment.ticket.epoch, fragment.ticket.iteration)) {
+            return Err(VoleScheduleError::DuplicateIteration {
+                iteration: fragment.ticket.iteration,
+            });
+        }
+    }
+    for epoch in &manifest.epochs {
+        for iteration in &epoch.iterations {
+            if !seen.contains(&(epoch.ordinal, iteration.ordinal)) {
+                return Err(VoleScheduleError::Incomplete {
+                    expected: iteration.ordinal,
+                });
+            }
+        }
     }
     merge_hat_fragments(fragments)
 }
@@ -442,14 +471,19 @@ impl<H> PusherByRef<H> for VoleScheduleHatSink<H> {
     }
 }
 
+struct HatSourceState {
+    next: usize,
+    over_consumed: bool,
+}
+
 /// Thread-safe verifier-side source for one ticket's ordered hats.
 ///
 /// Construction checks the reserved count, while [`Self::finish`] checks that
-/// the verifier consumed every supplied hat.
+/// the verifier consumed every supplied hat and did not over-consume it.
 pub struct VoleScheduleHatSource<H> {
     ticket: VoleScheduleTicket,
     hats: Vec<H>,
-    next: spin::Mutex<usize>,
+    state: spin::Mutex<HatSourceState>,
 }
 
 impl<H> VoleScheduleHatSource<H> {
@@ -466,7 +500,10 @@ impl<H> VoleScheduleHatSource<H> {
         Ok(Self {
             ticket,
             hats,
-            next: spin::Mutex::new(0),
+            state: spin::Mutex::new(HatSourceState {
+                next: 0,
+                over_consumed: false,
+            }),
         })
     }
 
@@ -475,14 +512,37 @@ impl<H> VoleScheduleHatSource<H> {
         self.ticket
     }
 
+    /// Take the next hat, rejecting an exhausted ticket explicitly.
+    pub fn try_next_by_ref(&self) -> Result<H, VoleScheduleError>
+    where
+        H: Clone,
+    {
+        let mut state = self.state.lock();
+        let Some(hat) = self.hats.get(state.next).cloned() else {
+            state.over_consumed = true;
+            return Err(VoleScheduleError::CorrelationOverConsumed {
+                iteration: self.ticket.iteration,
+                expected: self.ticket.correlation_range.len,
+            });
+        };
+        state.next += 1;
+        Ok(hat)
+    }
+
     /// Validate that the verifier consumed the complete reserved range.
     pub fn finish(self) -> Result<(), VoleScheduleError> {
-        let next = *self.next.lock();
-        if next != self.hats.len() {
+        let state = self.state.into_inner();
+        if state.over_consumed {
+            return Err(VoleScheduleError::CorrelationOverConsumed {
+                iteration: self.ticket.iteration,
+                expected: self.ticket.correlation_range.len,
+            });
+        }
+        if state.next != self.hats.len() {
             return Err(VoleScheduleError::CorrelationCountMismatch {
                 iteration: self.ticket.iteration,
                 expected: self.ticket.correlation_range.len,
-                actual: next,
+                actual: state.next,
             });
         }
         Ok(())
@@ -491,10 +551,7 @@ impl<H> VoleScheduleHatSource<H> {
 
 impl<H: Clone> PullerByRef<H> for VoleScheduleHatSource<H> {
     fn next_by_ref(&self) -> Option<H> {
-        let mut next = self.next.lock();
-        let hat = self.hats.get(*next)?.clone();
-        *next += 1;
-        Some(hat)
+        self.try_next_by_ref().ok()
     }
 }
 
@@ -789,6 +846,7 @@ mod tests {
     #[test]
     fn checked_merge_rejects_relabelled_ticket() {
         let mut manifest = manifest();
+        manifest.epochs[0].iterations.truncate(1);
         manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 1);
         let digest = [9; 32];
         let ticket =
@@ -827,6 +885,30 @@ mod tests {
     }
 
     #[test]
+    fn checked_merge_rejects_missing_fragment() {
+        let mut manifest = manifest();
+        manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 1);
+        manifest.epochs[0].iterations[1].correlation_range = OrdinalRange::new(5, 1);
+        let digest = [9; 32];
+        let first =
+            VoleScheduleTicket::from_manifest(&manifest, digest, EpochId(0), IterationId(0))
+                .unwrap();
+        assert!(matches!(
+            merge_hat_fragments_for_manifest(
+                &manifest,
+                digest,
+                vec![VoleScheduleHatFragment {
+                    ticket: first,
+                    hats: vec![10u8],
+                }]
+            ),
+            Err(VoleScheduleError::Incomplete {
+                expected: IterationId(1),
+            })
+        ));
+    }
+
+    #[test]
     fn hat_source_requires_complete_consumption() {
         let mut manifest = manifest();
         manifest.epochs[0].iterations[0].correlation_range = OrdinalRange::new(4, 2);
@@ -848,6 +930,9 @@ mod tests {
         assert_eq!(source.next_by_ref(), Some(10));
         assert_eq!(source.next_by_ref(), Some(11));
         assert_eq!(source.next_by_ref(), None);
-        assert!(source.finish().is_ok());
+        assert!(matches!(
+            source.finish(),
+            Err(VoleScheduleError::CorrelationOverConsumed { expected: 2, .. })
+        ));
     }
 }
