@@ -64,7 +64,10 @@ pub use mode_b_relation::{
     RamAccessKind, RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation,
     UnifiedR1cs, UnifiedR1csWitness, schedule_boolar_constraints,
 };
-pub use schedule::{VoleScheduleCursor, VoleScheduleError, VoleScheduleTicket};
+pub use schedule::{
+    VoleScheduleCursor, VoleScheduleError, VoleScheduleHatSink, VoleScheduleHatSource,
+    VoleScheduleTicket,
+};
 #[cfg(feature = "spartan-whir-adapter")]
 pub use spartan_whir_adapter::{
     SpartanWhirAdapterShape, SpartanWhirAdapterWitness, SpartanWhirTraceKeys,
