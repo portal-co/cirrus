@@ -100,6 +100,7 @@ fn cirrus_channel_rejects_oversized_and_cancelled_records() {
             maximum: 2,
         })
     );
+    assert!(channel.is_cancelled());
 
     let mut sink = VecPusher(Vec::new());
     let oversized = vec![0; BITGC_FRAME_MAX_BYTES + 1];
@@ -111,7 +112,10 @@ fn cirrus_channel_rejects_oversized_and_cancelled_records() {
             maximum: BITGC_FRAME_MAX_BYTES,
         })
     );
+    assert!(channel.is_cancelled());
 
+    let mut sink = VecPusher(Vec::new());
+    let mut channel = CirrusSessionChannel::new(&mut sink, core::iter::empty());
     BitGcFrameTransport::cancel(&mut channel).unwrap();
     assert_eq!(
         channel.receive_frame(8),

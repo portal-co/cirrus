@@ -80,6 +80,7 @@ where
             return Err(CirrusSessionChannelError::Cancelled);
         }
         if frame.len() > BITGC_FRAME_MAX_BYTES {
+            self.cancelled = true;
             return Err(CirrusSessionChannelError::Oversized {
                 actual: frame.len(),
                 maximum: BITGC_FRAME_MAX_BYTES,
@@ -93,12 +94,16 @@ where
         if self.cancelled {
             return Err(CirrusSessionChannelError::Cancelled);
         }
-        let record = self
-            .source
-            .next()
-            .ok_or(CirrusSessionChannelError::Exhausted)?;
+        let record = match self.source.next() {
+            Some(record) => record,
+            None => {
+                self.cancelled = true;
+                return Err(CirrusSessionChannelError::Exhausted);
+            }
+        };
         let maximum = core::cmp::min(max_bytes, BITGC_FRAME_MAX_BYTES);
         if record.len() > maximum {
+            self.cancelled = true;
             return Err(CirrusSessionChannelError::Oversized {
                 actual: record.len(),
                 maximum,
@@ -125,6 +130,7 @@ where
         }
         let maximum = BITGC_OT_MAX_INPUT_BYTES.saturating_add(OT_ENVELOPE_BOUND);
         if message.len() > maximum {
+            self.cancelled = true;
             return Err(CirrusSessionChannelError::Oversized {
                 actual: message.len(),
                 maximum,
@@ -138,15 +144,19 @@ where
         if self.cancelled {
             return Err(CirrusSessionChannelError::Cancelled);
         }
-        let record = self
-            .source
-            .next()
-            .ok_or(CirrusSessionChannelError::Exhausted)?;
+        let record = match self.source.next() {
+            Some(record) => record,
+            None => {
+                self.cancelled = true;
+                return Err(CirrusSessionChannelError::Exhausted);
+            }
+        };
         let maximum = core::cmp::min(
             max_bytes,
             BITGC_OT_MAX_INPUT_BYTES.saturating_add(OT_ENVELOPE_BOUND),
         );
         if record.len() > maximum {
+            self.cancelled = true;
             return Err(CirrusSessionChannelError::Oversized {
                 actual: record.len(),
                 maximum,
