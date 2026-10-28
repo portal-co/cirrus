@@ -35,6 +35,7 @@ mod locked;
 /// Experimental role-separated ML-KEM MiniOT → Ferret-Reg bootstrap without IKNP.
 pub mod mlkem_ferret;
 mod mode_b_relation;
+mod schedule;
 #[cfg(feature = "spartan-whir-adapter")]
 mod spartan_whir_adapter;
 mod trace_audit;
@@ -62,6 +63,13 @@ pub use mode_b_relation::{
     PrimeRamRecordLayout, PrimeRamScanLayout, PrimeRamScanRow, PublicBinding, R1csRow, RamAccess,
     RamAccessKind, RamWitness, SpartanWhirMatrixEntry, SpartanWhirR1csShape, StorageRelation,
     UnifiedR1cs, UnifiedR1csWitness, schedule_boolar_constraints,
+};
+pub use schedule::{
+    VoleScheduleCursor, VoleScheduleError, VoleScheduleHatFragment, VoleScheduleHatSink,
+    VoleScheduleHatSource, VoleScheduleStorageAccess, VoleScheduleStorageAccessKind,
+    VoleScheduleTicket, VoleScheduleTraceFragment, merge_hat_fragments,
+    merge_hat_fragments_for_manifest, merge_hat_fragments_for_manifest_with_limits,
+    merge_trace_fragments_for_manifest, merge_trace_fragments_for_manifest_with_limits,
 };
 #[cfg(feature = "spartan-whir-adapter")]
 pub use spartan_whir_adapter::{
