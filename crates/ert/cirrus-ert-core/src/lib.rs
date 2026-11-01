@@ -10,8 +10,9 @@
 
 use core::{array, marker::PhantomData, mem::MaybeUninit};
 
-use cirrus_core::{ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor};
-use volar_circuit_exec_core::{SelectEmitter, select as emit_select};
+use cirrus_core::{
+    ContextWithBitAnd, ContextWithBitOr, ContextWithBitXor, SelectEmitter, select as emit_select,
+};
 
 mod compare;
 #[cfg(test)]

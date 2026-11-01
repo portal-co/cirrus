@@ -610,6 +610,41 @@ impl<Val, C: ContextWithMuxByRef<Val> + ?Sized> ContextWithMuxByRef<Val> for Sha
     }
 }
 
+/// The AND/XOR subset needed by the canonical Boolean select identity.
+///
+/// This is the same seam `volar-circuit-exec-core` (llvm-bridge) exposes to
+/// source frontends, vendored into `cirrus-core` so embedded targets — ERT
+/// runs on bare metal — carry no LLVM-adjacent dependency. It is kept
+/// separate from [`ContextWithMux`] so allocator-free runtime interpreters
+/// that receive their zero/one wires from their ABI can share selection
+/// lowering without inventing a constant constructor.
+pub trait SelectEmitter {
+    /// The backend's Boolean wire handle.
+    type Wire: Clone;
+    /// A backend-emission failure.
+    type Error;
+
+    /// Emit conjunction.
+    fn and(&mut self, left: Self::Wire, right: Self::Wire) -> Result<Self::Wire, Self::Error>;
+    /// Emit exclusive-or.
+    fn xor(&mut self, left: Self::Wire, right: Self::Wire) -> Result<Self::Wire, Self::Error>;
+}
+
+/// Select `then_value` when `condition` is set, otherwise `else_value`.
+///
+/// This expands to `else ^ (condition & (then ^ else))`, which maps equally
+/// well to a native MUX backend and to AND/XOR-only contexts.
+pub fn select<E: SelectEmitter>(
+    emitter: &mut E,
+    condition: E::Wire,
+    then_value: E::Wire,
+    else_value: E::Wire,
+) -> Result<E::Wire, E::Error> {
+    let difference = emitter.xor(then_value, else_value.clone())?;
+    let masked = emitter.and(condition, difference)?;
+    emitter.xor(else_value, masked)
+}
+
 #[cfg(test)]
 extern crate std;
 
